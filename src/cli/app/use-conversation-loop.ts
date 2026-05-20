@@ -30,8 +30,10 @@ import {
   shouldAttemptApprovalRecovery,
 } from "@/agent/approval-recovery";
 import { getResumeDataFromBackend } from "@/agent/check-approval";
+import { isHostedBackendRequested } from "@/agent/memory-git";
 import { getStreamToolContextId, sendMessageStream } from "@/agent/message";
 import { getModelInfo, getModelInfoForLlmConfig } from "@/agent/model";
+import { recompileAgentSystemPrompt } from "@/agent/modify";
 import { INTERRUPT_RECOVERY_ALERT } from "@/agent/prompt-assets";
 import type { SessionStats } from "@/agent/stats";
 import {
@@ -682,6 +684,22 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 otid: randomUUID(),
               },
             ];
+          }
+
+          if (
+            isHostedBackendRequested() &&
+            contextTrackerRef.current.pendingHostedRecompile
+          ) {
+            contextTrackerRef.current.pendingHostedRecompile = false;
+            await recompileAgentSystemPrompt(
+              conversationIdRef.current ?? "default",
+              agentIdRef.current,
+            ).catch((error) => {
+              debugWarn(
+                "memory",
+                `Failed to recompile hosted prompt before turn: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
           }
 
           // Stream one turn - use ref to always get the latest conversationId
@@ -1351,6 +1369,22 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
           // A newer conversation is running and should control the UI.
           if (isStaleAfterDrain) {
             return;
+          }
+
+          if (
+            isHostedBackendRequested() &&
+            contextTrackerRef.current.pendingHostedRecompile
+          ) {
+            contextTrackerRef.current.pendingHostedRecompile = false;
+            await recompileAgentSystemPrompt(
+              conversationIdRef.current ?? "default",
+              agentIdRef.current,
+            ).catch((error) => {
+              debugWarn(
+                "memory",
+                `Failed to recompile hosted prompt after compaction: ${error instanceof Error ? error.message : String(error)}`,
+              );
+            });
           }
 
           // Immediate refresh after stream completes to show final state unless

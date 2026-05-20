@@ -1880,6 +1880,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             // Manual /compact bypasses stream compaction events, so trigger
             // post-compaction reflection reminder/auto-launch on the next user turn.
             contextTrackerRef.current.pendingReflectionTrigger = true;
+            contextTrackerRef.current.pendingHostedRecompile = true;
           } catch (error) {
             const apiError = error as {
               status?: number;
