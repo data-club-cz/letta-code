@@ -433,6 +433,7 @@ export function buildDeviceStatus(
     listener,
     scopedAgentId,
     scopedConversationId,
+    listener.deviceId,
   );
   const reflectionSettings = (() => {
     if (!scopedAgentId) {

@@ -132,6 +132,7 @@ export async function resolveStaleApprovals(
       runtime.listener,
       runtime.agentId,
       recoveryConversationId,
+      runtime.listener.deviceId,
     );
   const scope = {
     agent_id: runtime.agentId,
