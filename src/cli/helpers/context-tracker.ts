@@ -18,7 +18,7 @@ export type ContextTracker = {
   pendingCompaction: boolean;
   /** Set when compaction happens; consumed by the next user message to trigger memory reminder/spawn */
   pendingReflectionTrigger: boolean;
-  /** Set when compaction happens; hosted/Pierre memory should recompile after stream completion. */
+  /** Set when compaction happens; hosted memory should recompile after stream completion. */
   pendingHostedRecompile: boolean;
 };
 
