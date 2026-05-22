@@ -69,17 +69,21 @@ jobs:
           echo "tags=$unmerged_clean" >> "$GITHUB_OUTPUT"
 
       - name: Merge each unmerged tag
+        id: merge
         if: steps.tags.outputs.tags != ''
         env:
           TAG_LIST: ${{ steps.tags.outputs.tags }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           IFS=',' read -ra TAGS <<< "$TAG_LIST"
+          merged=""
           for tag in "${TAGS[@]}"; do
             upstream_label="${tag#upstream-}"
             echo "::group::Merging $upstream_label"
             if git merge --no-ff -m "chore: sync upstream $upstream_label" "$tag"; then
               echo "Merged $upstream_label cleanly."
+              merged="${merged:+$merged, }$upstream_label"
             else
               echo "::error::Conflict merging $upstream_label — opening PR for review."
               git merge --abort || true
@@ -88,19 +92,53 @@ jobs:
               git merge --no-ff --no-commit "$tag" || true
               git -c core.editor=true commit -am "chore: sync upstream $upstream_label (CONFLICTS)" || true
               git push origin "$branch" --force
-              gh pr create \
+              pr_url=$(gh pr create \
                 --base data-club-patch \
                 --head "$branch" \
                 --title "sync: upstream $upstream_label (conflicts)" \
                 --body "Automated merge of upstream tag \`$upstream_label\` produced conflicts. Resolve and merge manually." \
-                || true
+                2>/dev/null || gh pr view "$branch" --json url --jq .url 2>/dev/null || echo "")
+              echo "conflict_pr=$pr_url" >> "$GITHUB_OUTPUT"
+              echo "conflict_tag=$upstream_label" >> "$GITHUB_OUTPUT"
+              # Persist any clean merges that happened before the conflict.
+              [ -n "$merged" ] && echo "merged_tags=$merged" >> "$GITHUB_OUTPUT"
               git checkout data-club-patch
               # Stop on first conflict — let the human resolve before continuing.
               exit 0
             fi
             echo "::endgroup::"
           done
+          [ -n "$merged" ] && echo "merged_tags=$merged" >> "$GITHUB_OUTPUT"
 
       - name: Push merged commits
-        if: steps.tags.outputs.tags != ''
+        if: steps.merge.outputs.merged_tags != ''
         run: git push origin data-club-patch
+
+      - name: Notify Slack
+        if: always() && (steps.tags.outputs.tags != '' || failure())
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          MERGED: ${{ steps.merge.outputs.merged_tags }}
+          CONFLICT_PR: ${{ steps.merge.outputs.conflict_pr }}
+          CONFLICT_TAG: ${{ steps.merge.outputs.conflict_tag }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$WEBHOOK" ]; then
+            echo "SLACK_WEBHOOK_URL not set, skipping notification."
+            exit 0
+          fi
+          if [ -n "$CONFLICT_PR" ]; then
+            msg=":warning: letta-code sync hit a conflict on \`$CONFLICT_TAG\` — review <$CONFLICT_PR|the PR>."
+            if [ -n "$MERGED" ]; then
+              msg="$msg (Cleanly merged before the conflict: $MERGED.)"
+            fi
+          elif [ "$JOB_STATUS" = "failure" ] || [ "$JOB_STATUS" = "cancelled" ]; then
+            msg=":x: letta-code sync workflow $JOB_STATUS — <$RUN_URL|logs>."
+          elif [ -n "$MERGED" ]; then
+            msg=":white_check_mark: letta-code synced upstream into \`data-club-patch\`: $MERGED."
+          else
+            exit 0
+          fi
+          curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data "$(jq -nc --arg t "$msg" '{text:$t}')" "$WEBHOOK"
