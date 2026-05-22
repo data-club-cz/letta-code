@@ -75,6 +75,12 @@ export type SendMessageStreamOptions = {
    * does not mutate agent/conversation persisted model configuration.
    */
   overrideModel?: string;
+  /**
+   * Per-request system-prompt override. Replaces the compiled system message
+   * for this turn only (no agent/conversation persisted state mutation).
+   * data-club fork patch — see ai-hub-server's recency-bias injection.
+   */
+  overrideSystem?: string;
   /** Explicit turn-scoped tool snapshot. When present, bypasses the global registry. */
   preparedToolContext?: PreparedToolExecutionContext;
   /** Skip shared image normalization when the caller already did it. */
@@ -123,6 +129,7 @@ export function buildConversationMessagesCreateRequestBody(
     client_tools: clientTools,
     include_compaction_messages: true,
     ...(opts.overrideModel ? { override_model: opts.overrideModel } : {}),
+    ...(opts.overrideSystem ? { override_system: opts.overrideSystem } : {}),
     ...(isDefaultConversation ? { agent_id: opts.agentId } : {}),
   };
 }

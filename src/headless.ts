@@ -615,6 +615,7 @@ export async function handleHeadlessCommand(
   const forceNew = values["new-agent"];
   const systemPromptPreset = values.system;
   const systemCustom = values["system-custom"];
+  const overrideSystemFlag = values["override-system"];
   const personalityInput = values.personality;
   const embeddingModel = values.embedding;
   const memoryBlocksJson = values["memory-blocks"];
@@ -1571,6 +1572,7 @@ export async function handleHeadlessCommand(
       resolvedSkillSources,
       systemInfoReminderEnabled,
       effectiveReflectionSettings,
+      overrideSystemFlag,
     );
     return;
   }
@@ -1943,6 +1945,7 @@ ${SYSTEM_REMINDER_CLOSE}
         stream = await sendMessageStream(conversationId, currentInput, {
           agentId: agent.id,
           overrideModel: overrideModelHandle,
+          ...(overrideSystemFlag ? { overrideSystem: overrideSystemFlag } : {}),
           preparedToolContext:
             turnToolContext.preparedToolContext.preparedToolContext,
         });
@@ -2928,6 +2931,7 @@ async function runBidirectionalMode(
   skillSources: SkillSource[],
   systemInfoReminderEnabled: boolean,
   reflectionSettings: ReflectionSettings,
+  overrideSystemFlag: string | undefined,
 ): Promise<void> {
   const sessionId = agent.id;
   const backend = getBackend();
@@ -3851,6 +3855,9 @@ async function runBidirectionalMode(
             availableTools = turnToolContext.availableTools;
             stream = await sendMessageStream(conversationId, currentInput, {
               agentId: agent.id,
+              ...(overrideSystemFlag
+                ? { overrideSystem: overrideSystemFlag }
+                : {}),
               preparedToolContext:
                 turnToolContext.preparedToolContext.preparedToolContext,
             });

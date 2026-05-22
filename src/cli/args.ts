@@ -104,6 +104,15 @@ export const CLI_FLAG_CATALOG = {
     },
   },
   "system-custom": { parser: { type: "string" }, mode: "both" },
+  "override-system": {
+    parser: { type: "string" },
+    mode: "both",
+    help: {
+      argLabel: "<text>",
+      description:
+        "Per-turn override of compiled system message (data-club fork). Sent as override_system on every messages.create.",
+    },
+  },
   personality: {
     parser: { type: "string" },
     mode: "both",
