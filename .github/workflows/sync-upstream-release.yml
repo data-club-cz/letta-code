@@ -53,18 +53,38 @@ jobs:
             echo "tags=upstream-${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # Collect upstream-v*.*.* tags in version order, then keep only those
-          # not yet reachable from HEAD.
+          # Collect upstream-v*.*.* tags in version order, then filter to:
+          #   1. NOT already an ancestor of HEAD (i.e. not yet merged), AND
+          #   2. strictly NEWER (by semver) than the highest tag that IS an
+          #      ancestor of HEAD. Upstream history isn't strictly linear —
+          #      older release tags can sit on branches that never merged
+          #      into the line we forked from, and we don't want to merge
+          #      ancient releases into a newer baseline.
           all=$(git for-each-ref --sort=v:refname --format='%(refname:short)' 'refs/tags/upstream-v*' \
                 | grep -E '^upstream-v[0-9]+\.[0-9]+\.[0-9]+$' || true)
-          unmerged=""
+          # Find the highest tag that's already in HEAD's history; treat that
+          # as the baseline. Version-sorted listing means the last ancestor is
+          # the highest.
+          baseline=""
           for t in $all; do
-            if ! git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
-              unmerged="$unmerged $t"
+            if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+              baseline="$t"
             fi
           done
-          # Trim leading space, replace internal whitespace with comma so we
-          # can pass it through to the next step as a stable token.
+          echo "Baseline (highest tag in HEAD's history): ${baseline:-<none>}"
+          unmerged=""
+          for t in $all; do
+            if git merge-base --is-ancestor "$t" HEAD 2>/dev/null; then
+              continue
+            fi
+            # Strictly-newer-than-baseline check via `sort -V`. If no
+            # baseline, every non-ancestor tag is fair game.
+            if [ -n "$baseline" ]; then
+              top=$(printf '%s\n%s\n' "$baseline" "$t" | sort -V | tail -1)
+              [ "$top" = "$baseline" ] && continue
+            fi
+            unmerged="$unmerged $t"
+          done
           unmerged_clean=$(echo "$unmerged" | xargs | tr ' ' ',')
           echo "tags=$unmerged_clean" >> "$GITHUB_OUTPUT"
 
@@ -86,22 +106,26 @@ jobs:
               merged="${merged:+$merged, }$upstream_label"
             else
               echo "::error::Conflict merging $upstream_label — opening PR for review."
-              git merge --abort || true
               branch="sync/upstream-$upstream_label"
+              # Stage the conflict markers + any auto-merged hunks so we can
+              # commit them. `commit -am` won't include unmerged paths; we
+              # need an explicit `add -A` first.
               git checkout -B "$branch"
-              git merge --no-ff --no-commit "$tag" || true
-              git -c core.editor=true commit -am "chore: sync upstream $upstream_label (CONFLICTS)" || true
+              git add -A
+              git commit --no-verify -m "chore: sync upstream $upstream_label (CONFLICTS — resolve before merge)"
               git push origin "$branch" --force
               pr_url=$(gh pr create \
                 --base data-club-patch \
                 --head "$branch" \
                 --title "sync: upstream $upstream_label (conflicts)" \
                 --body "Automated merge of upstream tag \`$upstream_label\` produced conflicts. Resolve and merge manually." \
-                2>/dev/null || gh pr view "$branch" --json url --jq .url 2>/dev/null || echo "")
+                || gh pr view "$branch" --json url --jq .url \
+                || echo "")
               echo "conflict_pr=$pr_url" >> "$GITHUB_OUTPUT"
               echo "conflict_tag=$upstream_label" >> "$GITHUB_OUTPUT"
               # Persist any clean merges that happened before the conflict.
               [ -n "$merged" ] && echo "merged_tags=$merged" >> "$GITHUB_OUTPUT"
+              git checkout data-club-patch -- .
               git checkout data-club-patch
               # Stop on first conflict — let the human resolve before continuing.
               exit 0
@@ -128,8 +152,12 @@ jobs:
             echo "SLACK_WEBHOOK_URL not set, skipping notification."
             exit 0
           fi
-          if [ -n "$CONFLICT_PR" ]; then
-            msg=":warning: letta-code sync hit a conflict on \`$CONFLICT_TAG\` — review <$CONFLICT_PR|the PR>."
+          if [ -n "$CONFLICT_TAG" ]; then
+            if [ -n "$CONFLICT_PR" ]; then
+              msg=":warning: letta-code sync hit a conflict on \`$CONFLICT_TAG\` — review <$CONFLICT_PR|the PR>."
+            else
+              msg=":warning: letta-code sync hit a conflict on \`$CONFLICT_TAG\` — PR auto-open failed, see <$RUN_URL|run logs>."
+            fi
             if [ -n "$MERGED" ]; then
               msg="$msg (Cleanly merged before the conflict: $MERGED.)"
             fi
