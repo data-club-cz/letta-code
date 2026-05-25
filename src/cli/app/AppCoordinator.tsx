@@ -49,6 +49,8 @@ import {
   createCommandRunner,
 } from "@/cli/commands/runner";
 import type { BtwState } from "@/cli/components/BtwPane";
+import { buildStatuslineRenderContext } from "@/cli/display/statusline/context";
+import { useLocalExtensionRuntime } from "@/cli/extensions/use-local-extension-runtime";
 import {
   appendStreamingOutput,
   type Buffers,
@@ -70,13 +72,16 @@ import {
 import type { AdvancedDiffSuccess } from "@/cli/helpers/diff";
 import { setErrorContext } from "@/cli/helpers/error-context";
 import { parsePatchOperations } from "@/cli/helpers/format-args-display";
+import { CLI_GLYPHS } from "@/cli/helpers/glyphs";
 import { getReflectionSettings } from "@/cli/helpers/memory-reminder";
+import type { ExecutionPhase } from "@/cli/helpers/phase-visuals";
 import {
   buildContentFromQueueBatch,
   toQueuedMsg,
 } from "@/cli/helpers/queued-message-parts";
 import { safeJsonParseOr } from "@/cli/helpers/safe-json-parse";
 import { getStartupModelDisplayOverride } from "@/cli/helpers/startup-model-display";
+import { buildStatusLinePayload } from "@/cli/helpers/status-line-payload";
 import type { ApprovalRequest } from "@/cli/helpers/stream";
 import {
   collectFinishedTaskToolCalls,
@@ -98,7 +103,6 @@ import {
   renderWindowTitle,
   resolveWindowTitleConfig,
 } from "@/cli/helpers/window-title-config";
-import { useConfigurableStatusLine } from "@/cli/hooks/use-configurable-status-line";
 import { useSyncedState } from "@/cli/hooks/use-synced-state";
 import {
   useTerminalRows,
@@ -434,6 +438,7 @@ export function App({
   const [networkPhase, setNetworkPhase] = useState<
     "upload" | "download" | "error" | null
   >(null);
+  const [executionPhase, setExecutionPhase] = useState<ExecutionPhase>(null);
   // Track permission mode changes for UI updates.
   // Keep a ref in sync *synchronously* so async approval classification never
   // reads a stale mode during the render/effect window.
@@ -457,19 +462,12 @@ export function App({
     }
   }, []);
 
-  const statusLineTriggerVersionRef = useRef(0);
-  const [statusLineTriggerVersion, setStatusLineTriggerVersion] = useState(0);
-
   useEffect(() => {
     if (!streaming) {
       setNetworkPhase(null);
+      setExecutionPhase(null);
     }
   }, [streaming]);
-
-  const triggerStatusLineRefresh = useCallback(() => {
-    statusLineTriggerVersionRef.current += 1;
-    setStatusLineTriggerVersion(statusLineTriggerVersionRef.current);
-  }, []);
 
   // Guard ref for preventing concurrent processConversation calls
   // Separate from streaming state which may be set early for UI responsiveness
@@ -2124,10 +2122,9 @@ export function App({
     buffersRef.current.tokenStreamingEnabled = tokenStreamingEnabled;
   }, [tokenStreamingEnabled]);
 
-  // Configurable status line hook
   const sessionStatsSnapshot = sessionStatsRef.current.getSnapshot();
   const reflectionSettings = getReflectionSettings(agentId);
-  const statusLine = useConfigurableStatusLine({
+  const statusLinePayload = buildStatusLinePayload({
     modelId: llmConfigRef.current?.model ?? null,
     modelDisplayName: currentModelDisplay,
     reasoningEffort: currentReasoningEffort,
@@ -2149,6 +2146,12 @@ export function App({
     turnCount: sharedReminderStateRef.current.turnCount,
     reflectionMode: reflectionSettings.trigger,
     reflectionStepCount: reflectionSettings.stepCount,
+    memfsEnabled:
+      agentId !== "loading" ? settingsManager.isMemfsEnabled(agentId) : false,
+    memfsDirectory:
+      agentId !== "loading" && settingsManager.isMemfsEnabled(agentId)
+        ? getScopedMemoryFilesystemRoot(agentId)
+        : null,
     permissionMode: uiPermissionMode,
     networkPhase,
     terminalWidth: chromeColumns,
@@ -2157,25 +2160,37 @@ export function App({
       status: a.status,
       duration_ms: Date.now() - a.startTime,
     })),
-    triggerVersion: statusLineTriggerVersion,
   });
-
-  const previousStreamingForStatusLineRef = useRef(streaming);
-  useEffect(() => {
-    // Trigger status line when an assistant stream completes.
-    if (previousStreamingForStatusLineRef.current && !streaming) {
-      triggerStatusLineRefresh();
-    }
-    previousStreamingForStatusLineRef.current = streaming;
-  }, [streaming, triggerStatusLineRefresh]);
-
-  const statusLineRefreshIdentity = `${conversationId}|${currentModelDisplay ?? ""}|${currentModelProvider ?? ""}|${agentName ?? ""}|${columns}|${effectiveContextWindowSize ?? ""}|${currentReasoningEffort ?? ""}|${currentSystemPromptId ?? ""}|${currentToolset ?? ""}`;
-
-  // Trigger status line when key session identity/display state changes.
-  useEffect(() => {
-    void statusLineRefreshIdentity;
-    triggerStatusLineRefresh();
-  }, [statusLineRefreshIdentity, triggerStatusLineRefresh]);
+  const extensionContext = useMemo(
+    () =>
+      buildStatuslineRenderContext({
+        payload: statusLinePayload,
+        ui: {
+          currentModelProvider: currentModelProvider ?? null,
+          goalStatusText: null,
+          hasTemporaryModelOverride: Boolean(hasTemporaryModelOverride),
+          isByokProvider: Boolean(
+            currentModelProvider?.startsWith("lc-") ||
+              currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
+          ),
+          isLocalBackend,
+          isOpenAICodexProvider:
+            currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
+          rightColumnWidth: Math.max(
+            28,
+            Math.min(72, Math.floor(chromeColumns * 0.45)),
+          ),
+        },
+      }),
+    [
+      chromeColumns,
+      currentModelProvider,
+      hasTemporaryModelOverride,
+      isLocalBackend,
+      statusLinePayload,
+    ],
+  );
+  const extensionRuntime = useLocalExtensionRuntime(extensionContext);
 
   // Keep buffers in sync with agentId for server-side tool hooks
   useEffect(() => {
@@ -2985,8 +3000,21 @@ export function App({
           return;
         }
 
+        const hasConversationModelSettings =
+          conversationModelSettings !== undefined &&
+          conversationModelSettings !== null &&
+          Object.keys(conversationModelSettings as Record<string, unknown>)
+            .length > 0;
+        const resolvedConversationModelSettings = hasConversationModelSettings
+          ? conversationModelSettings
+          : conversationModel === undefined ||
+              conversationModel === null ||
+              conversationModel === agentModelHandle
+            ? (agentState.model_settings ?? null)
+            : null;
+
         const reasoningEffort = deriveReasoningEffort(
-          conversationModelSettings,
+          resolvedConversationModelSettings,
           agentState.llm_config,
         );
 
@@ -3011,7 +3039,7 @@ export function App({
             : conversationContextWindowLimit;
 
         setHasConversationModelOverride(true);
-        setConversationOverrideModelSettings(conversationModelSettings ?? null);
+        setConversationOverrideModelSettings(resolvedConversationModelSettings);
         setConversationOverrideContextWindowLimit(
           resolvedConversationContextWindowLimit,
         );
@@ -3376,6 +3404,7 @@ export function App({
     setLlmConfig,
     setNeedsEagerApprovalCheck,
     setNetworkPhase,
+    setExecutionPhase,
     setPendingApprovals,
     setRestoreQueueOnCancel,
     setRestoredInput,
@@ -3728,7 +3757,6 @@ export function App({
     bashCommandCacheRef,
     buffersRef,
     checkPendingApprovalsForSlashCommand,
-    chromeColumns,
     commandRunner,
     commandRunning,
     consumeQueuedApprovalInputForCurrentConversation,
@@ -3736,16 +3764,13 @@ export function App({
     conversationGenerationRef,
     conversationId,
     conversationIdRef,
-    currentModelDisplay,
     currentModelHandle,
     currentModelId,
     currentModelLabel,
     currentModelProvider,
-    currentReasoningEffort,
-    currentSystemPromptId,
-    currentToolset,
     effectiveContextWindowSize,
     emittedIdsRef,
+    extensionRuntime,
     firstUserQueryRef,
     flushPendingReasoningEffort: () => flushPendingReasoningEffort(),
     generateConversationTitle,
@@ -3755,11 +3780,9 @@ export function App({
     hasBackfilledRef,
     isAgentBusy,
     isExecutingTool,
-    lastRunIdRef,
     llmConfigRef,
     maybeCarryOverActiveConversationModel,
     needsEagerApprovalCheck,
-    networkPhase,
     openTrajectorySegment,
     overrideContentPartsRef,
     pendingApprovals,
@@ -3822,9 +3845,7 @@ export function App({
     tokenStreamingEnabled,
     trajectoryRunTokenStartRef,
     trajectoryTokenDisplayRef,
-    triggerStatusLineRefresh,
     tuiQueueRef,
-    uiPermissionMode,
     updateAgentName,
     updateMemorySyncCommand,
     userCancelledRef,
@@ -3958,6 +3979,7 @@ export function App({
     contextTrackerRef,
     conversationIdRef,
     currentModelHandle,
+    currentModelId,
     currentToolset,
     isAgentBusy,
     llmConfig,
@@ -4194,9 +4216,8 @@ export function App({
     (mode: PermissionMode) => {
       // permissionMode.setMode() is called in InputRich.tsx before this callback
       setUiPermissionMode(mode);
-      triggerStatusLineRefresh();
     },
-    [triggerStatusLineRefresh, setUiPermissionMode],
+    [setUiPermissionMode],
   );
 
   const { flushPendingReasoningEffort, handleCycleReasoningEffort } =
@@ -4568,6 +4589,7 @@ export function App({
       modelReasoningPrompt={modelReasoningPrompt}
       modelSelectorOptions={modelSelectorOptions}
       networkPhase={networkPhase}
+      executionPhase={executionPhase}
       onSubmit={onSubmit}
       pendingApprovals={pendingApprovals}
       pendingConversationSwitchRef={pendingConversationSwitchRef}
@@ -4608,7 +4630,9 @@ export function App({
       openOverlay={openOverlay}
       staticItems={staticItems}
       staticRenderEpoch={staticRenderEpoch}
-      statusLine={statusLine}
+      statusLinePayload={statusLinePayload}
+      statusLinePrompt={CLI_GLYPHS.prompt}
+      extensionRuntime={extensionRuntime}
       streaming={streaming}
       stubDescriptions={stubDescriptions}
       thinkingMessage={thinkingMessage}
