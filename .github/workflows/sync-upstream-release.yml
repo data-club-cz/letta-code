@@ -98,10 +98,23 @@ jobs:
           set -euo pipefail
           IFS=',' read -ra TAGS <<< "$TAG_LIST"
           merged=""
+          # Our fork owns its CI, and the Actions GITHUB_TOKEN may not push
+          # changes under .github/workflows/ anyway ("refusing to allow a GitHub
+          # App to ... without workflows permission"). After each merge, drop any
+          # upstream workflow-file changes and keep data-club-patch's versions so
+          # pushed commits never modify .github/workflows/.
+          keep_our_workflows() {
+            git rm -rfq --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
+            git checkout data-club-patch -- .github/workflows
+          }
           for tag in "${TAGS[@]}"; do
             upstream_label="${tag#upstream-}"
             echo "::group::Merging $upstream_label"
             if git merge --no-ff -m "chore: sync upstream $upstream_label" "$tag"; then
+              # Revert any upstream workflow changes, folding it into the merge commit.
+              keep_our_workflows
+              git diff --cached --quiet HEAD -- .github/workflows \
+                || git commit --amend --no-edit --no-verify
               echo "Merged $upstream_label cleanly."
               merged="${merged:+$merged, }$upstream_label"
             else
@@ -128,6 +141,9 @@ jobs:
               # aborting the step on the expected non-zero exit. `commit -am`
               # skips unmerged paths, so stage everything with `add -A` first.
               git merge --no-ff -m "chore: sync upstream $upstream_label" "$tag" || true
+              # Keep our CI off the PR branch: the Actions token can't push
+              # workflow changes, and the fork owns its CI.
+              keep_our_workflows
               git add -A
               git commit --no-verify -m "chore: sync upstream $upstream_label (CONFLICTS — resolve before merge)"
               git push origin "$branch" --force
