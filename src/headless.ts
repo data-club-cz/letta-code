@@ -1706,11 +1706,8 @@ export async function handleHeadlessCommand(
       resolvedSkillSources,
       systemInfoReminderEnabled,
       effectiveReflectionSettings,
-<<<<<<< HEAD
       overrideSystemFlag,
-=======
       headlessExtensionRuntime,
->>>>>>> upstream-v0.26.3
     );
     return;
   }
@@ -3096,11 +3093,8 @@ async function runBidirectionalMode(
   skillSources: SkillSource[],
   systemInfoReminderEnabled: boolean,
   reflectionSettings: ReflectionSettings,
-<<<<<<< HEAD
   overrideSystemFlag: string | undefined,
-=======
   headlessExtensionRuntime: ExtensionRuntime,
->>>>>>> upstream-v0.26.3
 ): Promise<void> {
   const sessionId = agent.id;
   const backend = getBackend();
