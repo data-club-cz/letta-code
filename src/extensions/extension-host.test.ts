@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import type Letta from "@letta-ai/letta-client";
 import {
+  clearRegisteredPiProviders,
+  getRegisteredPiProvider,
+} from "@/backend/dev/pi-provider-extension-registry";
+import {
   createExtensionHost,
   type ExtensionHost,
 } from "@/extensions/extension-host";
@@ -13,11 +17,16 @@ import {
 } from "@/extensions/tool-registry";
 import type {
   ExtensionCapabilities,
+  ExtensionContext,
   ExtensionPanelHandle,
+  ExtensionRuntimeBackendApi,
 } from "@/extensions/types";
 
 type ExtensionTestGlobal = typeof globalThis & {
+  __lettaExtensionBackend?: unknown;
+  __lettaExtensionForkResult?: { id: string };
   __lettaExtensionCapabilities?: ExtensionCapabilities;
+  __lettaExtensionEvents?: string[];
   __lettaExtensionGate?: Promise<void>;
   __lettaExtensionPanel?: ExtensionPanelHandle;
   __lettaExtensionSignal?: AbortSignal;
@@ -28,14 +37,61 @@ function createTempDir(): string {
   return mkdtempSync(path.join(tmpdir(), "letta-extension-host-"));
 }
 
+function createExtensionContext(): ExtensionContext {
+  return {
+    app: { version: "test" },
+    backgroundAgents: [],
+    contextWindow: {
+      currentUsage: null,
+      remainingPercentage: null,
+      size: 200000,
+      totalInputTokens: 0,
+      totalOutputTokens: 0,
+      usedPercentage: null,
+    },
+    cost: {
+      totalApiDurationMs: 0,
+      totalCostUsd: null,
+      totalDurationMs: 0,
+      totalLinesAdded: null,
+      totalLinesRemoved: null,
+    },
+    cwd: "/tmp/project",
+    lastRunId: null,
+    memfs: { enabled: false, memoryDir: null },
+    model: {
+      displayName: "Sonnet",
+      id: "model-1",
+      provider: "anthropic",
+      reasoningEffort: null,
+    },
+    networkPhase: null,
+    permissionMode: "standard",
+    reflection: { mode: null, stepCount: 0 },
+    sessionId: "conversation-1",
+    systemPromptId: null,
+    terminalWidth: 80,
+    toolset: "default",
+    agent: { id: "agent-1", name: "Amelia" },
+    workspace: {
+      cwd: "/tmp/project",
+      currentDir: "/tmp/project",
+      projectDir: "/tmp/project",
+    },
+  };
+}
+
 function createHost(
   root: string,
   capabilities?: ExtensionCapabilities,
+  backend?: ExtensionRuntimeBackendApi,
 ): ExtensionHost {
   return createExtensionHost({
     cacheDirectory: path.join(root, "extension-cache"),
+    ...(backend ? { backend } : {}),
     ...(capabilities ? { capabilities } : {}),
     getClient: async () => ({}) as unknown as Letta,
+    getContext: createExtensionContext,
     globalExtensionsDirectory: path.join(root, "global-extensions"),
   });
 }
@@ -43,6 +99,8 @@ function createHost(
 const TOOL_ONLY_EXTENSION_CAPABILITIES: ExtensionCapabilities = {
   tools: true,
   commands: false,
+  events: { lifecycle: false, turns: false },
+  providers: false,
   ui: {
     panels: false,
     statusValues: false,
@@ -53,6 +111,7 @@ const TOOL_ONLY_EXTENSION_CAPABILITIES: ExtensionCapabilities = {
 describe("extension host", () => {
   afterEach(() => {
     clearExtensionTools();
+    clearRegisteredPiProviders();
   });
 
   test("reload publishes snapshots with owner metadata", async () => {
@@ -149,6 +208,106 @@ describe("extension host", () => {
     }
   });
 
+  test("keeps backend internal and exposes scoped conversation helpers to events", async () => {
+    const root = createTempDir();
+    const testGlobal = globalThis as ExtensionTestGlobal;
+    delete testGlobal.__lettaExtensionBackend;
+    delete testGlobal.__lettaExtensionForkResult;
+
+    const backend: ExtensionRuntimeBackendApi = {
+      forkConversation: async (conversationId, options) => ({
+        id: `${conversationId}:${options?.agentId}:${options?.hidden ? "hidden" : "visible"}`,
+      }),
+      getConversationHistory: async () => [],
+      sendMessageStream: async () =>
+        (async function* () {
+          // Empty stream for host plumbing tests.
+        })(),
+    };
+
+    try {
+      const extensionDir = path.join(root, "global-extensions");
+      const extensionPath = path.join(extensionDir, "backend.ts");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        extensionPath,
+        `export default async function(letta) {
+          globalThis.__lettaExtensionBackend = letta.backend;
+          letta.events.on("conversation_open", async (_event, ctx) => {
+            globalThis.__lettaExtensionForkResult = await ctx.conversation.fork({ hidden: true });
+          });
+        }`,
+      );
+
+      const host = createHost(root, undefined, backend);
+      await host.reload();
+      await host.emitEvent("conversation_open", {
+        agentId: "agent-1",
+        agentName: "Amelia",
+        conversationId: "conv-1",
+        reason: "startup",
+      });
+
+      const forkResult = testGlobal.__lettaExtensionForkResult as
+        | { id: string }
+        | undefined;
+      expect(testGlobal.__lettaExtensionBackend).toBeUndefined();
+      expect(forkResult).toMatchObject({
+        id: "conv-1:agent-1:hidden",
+      });
+      expect(host.getSnapshot().errors).toEqual([]);
+    } finally {
+      delete testGlobal.__lettaExtensionBackend;
+      delete testGlobal.__lettaExtensionForkResult;
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("lets extensions register pi providers for local backend", async () => {
+    const root = createTempDir();
+    try {
+      const extensionDir = path.join(root, "global-extensions");
+      const extensionPath = path.join(extensionDir, "provider.ts");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        extensionPath,
+        `export default function(letta) {
+          letta.registerProvider("lmstudio", {
+            baseUrl: "http://localhost:8000/v1",
+            apiKey: "not-needed",
+            api: "openai-completions",
+            models: [{
+              id: "gemma-4-26B-A4B-it-oQ6",
+              name: "Gemma 4 VLM",
+              reasoning: true,
+              input: ["text", "image"],
+              cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+              contextWindow: 256000,
+              maxTokens: 8192,
+            }],
+          });
+        }`,
+      );
+
+      const host = createHost(root);
+      await host.reload();
+
+      expect(
+        getRegisteredPiProvider("lmstudio")?.config.models?.[0],
+      ).toMatchObject({
+        id: "gemma-4-26B-A4B-it-oQ6",
+        input: ["text", "image"],
+        contextWindow: 256000,
+        reasoning: true,
+      });
+
+      host.dispose();
+      expect(getRegisteredPiProvider("lmstudio")).toBeUndefined();
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
   test("unsupported capabilities no-op even when extensions call the APIs", async () => {
     const root = createTempDir();
     try {
@@ -165,6 +324,7 @@ describe("extension host", () => {
           letta.ui.openPanel({ id: "hidden", content: "hidden" });
           letta.ui.setStatus("hidden", "hidden");
           letta.ui.setStatuslineRenderer(() => "hidden");
+          letta.events.on("conversation_open", () => {});
           letta.tools.register({
             name: "visible_tool",
             description: "Visible tool",
@@ -179,10 +339,136 @@ describe("extension host", () => {
 
       expect(snapshot.errors).toEqual([]);
       expect(snapshot.commands).toEqual({});
+      expect(snapshot.events).toEqual({});
       expect(snapshot.ui.panels).toEqual({});
       expect(snapshot.ui.statusValues).toEqual({});
       expect(snapshot.ui.statuslineRenderer).toBeNull();
       expect(Object.keys(snapshot.tools)).toEqual(["visible_tool"]);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("emits extension lifecycle events and isolates handler errors", async () => {
+    const root = createTempDir();
+    const testGlobal = globalThis as ExtensionTestGlobal;
+    testGlobal.__lettaExtensionEvents = [];
+
+    try {
+      const extensionDir = path.join(root, "global-extensions");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        path.join(extensionDir, "events.ts"),
+        `export default function(letta) {
+          letta.events.on("conversation_open", (event, ctx) => {
+            globalThis.__lettaExtensionEvents.push(
+              event.reason + ":" + event.agentId + ":" + ctx.context.agent.name + ":" + ctx.conversation.id,
+            );
+            letta.ui.setStatus("lifecycle", event.reason);
+          });
+          letta.events.on("conversation_open", () => {
+            throw new Error("event failed");
+          });
+        }`,
+      );
+
+      const backend: ExtensionRuntimeBackendApi = {
+        forkConversation: async () => ({ id: "forked" }),
+        getConversationHistory: async () => [],
+        sendMessageStream: async () => (async function* () {})(),
+      };
+      const host = createHost(root, undefined, backend);
+      await host.reload();
+      expect(host.getSnapshot().events.conversation_open).toHaveLength(2);
+
+      const result = await host.emitEvent("conversation_open", {
+        agentId: "agent-1",
+        agentName: "Amelia",
+        conversationId: "conversation-1",
+        reason: "startup",
+      });
+
+      const snapshot = host.getSnapshot();
+      expect(result).toMatchObject({
+        handlerCount: 2,
+        name: "conversation_open",
+      });
+      expect(result.diagnostics).toHaveLength(1);
+      expect(testGlobal.__lettaExtensionEvents).toEqual([
+        "startup:agent-1:Amelia:conversation-1",
+      ]);
+      expect(snapshot.ui.statusValues.lifecycle).toBe("startup");
+      expect(snapshot.errors.at(-1)).toMatchObject({
+        phase: "event",
+        error: expect.objectContaining({ message: "event failed" }),
+      });
+
+      host.dispose();
+    } finally {
+      delete testGlobal.__lettaExtensionEvents;
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  test("lets turn_start handlers replace input in registration order", async () => {
+    const root = createTempDir();
+    try {
+      const extensionDir = path.join(root, "global-extensions");
+      mkdirSync(extensionDir, { recursive: true });
+      writeFileSync(
+        path.join(extensionDir, "turn-start.ts"),
+        `export default function(letta) {
+          letta.events.on("turn_start", (event) => ({
+            input: event.input.map((item) =>
+              item.role === "user"
+                ? { ...item, content: String(item.content).replaceAll("??", "first") }
+                : item,
+            ),
+          }));
+          letta.events.on("turn_start", (event) => {
+            event.input = event.input.map((item) =>
+              item.role === "user"
+                ? { ...item, content: String(item.content).replaceAll("first", "second") }
+                : item,
+            );
+          });
+          letta.events.on("turn_start", (event) => {
+            event.input = event.input.map((item) =>
+              item.role === "user"
+                ? { ...item, content: "broken" }
+                : item,
+            );
+            throw new Error("turn_start failed");
+          });
+          letta.events.on("turn_start", (event) => {
+            event.input = event.input.map((item) =>
+              item.role === "user"
+                ? { ...item, content: String(item.content).replaceAll("second", "final") }
+                : item,
+            );
+          });
+        }`,
+      );
+
+      const host = createHost(root);
+      await host.reload();
+      const event = {
+        agentId: "agent-1",
+        conversationId: "conversation-1",
+        input: [{ role: "user" as const, content: "hello ??" }],
+      };
+
+      const result = await host.emitEvent("turn_start", event);
+
+      expect(result).toMatchObject({
+        handlerCount: 4,
+        name: "turn_start",
+      });
+      expect(result.diagnostics).toHaveLength(1);
+      expect(result.results).toHaveLength(1);
+      expect(event.input).toEqual([{ role: "user", content: "hello final" }]);
+
+      host.dispose();
     } finally {
       rmSync(root, { force: true, recursive: true });
     }
