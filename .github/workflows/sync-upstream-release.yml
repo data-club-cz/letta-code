@@ -94,6 +94,10 @@ jobs:
         env:
           TAG_LIST: ${{ steps.tags.outputs.tags }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # We add an `upstream` remote above, so `gh` would otherwise default
+          # the PR's base repo to the fork's parent (letta-ai/letta-code), where
+          # our token has no access. Pin every gh call to this fork.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           IFS=',' read -ra TAGS <<< "$TAG_LIST"
