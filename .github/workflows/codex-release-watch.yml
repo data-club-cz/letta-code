@@ -1,8 +1,11 @@
 name: Codex Release Watch
 
+# Upstream (letta-ai) maintenance tooling: files GitHub Issues tracking
+# openai/codex tool-surface drift, with Letta maintainers as reviewers. Issues
+# are disabled on this fork and we don't action these reports here, so the
+# hourly schedule is removed to stop it failing every run. Kept as
+# workflow_dispatch-only so it can still be triggered by hand if ever needed.
 on:
-  schedule:
-    - cron: "0 * * * *"
   workflow_dispatch:
     inputs:
       since_tag:

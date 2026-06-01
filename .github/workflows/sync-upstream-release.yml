@@ -105,12 +105,29 @@ jobs:
               echo "Merged $upstream_label cleanly."
               merged="${merged:+$merged, }$upstream_label"
             else
-              echo "::error::Conflict merging $upstream_label — opening PR for review."
               branch="sync/upstream-$upstream_label"
-              # Stage the conflict markers + any auto-merged hunks so we can
-              # commit them. `commit -am` won't include unmerged paths; we
-              # need an explicit `add -A` first.
+              # If a prior run already opened a conflict PR for this tag and it's
+              # still open, the conflict is awaiting human resolution. Don't
+              # re-notify or force-push every 6h — publish any clean merges from
+              # this run and stop quietly.
+              if gh pr view "$branch" --json state --jq .state 2>/dev/null | grep -qx OPEN; then
+                echo "Conflict PR for $upstream_label already open; awaiting resolution. Skipping."
+                git merge --abort
+                [ -n "$merged" ] && echo "merged_tags=$merged" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::Conflict merging $upstream_label — opening a PR for review."
+              # We're mid-merge with an unmerged index, and git refuses to switch
+              # branches in that state ("you need to resolve your current index
+              # first"). Abort to restore a clean data-club-patch, branch off,
+              # then redo the merge so the conflict markers land on the PR
+              # branch — never on data-club-patch itself.
+              git merge --abort
               git checkout -B "$branch"
+              # Redo the merge; it conflicts again. `|| true` stops set -e from
+              # aborting the step on the expected non-zero exit. `commit -am`
+              # skips unmerged paths, so stage everything with `add -A` first.
+              git merge --no-ff -m "chore: sync upstream $upstream_label" "$tag" || true
               git add -A
               git commit --no-verify -m "chore: sync upstream $upstream_label (CONFLICTS — resolve before merge)"
               git push origin "$branch" --force
@@ -123,11 +140,13 @@ jobs:
                 || echo "")
               echo "conflict_pr=$pr_url" >> "$GITHUB_OUTPUT"
               echo "conflict_tag=$upstream_label" >> "$GITHUB_OUTPUT"
-              # Persist any clean merges that happened before the conflict.
+              # Persist any clean merges that happened before the conflict so the
+              # later push step publishes them to data-club-patch.
               [ -n "$merged" ] && echo "merged_tags=$merged" >> "$GITHUB_OUTPUT"
-              git checkout data-club-patch -- .
-              git checkout data-club-patch
-              # Stop on first conflict — let the human resolve before continuing.
+              # Return to data-club-patch (still holding only the clean merges, if
+              # any) so "Push merged commits" never publishes conflict markers.
+              git checkout -f data-club-patch
+              # Stop on the first conflict — let a human resolve before continuing.
               exit 0
             fi
             echo "::endgroup::"
