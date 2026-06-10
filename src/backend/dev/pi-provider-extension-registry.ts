@@ -1,4 +1,10 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
+import {
+  type OAuthCredentials,
+  type OAuthLoginCallbacks,
+  registerOAuthProvider,
+  unregisterOAuthProvider,
+} from "@earendil-works/pi-ai/oauth";
 
 export type PiProviderInputType = "text" | "image";
 
@@ -22,14 +28,64 @@ export interface PiProviderModelRegistration {
   compat?: Model<Api>["compat"];
 }
 
+export interface PiProviderConnection {
+  id: string;
+  providerName: string;
+  baseUrl?: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+}
+
+export interface PiProviderConnectField {
+  key: string;
+  label: string;
+  placeholder?: string;
+  secret?: boolean;
+}
+
+export interface PiProviderConnectConfig {
+  fields?: PiProviderConnectField[];
+}
+
+export interface PiProviderOAuthDeviceCodeInfo {
+  verificationUri: string;
+  userCode: string;
+  intervalSeconds?: number;
+  expiresInSeconds?: number;
+}
+
+export interface PiProviderOAuthLoginCallbacks
+  extends Omit<OAuthLoginCallbacks, "onDeviceCode"> {
+  onDeviceCode?: (info: PiProviderOAuthDeviceCodeInfo) => void;
+}
+
+export interface PiProviderOAuthConfig {
+  name?: string;
+  login: (
+    callbacks: PiProviderOAuthLoginCallbacks,
+  ) => Promise<OAuthCredentials>;
+  refreshToken: (credentials: OAuthCredentials) => Promise<OAuthCredentials>;
+  getApiKey: (credentials: OAuthCredentials) => string;
+  modifyModels?: (
+    models: Model<Api>[],
+    credentials: OAuthCredentials,
+  ) => Model<Api>[];
+}
+
 export interface PiProviderRegistration {
   name?: string;
+  description?: string;
   baseUrl?: string;
   apiKey?: string;
   api?: Api;
   headers?: Record<string, string>;
   authHeader?: boolean;
   models?: PiProviderModelRegistration[];
+  listModels?: (
+    connection: PiProviderConnection,
+  ) => Promise<PiProviderModelRegistration[]> | PiProviderModelRegistration[];
+  connect?: boolean | PiProviderConnectConfig;
+  oauth?: PiProviderOAuthConfig;
 }
 
 export interface RegisteredPiProvider {
@@ -39,12 +95,46 @@ export interface RegisteredPiProvider {
   path?: string;
 }
 
+type PiProviderRegistryListener = () => void;
+
 const registeredProviders = new Map<string, RegisteredPiProvider>();
+const registryListeners = new Set<PiProviderRegistryListener>();
+
+function notifyRegistryListeners(): void {
+  for (const listener of [...registryListeners]) {
+    try {
+      listener();
+    } catch {
+      // Registry listeners are observers; a UI refresh failure should not make
+      // extension provider registration fail.
+    }
+  }
+}
+
+export function subscribePiProviderRegistry(
+  listener: PiProviderRegistryListener,
+): () => void {
+  registryListeners.add(listener);
+  return () => {
+    registryListeners.delete(listener);
+  };
+}
 
 function cloneHeaders(
   headers: Record<string, string> | undefined,
 ): Record<string, string> | undefined {
   return headers ? { ...headers } : undefined;
+}
+
+function resolveHeaderValues(
+  headers: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const resolved: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    resolved[key] = process.env[value] ?? value;
+  }
+  return resolved;
 }
 
 function cloneModel(
@@ -71,9 +161,9 @@ function cloneConfig(config: PiProviderRegistration): PiProviderRegistration {
 }
 
 function validateProviderName(providerName: string): void {
-  if (!/^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(providerName)) {
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(providerName)) {
     throw new Error(
-      "Provider name must start with a letter or number and contain only letters, numbers, dots, underscores, or hyphens",
+      "Provider name must start with a lowercase letter or number and contain only lowercase letters, numbers, dots, underscores, or hyphens",
     );
   }
 }
@@ -127,6 +217,9 @@ function validateModel(
   if (!model.id || typeof model.id !== "string") {
     throw new Error(`${label}: id is required`);
   }
+  if (model.id.includes("/")) {
+    throw new Error(`${label}: id must be unprefixed and cannot contain "/"`);
+  }
   if (!model.name || typeof model.name !== "string") {
     throw new Error(`${label}: name is required`);
   }
@@ -146,12 +239,97 @@ function validateModel(
   validateHeaders(model.headers, `${label}.headers`);
 }
 
+function validateConnectConfig(
+  providerName: string,
+  connect: PiProviderRegistration["connect"],
+): void {
+  if (connect === undefined || connect === true || connect === false) return;
+  if (!connect || typeof connect !== "object" || Array.isArray(connect)) {
+    throw new Error(
+      `Provider ${providerName}.connect must be boolean or object`,
+    );
+  }
+  if (connect.fields !== undefined) {
+    if (!Array.isArray(connect.fields)) {
+      throw new Error(
+        `Provider ${providerName}.connect.fields must be an array`,
+      );
+    }
+    for (const field of connect.fields) {
+      if (!field || typeof field !== "object") {
+        throw new Error(
+          `Provider ${providerName}.connect.fields entries must be objects`,
+        );
+      }
+      if (typeof field.key !== "string" || field.key.length === 0) {
+        throw new Error(
+          `Provider ${providerName}.connect.fields entries need a key`,
+        );
+      }
+      if (typeof field.label !== "string" || field.label.length === 0) {
+        throw new Error(
+          `Provider ${providerName}.connect.fields entries need a label`,
+        );
+      }
+      if (
+        field.placeholder !== undefined &&
+        typeof field.placeholder !== "string"
+      ) {
+        throw new Error(
+          `Provider ${providerName}.connect.fields placeholder must be a string`,
+        );
+      }
+      if (field.secret !== undefined && typeof field.secret !== "boolean") {
+        throw new Error(
+          `Provider ${providerName}.connect.fields secret must be boolean`,
+        );
+      }
+    }
+  }
+}
+
+function validateOAuthConfig(
+  providerName: string,
+  oauth: PiProviderRegistration["oauth"],
+): void {
+  if (oauth === undefined) return;
+  if (!oauth || typeof oauth !== "object" || Array.isArray(oauth)) {
+    throw new Error(`Provider ${providerName}.oauth must be an object`);
+  }
+  if (oauth.name !== undefined && typeof oauth.name !== "string") {
+    throw new Error(`Provider ${providerName}.oauth.name must be a string`);
+  }
+  for (const key of ["login", "refreshToken", "getApiKey"] as const) {
+    if (typeof oauth[key] !== "function") {
+      throw new Error(
+        `Provider ${providerName}.oauth.${key} must be a function`,
+      );
+    }
+  }
+  if (
+    oauth.modifyModels !== undefined &&
+    typeof oauth.modifyModels !== "function"
+  ) {
+    throw new Error(
+      `Provider ${providerName}.oauth.modifyModels must be a function`,
+    );
+  }
+}
+
 function validateProviderConfig(
   providerName: string,
   config: PiProviderRegistration,
 ): void {
   validateProviderName(providerName);
   validateHeaders(config.headers, `Provider ${providerName}.headers`);
+  validateConnectConfig(providerName, config.connect);
+  validateOAuthConfig(providerName, config.oauth);
+  if (
+    config.listModels !== undefined &&
+    typeof config.listModels !== "function"
+  ) {
+    throw new Error(`Provider ${providerName}.listModels must be a function`);
+  }
   if (
     config.authHeader !== undefined &&
     typeof config.authHeader !== "boolean"
@@ -175,6 +353,45 @@ function validateProviderConfig(
   }
 }
 
+function registerPiOAuthProvider(
+  providerName: string,
+  config: PiProviderRegistration,
+): void {
+  unregisterOAuthProvider(providerName);
+  if (!config.oauth) return;
+  registerOAuthProvider({
+    id: providerName,
+    name: config.oauth.name ?? config.name ?? providerName,
+    login: (callbacks) =>
+      config.oauth?.login(callbacks as PiProviderOAuthLoginCallbacks) ??
+      Promise.reject(
+        new Error(`Provider "${providerName}" OAuth is not registered`),
+      ),
+    refreshToken: (credentials) => {
+      if (!config.oauth) {
+        throw new Error(`Provider "${providerName}" OAuth is not registered`);
+      }
+      return config.oauth.refreshToken(credentials);
+    },
+    getApiKey: (credentials) => {
+      if (!config.oauth) {
+        throw new Error(`Provider "${providerName}" OAuth is not registered`);
+      }
+      return config.oauth.getApiKey(credentials);
+    },
+    ...(config.oauth.modifyModels
+      ? {
+          modifyModels: (models, credentials) =>
+            config.oauth?.modifyModels?.(models, credentials) ?? models,
+        }
+      : {}),
+  });
+}
+
+function unregisterPiOAuthProvider(providerName: string): void {
+  unregisterOAuthProvider(providerName);
+}
+
 export function registerPiProvider(
   providerName: string,
   config: PiProviderRegistration,
@@ -188,6 +405,8 @@ export function registerPiProvider(
     ...(owner?.path ? { path: owner.path } : {}),
   };
   registeredProviders.set(providerName, registered);
+  registerPiOAuthProvider(providerName, registered.config);
+  notifyRegistryListeners();
   return getRegisteredPiProvider(providerName) as RegisteredPiProvider;
 }
 
@@ -199,18 +418,29 @@ export function unregisterPiProvider(
   if (!existing) return;
   if (ownerId && existing.ownerId && existing.ownerId !== ownerId) return;
   registeredProviders.delete(providerName);
+  unregisterPiOAuthProvider(providerName);
+  notifyRegistryListeners();
 }
 
 export function unregisterPiProvidersForOwner(ownerId: string): void {
+  let changed = false;
   for (const [providerName, provider] of registeredProviders.entries()) {
     if (provider.ownerId === ownerId) {
       registeredProviders.delete(providerName);
+      unregisterPiOAuthProvider(providerName);
+      changed = true;
     }
   }
+  if (changed) notifyRegistryListeners();
 }
 
 export function clearRegisteredPiProviders(): void {
+  if (registeredProviders.size === 0) return;
+  for (const providerName of registeredProviders.keys()) {
+    unregisterPiOAuthProvider(providerName);
+  }
   registeredProviders.clear();
+  notifyRegistryListeners();
 }
 
 export function getRegisteredPiProvider(
@@ -254,4 +484,10 @@ export function resolveRegisteredPiProviderApiKey(
 ): string | undefined {
   if (!apiKey) return undefined;
   return process.env[apiKey] ?? apiKey;
+}
+
+export function resolveRegisteredPiProviderHeaders(
+  headers: PiProviderRegistration["headers"],
+): Record<string, string> | undefined {
+  return resolveHeaderValues(headers);
 }

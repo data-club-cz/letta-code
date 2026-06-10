@@ -18,8 +18,10 @@ import {
   getRegisteredPiProvider,
   type PiProviderModelRegistration,
   type PiProviderRegistration,
+  type RegisteredPiProvider,
   resolveRegisteredPiProviderApiKey,
   resolveRegisteredPiProviderFromModelHandle,
+  resolveRegisteredPiProviderHeaders,
   stripRegisteredProviderHandlePrefix,
 } from "./pi-provider-extension-registry";
 import {
@@ -111,14 +113,29 @@ export function resolvePiProviderFromAgent(
   model: string | undefined,
   modelSettings: PiModelSettings = {},
 ): PiProvider {
-  return (
-    (resolveRegisteredPiProviderFromModelHandle(model) as
-      | PiProvider
-      | undefined) ??
-    resolveProviderFromModelHandle(model) ??
-    resolveProviderFromProviderType(modelSettings.provider_type) ??
-    resolvePiProvider()
+  const registeredProvider = resolveRegisteredPiProviderFromModelHandle(
+    model,
+  ) as PiProvider | undefined;
+  if (registeredProvider) return registeredProvider;
+
+  const handleProvider = resolveProviderFromModelHandle(model);
+  if (handleProvider) return handleProvider;
+
+  const settingsProvider = resolveProviderFromProviderType(
+    modelSettings.provider_type,
   );
+  if (settingsProvider) return settingsProvider;
+
+  if (model) {
+    const slashIndex = model.indexOf("/");
+    if (slashIndex > 0) {
+      throw new Error(
+        `Model provider "${model.slice(0, slashIndex)}" is not registered. Load or repair the provider extension, or choose another model with /model.`,
+      );
+    }
+  }
+
+  return resolvePiProvider();
 }
 
 export function resolvePiModelFromAgent(
@@ -160,6 +177,58 @@ function localProviderConnection(
     }),
     ...(record ? { record } : {}),
   };
+}
+
+function registeredProviderLocalNames(
+  provider: RegisteredPiProvider,
+): readonly string[] {
+  return isPiProvider(provider.providerName)
+    ? getPiProviderSpec(provider.providerName).localProviderNames
+    : [provider.providerName];
+}
+
+function registeredProviderConnection(
+  provider: RegisteredPiProvider,
+  storageDir?: string,
+): {
+  apiKey?: string;
+  baseURL?: string;
+  timeout: LocalProviderTimeout;
+  headers?: Record<string, string>;
+  record?: LocalProviderRecord;
+} {
+  const providerNames = registeredProviderLocalNames(provider);
+  const record = localProviderRecord(providerNames, storageDir);
+  return {
+    apiKey:
+      localProviderApiKeyFromRecord(record) ??
+      resolveRegisteredPiProviderApiKey(provider.config.apiKey),
+    baseURL: record?.base_url ?? provider.config.baseUrl,
+    timeout: resolveLocalProviderTimeout({
+      configuredTimeout: record?.timeout,
+      providerIds: providerNames,
+    }),
+    headers: resolveRegisteredPiProviderHeaders(provider.config.headers),
+    ...(record ? { record } : {}),
+  };
+}
+
+async function registeredProviderModels(
+  provider: RegisteredPiProvider,
+  connection: {
+    apiKey?: string;
+    baseURL?: string;
+    headers?: Record<string, string>;
+  },
+): Promise<PiProviderModelRegistration[]> {
+  const listed = await provider.config.listModels?.({
+    id: provider.providerName,
+    providerName: provider.providerName,
+    baseUrl: connection.baseURL,
+    apiKey: connection.apiKey,
+    headers: connection.headers,
+  });
+  return listed ?? provider.config.models ?? [];
 }
 
 export interface ZaiConnection {
@@ -427,28 +496,20 @@ export async function resolvePiModelForAgent(
       ? modelSettings.provider_type
       : options.preferredProviderType;
 
-  const registeredApiKey = resolveRegisteredPiProviderApiKey(
-    registeredProvider?.config.apiKey,
-  );
-  let connection = spec
-    ? localProviderConnection(
-        spec.localProviderNames,
-        registeredApiKey ?? spec.apiKeyEnv?.() ?? spec.fallbackApiKey,
-        storageDir,
-      )
-    : {
-        apiKey: registeredApiKey,
-        timeout: resolveLocalProviderTimeout({ providerIds: [provider] }),
-      };
+  let connection = registeredProvider
+    ? registeredProviderConnection(registeredProvider, storageDir)
+    : spec
+      ? localProviderConnection(
+          spec.localProviderNames,
+          spec.apiKeyEnv?.() ?? spec.fallbackApiKey,
+          storageDir,
+        )
+      : {
+          timeout: resolveLocalProviderTimeout({ providerIds: [provider] }),
+        };
   let baseURL =
-    connection.baseURL ??
-    registeredProvider?.config.baseUrl ??
-    spec?.baseUrlEnv?.() ??
-    spec?.defaultBaseURL;
-  let headers = mergeHeaders(
-    spec?.headers?.(),
-    registeredProvider?.config.headers,
-  );
+    connection.baseURL ?? spec?.baseUrlEnv?.() ?? spec?.defaultBaseURL;
+  let headers = mergeHeaders(spec?.headers?.(), connection.headers);
   let providerOptions: Record<string, unknown> | undefined;
   let envOverrides: Record<string, string | undefined> | undefined;
   let oauthCredentials: OAuthCredentials | undefined;
@@ -483,6 +544,22 @@ export async function resolvePiModelForAgent(
     oauthCredentials = oauth?.credentials;
   }
 
+  if (
+    connection.record?.auth.type === "oauth" &&
+    registeredProvider?.config.oauth
+  ) {
+    const oauth = await getLocalOAuthApiKey({
+      providerId: registeredProvider.providerName,
+      providerNames: registeredProviderLocalNames(registeredProvider),
+      storageDir,
+    });
+    connection = {
+      ...connection,
+      apiKey: oauth?.apiKey,
+    };
+    oauthCredentials = oauth?.credentials;
+  }
+
   if (provider === "amazon-bedrock") {
     const bedrock = bedrockLocalProviderOptions(connection.record);
     providerOptions = bedrock.providerOptions;
@@ -497,7 +574,9 @@ export async function resolvePiModelForAgent(
     registeredProvider?.config.authHeader,
   );
 
-  const registeredModels = registeredProvider?.config.models;
+  const registeredModels = registeredProvider
+    ? await registeredProviderModels(registeredProvider, connection)
+    : undefined;
   const registeredModel = registeredModels?.find(
     (model) => model.id === modelId,
   );
@@ -512,19 +591,24 @@ export async function resolvePiModelForAgent(
     : baseURL;
   let model: Model<Api>;
   if (registeredModel && registeredProvider) {
-    model = withOverrides(
-      registeredModelToPiModel({
-        providerName: provider,
-        config: registeredProvider.config,
-        model: registeredModel,
-        baseURL: normalizedBaseURL,
-        headers: mergeHeaders(headers, registeredModel.headers),
-      }),
-      {
-        contextWindow,
-        maxTokens,
-      },
-    );
+    const baseModel = registeredModelToPiModel({
+      providerName: provider,
+      config: registeredProvider.config,
+      model: registeredModel,
+      baseURL: normalizedBaseURL,
+      headers: mergeHeaders(headers, registeredModel.headers),
+    });
+    const oauthModel =
+      oauthCredentials && registeredProvider.config.oauth?.modifyModels
+        ? (registeredProvider.config.oauth.modifyModels(
+            [baseModel],
+            oauthCredentials,
+          )[0] ?? baseModel)
+        : baseModel;
+    model = withOverrides(oauthModel, {
+      contextWindow,
+      maxTokens,
+    });
   } else if (!spec) {
     throw new Error(
       `Unknown model "${modelId}" for provider "${provider}". ` +

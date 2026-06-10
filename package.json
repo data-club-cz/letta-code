@@ -1,7 +1,13 @@
 {
+<<<<<<< HEAD
   "name": "@data-club/letta-code",
   "version": "0.26.3",
   "description": "DataClub fork of Letta Code — CLI tool for interacting with stateful Letta agents from the terminal.",
+=======
+  "name": "@letta-ai/letta-code",
+  "version": "0.26.4",
+  "description": "Letta Code is a CLI tool for interacting with stateful Letta agents from the terminal.",
+>>>>>>> upstream-v0.26.4
   "type": "module",
   "packageManager": "bun@1.3.0",
   "bin": {
