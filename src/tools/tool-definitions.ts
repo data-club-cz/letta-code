@@ -4,8 +4,8 @@ import AskUserQuestionDescription from "./descriptions/AskUserQuestion.md";
 import BashDescription from "./descriptions/Bash.md";
 import BashOutputDescription from "./descriptions/BashOutput.md";
 import CreateGoalDescription from "./descriptions/CreateGoal.md";
-import CreateWorktreeDescription from "./descriptions/CreateWorktree.md";
 import EditDescription from "./descriptions/Edit.md";
+import EnterWorktreeDescription from "./descriptions/EnterWorktree.md";
 import ExecCommandDescription from "./descriptions/ExecCommand.md";
 import GetGoalDescription from "./descriptions/GetGoal.md";
 import GlobDescription from "./descriptions/Glob.md";
@@ -22,6 +22,7 @@ import MemoryApplyPatchDescription from "./descriptions/MemoryApplyPatch.md";
 import MessageChannelDescription from "./descriptions/MessageChannel.md";
 import MultiEditDescription from "./descriptions/MultiEdit.md";
 import ReadDescription from "./descriptions/Read.md";
+import ReadArtifactFileDescription from "./descriptions/ReadArtifactFile.md";
 import ReadFileCodexDescription from "./descriptions/ReadFileCodex.md";
 import ReadFileGeminiDescription from "./descriptions/ReadFileGemini.md";
 import ReadLSPDescription from "./descriptions/ReadLSP.md";
@@ -33,23 +34,29 @@ import ShellDescription from "./descriptions/Shell.md";
 import ShellCommandDescription from "./descriptions/ShellCommand.md";
 import SkillDescription from "./descriptions/Skill.md";
 import TaskDescription from "./descriptions/Task.md";
+import TaskCreateDescription from "./descriptions/TaskCreate.md";
+import TaskGetDescription from "./descriptions/TaskGet.md";
+import TaskListDescription from "./descriptions/TaskList.md";
 import TaskOutputDescription from "./descriptions/TaskOutput.md";
 import TaskStopDescription from "./descriptions/TaskStop.md";
+import TaskUpdateDescription from "./descriptions/TaskUpdate.md";
 import TodoWriteDescription from "./descriptions/TodoWrite.md";
 import UpdateGoalDescription from "./descriptions/UpdateGoal.md";
 import UpdatePlanDescription from "./descriptions/UpdatePlan.md";
 import ViewImageDescription from "./descriptions/ViewImage.md";
 import WriteDescription from "./descriptions/Write.md";
+import WriteArtifactFileDescription from "./descriptions/WriteArtifactFile.md";
 import WriteFileGeminiDescription from "./descriptions/WriteFileGemini.md";
 import WriteStdinDescription from "./descriptions/WriteStdin.md";
 import WriteTodosGeminiDescription from "./descriptions/WriteTodosGemini.md";
 import { apply_patch } from "./impl/apply-patch";
+import { read_artifact_file, write_artifact_file } from "./impl/artifact-files";
 import { ask_user_question } from "./impl/ask-user-question";
 import { bash } from "./impl/bash";
 import { bash_output } from "./impl/bash-output";
 import { create_goal } from "./impl/create-goal";
-import { create_worktree } from "./impl/create-worktree";
 import { edit } from "./impl/edit";
+import { enter_worktree } from "./impl/enter-worktree";
 import { exec_command, write_stdin } from "./impl/exec-command";
 import { get_goal } from "./impl/get-goal";
 import { glob } from "./impl/glob";
@@ -77,8 +84,12 @@ import { shell } from "./impl/shell";
 import { shell_command } from "./impl/shell-command";
 import { skill } from "./impl/skill";
 import { task } from "./impl/task";
+import { task_create } from "./impl/task-create";
+import { task_get } from "./impl/task-get";
+import { task_list } from "./impl/task-list";
 import { task_output } from "./impl/task-output";
 import { task_stop } from "./impl/task-stop";
+import { task_update } from "./impl/task-update";
 import { todo_write } from "./impl/todo-write";
 import { update_goal } from "./impl/update-goal";
 import { update_plan } from "./impl/update-plan";
@@ -92,8 +103,8 @@ import AskUserQuestionSchema from "./schemas/AskUserQuestion.json";
 import BashSchema from "./schemas/Bash.json";
 import BashOutputSchema from "./schemas/BashOutput.json";
 import CreateGoalSchema from "./schemas/CreateGoal.json";
-import CreateWorktreeSchema from "./schemas/CreateWorktree.json";
 import EditSchema from "./schemas/Edit.json";
+import EnterWorktreeSchema from "./schemas/EnterWorktree.json";
 import ExecCommandSchema from "./schemas/ExecCommand.json";
 import GetGoalSchema from "./schemas/GetGoal.json";
 import GlobSchema from "./schemas/Glob.json";
@@ -110,6 +121,7 @@ import MemoryApplyPatchSchema from "./schemas/MemoryApplyPatch.json";
 import MessageChannelSchema from "./schemas/MessageChannel.json";
 import MultiEditSchema from "./schemas/MultiEdit.json";
 import ReadSchema from "./schemas/Read.json";
+import ReadArtifactFileSchema from "./schemas/ReadArtifactFile.json";
 import ReadFileCodexSchema from "./schemas/ReadFileCodex.json";
 import ReadFileGeminiSchema from "./schemas/ReadFileGemini.json";
 import ReadLSPSchema from "./schemas/ReadLSP.json";
@@ -121,13 +133,18 @@ import ShellSchema from "./schemas/Shell.json";
 import ShellCommandSchema from "./schemas/ShellCommand.json";
 import SkillSchema from "./schemas/Skill.json";
 import TaskSchema from "./schemas/Task.json";
+import TaskCreateSchema from "./schemas/TaskCreate.json";
+import TaskGetSchema from "./schemas/TaskGet.json";
+import TaskListSchema from "./schemas/TaskList.json";
 import TaskOutputSchema from "./schemas/TaskOutput.json";
 import TaskStopSchema from "./schemas/TaskStop.json";
+import TaskUpdateSchema from "./schemas/TaskUpdate.json";
 import TodoWriteSchema from "./schemas/TodoWrite.json";
 import UpdateGoalSchema from "./schemas/UpdateGoal.json";
 import UpdatePlanSchema from "./schemas/UpdatePlan.json";
 import ViewImageSchema from "./schemas/ViewImage.json";
 import WriteSchema from "./schemas/Write.json";
+import WriteArtifactFileSchema from "./schemas/WriteArtifactFile.json";
 import WriteFileGeminiSchema from "./schemas/WriteFileGemini.json";
 import WriteStdinSchema from "./schemas/WriteStdin.json";
 import WriteTodosGeminiSchema from "./schemas/WriteTodosGemini.json";
@@ -136,6 +153,21 @@ const WINDOWS_UNIFIED_EXEC_GUIDANCE = `Windows safety rules:
 - Do not compose destructive filesystem commands across shells. Do not enumerate paths in PowerShell and then pass them to \`cmd /c\`, batch builtins, or another shell for deletion or moving. Use one shell end-to-end, prefer native PowerShell cmdlets such as \`Remove-Item\` / \`Move-Item\` with \`-LiteralPath\`, and avoid string-built shell commands for file operations.
 - Before any recursive delete or move on Windows, verify the resolved absolute target paths stay within the intended workspace or explicitly named target directory. Never issue a recursive delete or move against a computed path if the final target has not been checked.
 - When using \`Start-Process\` to launch a background helper or service, pass \`-WindowStyle Hidden\` unless the user explicitly asked for a visible interactive window. Use visible windows only for interactive tools the user needs to see or control.`;
+
+const WINDOWS_BASH_EXECUTION_GUIDANCE = `Windows execution:
+- Despite the tool name, on Windows this tool does not run commands through bash by default. It uses the native Windows shell launcher: PowerShell Core (\`pwsh\`) when available, then Windows PowerShell, then \`cmd.exe\` as fallback.
+- Write commands using PowerShell-compatible syntax by default. POSIX/bash constructs such as heredocs, \`export VAR=...\`, and Unix-style shell quoting may not work unless you explicitly invoke a POSIX shell.
+
+${WINDOWS_UNIFIED_EXEC_GUIDANCE}`;
+
+export function buildBashDescriptionForPlatform(
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const baseDescription = BashDescription.trim();
+  return platform === "win32"
+    ? `${baseDescription}\n\n${WINDOWS_BASH_EXECUTION_GUIDANCE}`
+    : baseDescription;
+}
 
 function execCommandDescription(): string {
   const baseDescription = ExecCommandDescription.trim();
@@ -152,7 +184,7 @@ const toolDefinitions = {
   }),
   Bash: defineTool({
     schema: BashSchema,
-    description: BashDescription.trim(),
+    description: buildBashDescriptionForPlatform(),
     impl: bash,
   }),
   BashOutput: defineTool({
@@ -160,10 +192,10 @@ const toolDefinitions = {
     description: BashOutputDescription.trim(),
     impl: bash_output,
   }),
-  CreateWorktree: defineTool({
-    schema: CreateWorktreeSchema,
-    description: CreateWorktreeDescription.trim(),
-    impl: create_worktree,
+  EnterWorktree: defineTool({
+    schema: EnterWorktreeSchema,
+    description: EnterWorktreeDescription.trim(),
+    impl: enter_worktree,
   }),
   Edit: defineTool({
     schema: EditSchema,
@@ -225,6 +257,11 @@ const toolDefinitions = {
     description: ReadDescription.trim(),
     impl: read,
   }),
+  read_artifact_file: defineTool({
+    schema: ReadArtifactFileSchema,
+    description: ReadArtifactFileDescription.trim(),
+    impl: read_artifact_file,
+  }),
   view_image: defineTool({
     schema: ViewImageSchema,
     description: ViewImageDescription.trim(),
@@ -251,6 +288,26 @@ const toolDefinitions = {
     description: TaskDescription.trim(),
     impl: task,
   }),
+  TaskCreate: defineTool({
+    schema: TaskCreateSchema,
+    description: TaskCreateDescription.trim(),
+    impl: task_create,
+  }),
+  TaskGet: defineTool({
+    schema: TaskGetSchema,
+    description: TaskGetDescription.trim(),
+    impl: task_get,
+  }),
+  TaskList: defineTool({
+    schema: TaskListSchema,
+    description: TaskListDescription.trim(),
+    impl: task_list,
+  }),
+  TaskUpdate: defineTool({
+    schema: TaskUpdateSchema,
+    description: TaskUpdateDescription.trim(),
+    impl: task_update,
+  }),
   TodoWrite: defineTool({
     schema: TodoWriteSchema,
     description: TodoWriteDescription.trim(),
@@ -260,6 +317,11 @@ const toolDefinitions = {
     schema: WriteSchema,
     description: WriteDescription.trim(),
     impl: write,
+  }),
+  write_artifact_file: defineTool({
+    schema: WriteArtifactFileSchema,
+    description: WriteArtifactFileDescription.trim(),
+    impl: write_artifact_file,
   }),
   shell_command: defineTool({
     schema: ShellCommandSchema,

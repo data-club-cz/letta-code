@@ -3,15 +3,22 @@ import {
   addTask as addCronTask,
   deleteAllTasks as deleteAllCronTasks,
   deleteTask as deleteCronTask,
+  getCronRunLogPath,
   getTask as getCronTask,
   listTasks as listCronTasks,
+  readCronRunLogEntriesPage,
+  updateTask as updateCronTask,
 } from "@/cron";
+import { runCronTaskNow } from "@/cron/scheduler";
 import type {
   CronAddCommand,
   CronDeleteAllCommand,
   CronDeleteCommand,
   CronGetCommand,
   CronListCommand,
+  CronRunsCommand,
+  CronTriggerCommand,
+  CronUpdateCommand,
 } from "@/types/protocol_v2";
 import {
   isCronAddCommand,
@@ -19,6 +26,9 @@ import {
   isCronDeleteCommand,
   isCronGetCommand,
   isCronListCommand,
+  isCronRunsCommand,
+  isCronTriggerCommand,
+  isCronUpdateCommand,
 } from "@/websocket/listener/protocol-inbound";
 import type { RunDetachedListenerTask, SafeSocketSend } from "./types";
 
@@ -26,6 +36,9 @@ export type CronCommand =
   | CronListCommand
   | CronAddCommand
   | CronGetCommand
+  | CronRunsCommand
+  | CronTriggerCommand
+  | CronUpdateCommand
   | CronDeleteCommand
   | CronDeleteAllCommand;
 
@@ -178,6 +191,142 @@ export async function handleCronCommand(
     return true;
   }
 
+  if (parsed.type === "cron_runs") {
+    try {
+      const page = readCronRunLogEntriesPage(
+        getCronRunLogPath(parsed.task_id),
+        {
+          jobId: parsed.task_id,
+          limit: parsed.limit,
+          offset: parsed.offset,
+          runId: parsed.run_id,
+        },
+      );
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_runs_response",
+          request_id: parsed.request_id,
+          success: true,
+          page,
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+    } catch (err) {
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_runs_response",
+          request_id: parsed.request_id,
+          success: false,
+          error:
+            err instanceof Error
+              ? err.message
+              : "Failed to list cron run history",
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+    }
+    return true;
+  }
+
+  if (parsed.type === "cron_trigger") {
+    try {
+      const result = await runCronTaskNow(parsed.task_id);
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_trigger_response",
+          request_id: parsed.request_id,
+          success: result.success,
+          found: result.found,
+          ...(result.task ? { task: result.task } : {}),
+          ...(result.error ? { error: result.error } : {}),
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+    } catch (err) {
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_trigger_response",
+          request_id: parsed.request_id,
+          success: false,
+          found: false,
+          error: err instanceof Error ? err.message : "Failed to trigger cron",
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+    }
+    return true;
+  }
+
+  if (parsed.type === "cron_update") {
+    try {
+      let scheduledForIso: string | null | undefined;
+      if (parsed.scheduled_for === null) {
+        scheduledForIso = null;
+      } else if (parsed.scheduled_for !== undefined) {
+        const scheduledFor = new Date(parsed.scheduled_for);
+        if (Number.isNaN(scheduledFor.getTime())) {
+          throw new Error("Invalid scheduled_for timestamp");
+        }
+        scheduledForIso = scheduledFor.toISOString();
+      }
+      const task = updateCronTask(parsed.task_id, (current) => {
+        if (parsed.name !== undefined) current.name = parsed.name;
+        if (parsed.description !== undefined) {
+          current.description = parsed.description;
+        }
+        if (parsed.conversation_id !== undefined) {
+          current.conversation_id = parsed.conversation_id;
+        }
+        if (parsed.cron !== undefined) current.cron = parsed.cron;
+        if (parsed.timezone !== undefined) current.timezone = parsed.timezone;
+        if (parsed.recurring !== undefined)
+          current.recurring = parsed.recurring;
+        if (parsed.prompt !== undefined) current.prompt = parsed.prompt;
+        if (parsed.scheduled_for !== undefined) {
+          current.scheduled_for = scheduledForIso ?? null;
+        }
+      });
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_update_response",
+          request_id: parsed.request_id,
+          success: task !== null,
+          ...(task ? { task } : { error: "Cron task not found" }),
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+      if (task) {
+        emitCronsUpdated(socket, safeSocketSend, {
+          agent_id: task.agent_id,
+          conversation_id: task.conversation_id,
+        });
+      }
+    } catch (err) {
+      safeSocketSend(
+        socket,
+        {
+          type: "cron_update_response",
+          request_id: parsed.request_id,
+          success: false,
+          error: err instanceof Error ? err.message : "Failed to update cron",
+        },
+        "listener_cron_send_failed",
+        "listener_cron_command",
+      );
+    }
+    return true;
+  }
+
   if (parsed.type === "cron_delete") {
     try {
       const existingTask = getCronTask(parsed.task_id);
@@ -263,6 +412,9 @@ export function handleCronProtocolCommand(
     isCronListCommand(parsed) ||
     isCronAddCommand(parsed) ||
     isCronGetCommand(parsed) ||
+    isCronRunsCommand(parsed) ||
+    isCronTriggerCommand(parsed) ||
+    isCronUpdateCommand(parsed) ||
     isCronDeleteCommand(parsed) ||
     isCronDeleteAllCommand(parsed)
   ) {

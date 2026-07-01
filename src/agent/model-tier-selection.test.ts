@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+  getChatGptFastRegistryHandleForModelHandle,
   getModelInfo,
   getModelInfoForLlmConfig,
   getReasoningTierOptionsForHandle,
@@ -8,7 +9,31 @@ import {
 } from "@/agent/model";
 
 describe("getModelInfo", () => {
-  test("includes Bedrock Opus 4.7", () => {
+  test("points opus alias at Opus 4.8 high", () => {
+    const info = getModelInfo("opus");
+    expect(info?.handle).toBe("anthropic/claude-opus-4-8");
+    expect(info?.label).toBe("Opus 4.8");
+    expect(info?.updateArgs).toMatchObject({
+      context_window: 200000,
+      reasoning_effort: "high",
+      enable_reasoner: true,
+    });
+  });
+
+  test("resolves Fable 5 registry metadata", () => {
+    const info = getModelInfo("fable");
+    expect(info?.handle).toBe("anthropic/claude-fable-5");
+    expect(info?.label).toBe("Fable 5");
+    expect(info?.updateArgs).toMatchObject({
+      context_window: 1000000,
+      max_output_tokens: 128000,
+      enable_reasoner: true,
+      reasoning_effort: "high",
+      parallel_tool_calls: true,
+    });
+  });
+
+  test("preserves Bedrock Opus 4.7", () => {
     const info = getModelInfo("bedrock-opus-4.7");
     expect(info?.handle).toBe("bedrock/us.anthropic.claude-opus-4-7");
     expect(info?.label).toBe("Bedrock Opus 4.7");
@@ -16,6 +41,16 @@ describe("getModelInfo", () => {
       context_window: 200000,
       reasoning_effort: "medium",
       enable_reasoner: true,
+    });
+  });
+
+  test("resolves MiniMax M3 registry metadata", () => {
+    const info = getModelInfo("minimax-m3");
+    expect(info?.handle).toBe("minimax/MiniMax-M3");
+    expect(info?.label).toBe("MiniMax M3");
+    expect(info?.updateArgs).toMatchObject({
+      context_window: 500000,
+      parallel_tool_calls: true,
     });
   });
 });
@@ -36,6 +71,30 @@ describe("getModelInfoForLlmConfig", () => {
     expect(xhigh?.id).toBe("gpt-5.4-xhigh");
   });
 
+  test("uses ChatGPT metadata for local ChatGPT OAuth handles", () => {
+    const info = getModelInfoForLlmConfig("openai-codex/gpt-5.5", {
+      reasoning_effort: "high",
+    });
+    expect(info?.id).toBe("gpt-5.5-plus-pro-high");
+    expect(info?.label).toBe("GPT-5.5 (ChatGPT)");
+  });
+
+  test("uses Fast ChatGPT metadata when local ChatGPT service tier is priority", () => {
+    const info = getModelInfoForLlmConfig("openai-codex/gpt-5.5", {
+      reasoning_effort: "high",
+      service_tier: "priority",
+    });
+    expect(info?.id).toBe("gpt-5.5-fast-plus-pro-high");
+    expect(info?.label).toBe("GPT-5.5 Fast (ChatGPT)");
+  });
+
+  test("does not treat synthetic local ChatGPT Fast handles as registry models", () => {
+    const info = getModelInfoForLlmConfig("openai-codex/gpt-5.5-fast", {
+      reasoning_effort: "high",
+    });
+    expect(info).toBeNull();
+  });
+
   test("falls back to first handle match when effort missing", () => {
     const handle = "openai/gpt-5.4";
     const info = getModelInfoForLlmConfig(handle, null);
@@ -44,13 +103,13 @@ describe("getModelInfoForLlmConfig", () => {
   });
 
   test("selects opus 1M variant by context_window", () => {
-    const handle = "anthropic/claude-opus-4-6";
+    const handle = "anthropic/claude-opus-4-8";
 
     const withEffort = getModelInfoForLlmConfig(handle, {
       context_window: 950000,
       reasoning_effort: "high",
     });
-    expect(withEffort?.id).toBe("opus-1m");
+    expect(withEffort?.id).toBe("opus-4.8-1m");
 
     // With 1M context_window but no effort → still a 1M variant (not 200k "opus")
     const noEffort = getModelInfoForLlmConfig(handle, {
@@ -60,6 +119,15 @@ describe("getModelInfoForLlmConfig", () => {
     expect(
       (noEffort?.updateArgs as { context_window?: number })?.context_window,
     ).toBe(950000);
+  });
+
+  test("keeps existing opus 4.6 1M variant ids stable", () => {
+    const info = getModelInfoForLlmConfig("anthropic/claude-opus-4-6", {
+      context_window: 950000,
+      reasoning_effort: "high",
+    });
+    expect(info?.id).toBe("opus-1m");
+    expect(info?.label).toBe("Opus 4.6 1M");
   });
 
   test("selects sonnet 1M variant by context_window", () => {
@@ -118,9 +186,9 @@ describe("getReasoningTierOptionsForHandle", () => {
     ]);
   });
 
-  test("returns byok reasoning options for chatgpt-plus-pro gpt-5.3-codex", () => {
+  test("returns byok reasoning options for chatgpt-plus-pro gpt-5.5", () => {
     const options = getReasoningTierOptionsForHandle(
-      "chatgpt-plus-pro/gpt-5.3-codex",
+      "chatgpt-plus-pro/gpt-5.5",
     );
     expect(options.map((option) => option.effort)).toEqual([
       "none",
@@ -130,18 +198,16 @@ describe("getReasoningTierOptionsForHandle", () => {
       "xhigh",
     ]);
     expect(options.map((option) => option.modelId)).toEqual([
-      "gpt-5.3-codex-plus-pro-none",
-      "gpt-5.3-codex-plus-pro-low",
-      "gpt-5.3-codex-plus-pro-medium",
-      "gpt-5.3-codex-plus-pro-high",
-      "gpt-5.3-codex-plus-pro-xhigh",
+      "gpt-5.5-plus-pro-none",
+      "gpt-5.5-plus-pro-low",
+      "gpt-5.5-plus-pro-medium",
+      "gpt-5.5-plus-pro-high",
+      "gpt-5.5-plus-pro-xhigh",
     ]);
   });
 
-  test("returns byok reasoning options for chatgpt-plus-pro gpt-5.5", () => {
-    const options = getReasoningTierOptionsForHandle(
-      "chatgpt-plus-pro/gpt-5.5",
-    );
+  test("returns ChatGPT reasoning options for local ChatGPT OAuth gpt-5.5", () => {
+    const options = getReasoningTierOptionsForHandle("openai-codex/gpt-5.5");
     expect(options.map((option) => option.effort)).toEqual([
       "none",
       "low",
@@ -178,6 +244,27 @@ describe("getReasoningTierOptionsForHandle", () => {
     ]);
   });
 
+  test("resolves Fast registry handles for supported local ChatGPT OAuth models", () => {
+    expect(
+      getChatGptFastRegistryHandleForModelHandle("openai-codex/gpt-5.5"),
+    ).toBe("chatgpt-plus-pro/gpt-5.5-fast");
+    expect(
+      getChatGptFastRegistryHandleForModelHandle("openai-codex/gpt-5.4"),
+    ).toBe("chatgpt-plus-pro/gpt-5.4-fast");
+    expect(
+      getChatGptFastRegistryHandleForModelHandle("chatgpt-plus-pro/gpt-5.5"),
+    ).toBe("chatgpt-plus-pro/gpt-5.5-fast");
+    expect(
+      getChatGptFastRegistryHandleForModelHandle("openai-codex/gpt-5.5-fast"),
+    ).toBeNull();
+  });
+
+  test("does not return reasoning options for synthetic local ChatGPT Fast handles", () => {
+    expect(
+      getReasoningTierOptionsForHandle("openai-codex/gpt-5.5-fast"),
+    ).toEqual([]);
+  });
+
   test("returns reasoning options for anthropic sonnet 4.6", () => {
     const options = getReasoningTierOptionsForHandle(
       "anthropic/claude-sonnet-4-6",
@@ -193,8 +280,28 @@ describe("getReasoningTierOptionsForHandle", () => {
       "sonnet-4.6-no-reasoning",
       "sonnet-4.6-low",
       "sonnet-4.6-medium",
-      "sonnet",
+      "sonnet-4.6",
       "sonnet-4.6-xhigh",
+    ]);
+  });
+
+  test("returns reasoning options for anthropic sonnet 5", () => {
+    const options = getReasoningTierOptionsForHandle(
+      "anthropic/claude-sonnet-5",
+    );
+    expect(options.map((option) => option.effort)).toEqual([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+    ]);
+    expect(options.map((option) => option.modelId)).toEqual([
+      "sonnet-5-no-reasoning",
+      "sonnet-5-low",
+      "sonnet-5-medium",
+      "sonnet",
+      "sonnet-5-xhigh",
     ]);
   });
 
@@ -218,6 +325,46 @@ describe("getReasoningTierOptionsForHandle", () => {
     ]);
   });
 
+  test("returns reasoning options for anthropic opus 4.8", () => {
+    const options = getReasoningTierOptionsForHandle(
+      "anthropic/claude-opus-4-8",
+    );
+    expect(options.map((option) => option.effort)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(options.map((option) => option.modelId)).toEqual([
+      "opus-4.8-low",
+      "opus-4.8-medium",
+      "opus", // featured entry uses high; wins first-seen dedup
+      "opus-4.8-xhigh",
+      "opus-4.8-max",
+    ]);
+  });
+
+  test("returns reasoning options for anthropic fable 5", () => {
+    const options = getReasoningTierOptionsForHandle(
+      "anthropic/claude-fable-5",
+    );
+    expect(options.map((option) => option.effort)).toEqual([
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+    expect(options.map((option) => option.modelId)).toEqual([
+      "fable-low",
+      "fable-medium",
+      "fable",
+      "fable-xhigh",
+      "fable-max",
+    ]);
+  });
+
   test("returns reasoning options for anthropic opus 4.7", () => {
     const options = getReasoningTierOptionsForHandle(
       "anthropic/claude-opus-4-7",
@@ -231,7 +378,7 @@ describe("getReasoningTierOptionsForHandle", () => {
     ]);
     expect(options.map((option) => option.modelId)).toEqual([
       "opus-4.7-low",
-      "opus", // featured entry uses medium; wins first-seen dedup
+      "opus-4.7-medium",
       "opus-4.7-high",
       "opus-4.7-xhigh",
       "opus-4.7-max",
@@ -258,7 +405,7 @@ describe("getReasoningTierOptionsForHandle", () => {
 
   test("returns only 1M reasoning options when context_window specified for opus", () => {
     const options = getReasoningTierOptionsForHandle(
-      "anthropic/claude-opus-4-6",
+      "anthropic/claude-opus-4-8",
       950000,
     );
     for (const option of options) {
@@ -268,7 +415,7 @@ describe("getReasoningTierOptionsForHandle", () => {
 
   test("returns only 200k reasoning options when no context_window for opus", () => {
     const options = getReasoningTierOptionsForHandle(
-      "anthropic/claude-opus-4-6",
+      "anthropic/claude-opus-4-8",
     );
     for (const option of options) {
       expect(option.modelId).not.toContain("1m");

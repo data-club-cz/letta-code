@@ -18,13 +18,12 @@ import type { ModelReasoningEffort } from "@/agent/model";
 import { LETTA_CLOUD_API_URL } from "@/auth/oauth";
 import { buildStatuslineRenderContext } from "@/cli/display/statusline/context";
 import { shouldRenderDefaultStatuslineRenderer } from "@/cli/display/statusline/default-renderer-activation";
+import { truncateToWidth } from "@/cli/display/statusline/formatting";
 import {
   DEFAULT_STATUSLINE_RENDERER_ID,
   getBuiltinStatuslineRenderer,
 } from "@/cli/display/statusline/registry";
 import { buildDefaultStatuslineParts } from "@/cli/display/statusline/renderers/Default";
-import { evaluateLocalExtensionStatuses } from "@/cli/extensions/local-extension-loader";
-import type { LocalExtensionRuntime } from "@/cli/extensions/use-local-extension-runtime";
 import { bytesToTokens, formatCompact } from "@/cli/helpers/format";
 import { CLI_GLYPHS } from "@/cli/helpers/glyphs";
 import { formatGoalStatusIndicator } from "@/cli/helpers/goal-command";
@@ -36,6 +35,8 @@ import type { StatusLinePayload } from "@/cli/helpers/status-line-payload";
 import { getRandomThinkingTip } from "@/cli/helpers/thinking-messages";
 import { useShimmerAnimation } from "@/cli/hooks/use-shimmer-animation";
 import { useTokenSmoothing } from "@/cli/hooks/use-token-smoothing";
+import type { ModContext } from "@/cli/mods/types";
+import type { LocalModAdapter } from "@/cli/mods/use-local-mod-adapter";
 import {
   ELAPSED_DISPLAY_THRESHOLD_MS,
   TOKEN_DISPLAY_THRESHOLD,
@@ -44,11 +45,10 @@ import type { PermissionMode } from "@/permissions/mode";
 import { permissionMode } from "@/permissions/mode";
 import { OPENAI_CODEX_PROVIDER_NAME } from "@/providers/openai-codex-provider";
 import { settingsManager } from "@/settings-manager";
-import { debugLog } from "@/utils/debug";
 import type { QueuedMessage } from "@/utils/message-queue-bridge";
 import { colors } from "./colors";
-import { ExtensionPanelRow } from "./ExtensionPanelRow";
 import { InputAssist } from "./InputAssist";
+import { ModPanelRow, renderModPanelLines } from "./ModPanelRow";
 import { PasteAwareTextInput } from "./PasteAwareTextInput";
 import { ProductStatusRow } from "./ProductStatusRow";
 import { QueuedMessages } from "./QueuedMessages";
@@ -171,8 +171,6 @@ function getPermissionModeTransientHintInfo(mode: PermissionMode): {
         color: colors.status.success,
         glyph: "⚡︎",
       };
-    case "memory":
-      return { name: "memory mode", color: colors.status.processing };
   }
 }
 
@@ -440,7 +438,7 @@ function BlankStatuslineRow({
 
 /**
  * Bottom statusline slot. Safety states and transient host hints may preempt the
- * row; otherwise custom extensions own the idle row before the built-in default.
+ * row; otherwise custom mods own the idle row before the built-in default.
  */
 const StatuslineSlot = memo(function StatuslineSlot({
   ctrlCPressed,
@@ -458,7 +456,7 @@ const StatuslineSlot = memo(function StatuslineSlot({
   hideFooter,
   rightColumnWidth,
   statusLinePayload,
-  extensionRuntime,
+  modAdapter,
   transientHint,
 }: {
   ctrlCPressed: boolean;
@@ -476,7 +474,7 @@ const StatuslineSlot = memo(function StatuslineSlot({
   hideFooter: boolean;
   rightColumnWidth: number;
   statusLinePayload: StatusLinePayload;
-  extensionRuntime: LocalExtensionRuntime;
+  modAdapter: LocalModAdapter;
   transientHint?: StatuslineTransientHint | null;
 }) {
   const hideFooterContent = hideFooter;
@@ -486,7 +484,7 @@ const StatuslineSlot = memo(function StatuslineSlot({
     escapePressed,
   });
 
-  const baseStatuslineContext = buildStatuslineRenderContext({
+  const statuslineContext = buildStatuslineRenderContext({
     payload: statusLinePayload,
     ui: {
       currentModelProvider: currentModelProvider ?? null,
@@ -498,43 +496,42 @@ const StatuslineSlot = memo(function StatuslineSlot({
       rightColumnWidth,
     },
   });
-  const statuslineContext = {
-    ...baseStatuslineContext,
-    statuses: evaluateLocalExtensionStatuses(
-      extensionRuntime.registry,
-      baseStatuslineContext,
-    ),
-  };
-  extensionRuntime.updateContext(statuslineContext);
 
   const builtInStatuslineRenderer = getBuiltinStatuslineRenderer(
     DEFAULT_STATUSLINE_RENDERER_ID,
   );
-  const localStatuslineRenderer =
-    extensionRuntime.registry?.ui.statuslineRenderer ?? null;
-  const extensionStatuslineLoading =
-    extensionRuntime.isLoading &&
-    (extensionRuntime.hasExtensionSources ||
-      extensionRuntime.hadStatuslineRenderer);
-  const customStatuslineActive = Boolean(
-    localStatuslineRenderer || extensionStatuslineLoading,
-  );
+
+  // The order-0 "primary" panel overrides the built-in agent · model line.
+  const panels = modAdapter.registry?.ui.panels ?? {};
+  const primaryPanel = Object.values(panels)
+    .filter((panel) => panel.order === 0)
+    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+  const modPanelsLoading =
+    modAdapter.isLoading &&
+    (modAdapter.hasModSources || modAdapter.hadModPanels);
+  const customStatuslineActive = Boolean(primaryPanel || modPanelsLoading);
   const idleSlotAvailable = !hideFooterContent && !preemption && !transientHint;
 
-  if (idleSlotAvailable && localStatuslineRenderer) {
-    try {
-      return localStatuslineRenderer.render(statuslineContext);
-    } catch (error) {
-      debugLog(
-        "extensions",
-        "statusline renderer %s failed: %s",
-        localStatuslineRenderer.id,
-        error instanceof Error ? error.message : String(error),
+  if (idleSlotAvailable && primaryPanel) {
+    const rowWidth = Math.max(0, (statuslineContext.terminalWidth ?? 0) - 1);
+    const lines = renderModPanelLines(
+      primaryPanel,
+      rowWidth,
+      statuslineContext,
+    );
+    if (lines.length > 0) {
+      return (
+        <Box flexDirection="column">
+          {lines.map((line, index) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: panel content is caller-owned text
+            <Text key={index}>{truncateToWidth(line || " ", rowWidth)}</Text>
+          ))}
+        </Box>
       );
     }
   }
 
-  if (idleSlotAvailable && extensionStatuslineLoading) {
+  if (idleSlotAvailable && modPanelsLoading) {
     return <BlankStatuslineRow rightColumnWidth={rightColumnWidth} />;
   }
 
@@ -912,6 +909,7 @@ export function Input({
   isLocalBackend = false,
   hasTemporaryModelOverride = false,
   currentReasoningEffort,
+  fileAutocompleteFdPath,
   messageQueue,
   onQueueEdit,
   onEscapeCancel,
@@ -928,7 +926,7 @@ export function Input({
   terminalWidth,
   shouldAnimate = true,
   statusLinePayload,
-  extensionRuntime,
+  modAdapter,
   statusLinePrompt,
   onCycleReasoningEffort,
   footerNotification,
@@ -964,6 +962,7 @@ export function Input({
   isLocalBackend?: boolean;
   hasTemporaryModelOverride?: boolean;
   currentReasoningEffort?: ModelReasoningEffort | null;
+  fileAutocompleteFdPath?: string | null;
   messageQueue?: QueuedMessage[];
   onQueueEdit?: () => string;
   onEscapeCancel?: () => void;
@@ -980,7 +979,7 @@ export function Input({
   terminalWidth: number;
   shouldAnimate?: boolean;
   statusLinePayload: StatusLinePayload;
-  extensionRuntime: LocalExtensionRuntime;
+  modAdapter: LocalModAdapter;
   statusLinePrompt?: string;
   onCycleReasoningEffort?: () => void;
   footerNotification?: string | null;
@@ -1706,36 +1705,12 @@ export function Input({
     onSubmit,
   ]);
 
-  // Handle file selection from autocomplete
-  const handleFileSelect = useCallback(
-    (selectedPath: string) => {
-      // Find the last "@" and replace everything after it with the selected path
-      const atIndex = value.lastIndexOf("@");
-      if (atIndex === -1) return;
-
-      const beforeAt = value.slice(0, atIndex);
-      const afterAt = value.slice(atIndex + 1);
-      const spaceIndex = afterAt.indexOf(" ");
-
-      let newValue: string;
-      let newCursorPos: number;
-
-      // Replace the query part with the selected path
-      if (spaceIndex === -1) {
-        // No space after @query, replace to end
-        newValue = `${beforeAt}@${selectedPath} `;
-        newCursorPos = newValue.length;
-      } else {
-        // Space exists, replace only the query part
-        const afterQuery = afterAt.slice(spaceIndex);
-        newValue = `${beforeAt}@${selectedPath}${afterQuery}`;
-        newCursorPos = beforeAt.length + selectedPath.length + 1; // After the path
-      }
-
-      setValue(newValue);
-      setCursorPos(newCursorPos);
+  const handleFileAutocompleteApply = useCallback(
+    (nextValue: string, nextCursorPosition: number) => {
+      setValue(nextValue);
+      setCursorPos(nextCursorPosition);
     },
-    [value],
+    [],
   );
 
   // Handle slash command selection from autocomplete (Enter key - execute)
@@ -1939,6 +1914,70 @@ export function Input({
     previousFooterNotificationRef.current = footerNotification ?? null;
   }, [footerNotification, showStatuslineTransientHint]);
 
+  // Decoupled from input churn (value/cursorPos) so panel content only
+  // re-renders when the panels themselves change, mirroring how BtwPane
+  // stays flash-free. Folding this into lowerPane would rebuild it on every
+  // keystroke.
+  const panelLiveContext = useMemo<ModContext>(
+    () =>
+      buildStatuslineRenderContext({
+        payload: statusLinePayload,
+        ui: {
+          currentModelProvider: currentModelProvider ?? null,
+          goalStatusText: null,
+          hasTemporaryModelOverride: Boolean(hasTemporaryModelOverride),
+          isByokProvider:
+            currentModelProvider?.startsWith("lc-") ||
+            currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
+          isLocalBackend,
+          isOpenAICodexProvider:
+            currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
+          rightColumnWidth: footerRightColumnWidth,
+        },
+      }),
+    [
+      currentModelProvider,
+      footerRightColumnWidth,
+      hasTemporaryModelOverride,
+      isLocalBackend,
+      statusLinePayload,
+    ],
+  );
+
+  const modPanelRow = useMemo(() => {
+    if (suppressDividers) return null;
+    return (
+      <ModPanelRow
+        panels={modAdapter.registry?.ui.panels}
+        terminalWidth={terminalWidth}
+        placement="above"
+        context={panelLiveContext}
+      />
+    );
+  }, [
+    suppressDividers,
+    modAdapter.registry?.ui.panels,
+    terminalWidth,
+    panelLiveContext,
+  ]);
+
+  const modPanelRowBelow = useMemo(() => {
+    if (suppressDividers) return null;
+    return (
+      <ModPanelRow
+        panels={modAdapter.registry?.ui.panels}
+        terminalWidth={terminalWidth}
+        placement="below"
+        context={panelLiveContext}
+      />
+    );
+  }, [
+    suppressDividers,
+    modAdapter.registry?.ui.panels,
+    terminalWidth,
+    panelLiveContext,
+  ]);
+
   const lowerPane = useMemo(() => {
     return (
       <>
@@ -1949,12 +1988,7 @@ export function Input({
 
         {interactionEnabled ? (
           <Box flexDirection="column">
-            {!suppressDividers && (
-              <ExtensionPanelRow
-                panels={extensionRuntime.registry?.ui.panels}
-                terminalWidth={terminalWidth}
-              />
-            )}
+            {modPanelRow}
 
             {!suppressDividers && (
               <ProductStatusRow
@@ -2022,7 +2056,8 @@ export function Input({
               <InputAssist
                 currentInput={value}
                 cursorPosition={currentCursorPosition}
-                onFileSelect={handleFileSelect}
+                fdPath={fileAutocompleteFdPath}
+                onFileAutocompleteApply={handleFileAutocompleteApply}
                 onCommandSelect={handleCommandSelect}
                 onCommandAutocomplete={handleCommandAutocomplete}
                 onAutocompleteActiveChange={setIsAutocompleteActive}
@@ -2033,7 +2068,7 @@ export function Input({
                 serverUrl={serverUrl}
                 workingDirectory={process.cwd()}
                 conversationId={conversationId}
-                extensionCommands={extensionRuntime.registry?.commands}
+                modCommands={modAdapter.registry?.commands}
               />
             )}
 
@@ -2059,10 +2094,12 @@ export function Input({
                 hideFooter={hideFooter}
                 rightColumnWidth={footerRightColumnWidth}
                 statusLinePayload={statusLinePayload}
-                extensionRuntime={extensionRuntime}
+                modAdapter={modAdapter}
                 transientHint={statuslineTransientHint}
               />
             )}
+
+            {!suppressDividers && modPanelRowBelow}
           </Box>
         ) : reserveInputSpace ? (
           <Box height={inputChromeHeight} />
@@ -2071,6 +2108,8 @@ export function Input({
     );
   }, [
     messageQueue,
+    modPanelRow,
+    modPanelRowBelow,
     interactionEnabled,
     isBashMode,
     horizontalLine,
@@ -2084,7 +2123,7 @@ export function Input({
     handleBackspaceAtEmpty,
     onPasteError,
     currentCursorPosition,
-    handleFileSelect,
+    handleFileAutocompleteApply,
     handleCommandSelect,
     handleCommandAutocomplete,
     agentId,
@@ -2100,6 +2139,7 @@ export function Input({
     goalLoopActive,
     currentModel,
     currentReasoningEffort,
+    fileAutocompleteFdPath,
     currentModelProvider,
     hasTemporaryModelOverride,
     hideFooter,
@@ -2107,7 +2147,7 @@ export function Input({
     reserveInputSpace,
     inputChromeHeight,
     statusLinePayload,
-    extensionRuntime,
+    modAdapter,
 
     goalStatusText,
     promptChar,

@@ -7,7 +7,7 @@
  *
  * Usage:
  *   bun tsx src/tests/headless-scenario.ts --model gpt-4.1 --output stream-json --parallel on
- *   bun tsx src/tests/headless-scenario.ts --backend local --model gpt-5-mini-medium --output text --parallel on
+ *   bun tsx src/tests/headless-scenario.ts --backend local --model openai/gpt-5-mini --output text --parallel on
  */
 
 import { execFile as execFileCb, spawn } from "node:child_process";
@@ -27,7 +27,7 @@ import {
 const execFile = promisify(execFileCb);
 
 type Backend = "api" | "local";
-type LocalProvider = "openai" | "anthropic";
+type LocalProvider = "openai" | "anthropic" | "google" | "ollama";
 
 type Args = {
   backend: Backend;
@@ -35,6 +35,11 @@ type Args = {
   output: "text" | "json" | "stream-json";
   parallel: "on" | "off" | "hybrid";
   provider?: LocalProvider;
+  // Smoke mode: trivial no-tools prompt asserting a sentinel word. Exercises
+  // the provider request path (connect/autodetect/round-trip) without the full
+  // tool-calling scenario — needed for weak/slow local models (e.g. Ollama on
+  // CPU runners) that cannot pass the frontier-model scenario in time.
+  smoke: boolean;
 };
 
 interface RunResult {
@@ -51,10 +56,12 @@ function parseArgs(argv: string[]): Args {
     output: Args["output"];
     parallel: Args["parallel"];
     provider?: LocalProvider;
+    smoke: boolean;
   } = {
     backend: "api",
     output: "text",
     parallel: "on",
+    smoke: false,
   };
   for (let i = 0; i < argv.length; i++) {
     const v = argv[i];
@@ -63,6 +70,7 @@ function parseArgs(argv: string[]): Args {
     else if (v === "--output") args.output = argv[++i] as Args["output"];
     else if (v === "--parallel") args.parallel = argv[++i] as Args["parallel"];
     else if (v === "--provider") args.provider = argv[++i] as LocalProvider;
+    else if (v === "--smoke") args.smoke = true;
   }
   if (!args.model) throw new Error("Missing --model");
   if (!["api", "local"].includes(args.backend)) {
@@ -76,7 +84,7 @@ function parseArgs(argv: string[]): Args {
   }
   if (
     args.provider !== undefined &&
-    !["openai", "anthropic"].includes(args.provider)
+    !["openai", "anthropic", "google", "ollama"].includes(args.provider)
   ) {
     throw new Error(`Invalid --provider ${args.provider}`);
   }
@@ -84,6 +92,16 @@ function parseArgs(argv: string[]): Args {
 }
 
 function inferLocalProvider(model: string): LocalProvider {
+  if (model.startsWith("ollama/")) {
+    return "ollama";
+  }
+  if (
+    model.startsWith("google/") ||
+    model.startsWith("google_ai/") ||
+    model.includes("gemini")
+  ) {
+    return "google";
+  }
   if (
     model.startsWith("anthropic/") ||
     model.startsWith("claude") ||
@@ -106,8 +124,20 @@ async function ensurePrereqs(args: Args): Promise<"ok" | "skip"> {
   }
 
   const provider = args.provider ?? inferLocalProvider(args.model);
+  // Ollama is a local endpoint (no API key); it needs a reachable base URL.
+  if (provider === "ollama") {
+    if (!process.env.OLLAMA_BASE_URL) {
+      console.log("SKIP: Missing env OLLAMA_BASE_URL");
+      return "skip";
+    }
+    return "ok";
+  }
   const requiredKey =
-    provider === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+    provider === "anthropic"
+      ? "ANTHROPIC_API_KEY"
+      : provider === "google"
+        ? "GOOGLE_GENERATIVE_AI_API_KEY"
+        : "OPENAI_API_KEY";
   if (!process.env[requiredKey]) {
     console.log(`SKIP: Missing env ${requiredKey}`);
     return "skip";
@@ -139,12 +169,24 @@ function localScenarioPrompt(): string {
   );
 }
 
-function scenarioPrompt(backend: Backend): string {
-  return backend === "local" ? localScenarioPrompt() : apiScenarioPrompt();
+function smokePrompt(): string {
+  return (
+    "This is an automated CI smoke test (no human to assist). " +
+    "Do not call any tools. " +
+    "Respond with exactly the single uppercase word PONG and nothing else."
+  );
+}
+
+function scenarioPrompt(args: Args): string {
+  if (args.smoke) return smokePrompt();
+  return args.backend === "local" ? localScenarioPrompt() : apiScenarioPrompt();
 }
 
 function providerEnvValue(provider: LocalProvider): string {
-  return provider === "openai" ? "openai-responses" : "anthropic";
+  if (provider === "openai") return "openai-responses";
+  if (provider === "google") return "google";
+  if (provider === "ollama") return "ollama";
+  return "anthropic";
 }
 
 async function runCLI(args: Args): Promise<RunResult> {
@@ -166,7 +208,7 @@ async function runCLI(args: Args): Promise<RunResult> {
     "run",
     "dev",
     "-p",
-    scenarioPrompt(args.backend),
+    scenarioPrompt(args),
     "--yolo",
     "--new-agent",
   ];
@@ -284,6 +326,7 @@ async function validateLocalStorage(storageDir: string | undefined) {
 }
 
 const REQUIRED_MARKERS = ["BANANA"];
+const SMOKE_MARKERS = ["PONG"];
 const MAX_ATTEMPTS = 3;
 
 function assertContainsAll(hay: string, needles: string[]) {
@@ -320,9 +363,13 @@ function extractStreamJsonAssistantText(stdout: string): string {
   return parts.join("");
 }
 
-function validateOutput(stdout: string, output: Args["output"]) {
+function validateOutput(
+  stdout: string,
+  output: Args["output"],
+  markers: string[],
+) {
   if (output === "text") {
-    assertContainsAll(stdout, REQUIRED_MARKERS);
+    assertContainsAll(stdout, markers);
     return;
   }
 
@@ -330,7 +377,7 @@ function validateOutput(stdout: string, output: Args["output"]) {
     try {
       const obj = JSON.parse(stdout);
       const result = String(obj?.result ?? "");
-      assertContainsAll(result, REQUIRED_MARKERS);
+      assertContainsAll(result, markers);
       return;
     } catch (e) {
       throw new Error(`Invalid JSON output: ${(e as Error).message}`);
@@ -341,7 +388,7 @@ function validateOutput(stdout: string, output: Args["output"]) {
   if (!streamText) {
     throw new Error("No assistant/result content found in stream-json output");
   }
-  assertContainsAll(streamText, REQUIRED_MARKERS);
+  assertContainsAll(streamText, markers);
 }
 
 async function main() {
@@ -365,8 +412,14 @@ async function main() {
           })}`,
         );
       }
-      validateOutput(run.stdout, args.output);
-      if (args.backend === "local") {
+      validateOutput(
+        run.stdout,
+        args.output,
+        args.smoke ? SMOKE_MARKERS : REQUIRED_MARKERS,
+      );
+      // Smoke mode only asserts the sentinel; it deliberately skips the
+      // tool-driven MemFS validation since it issues a no-tools prompt.
+      if (args.backend === "local" && !args.smoke) {
         await validateLocalStorage(run.localStorageDir);
       }
       console.log(`OK: ${args.backend} / ${args.model} / ${args.output}`);

@@ -12,19 +12,26 @@
  * On stop: clears interval, releases lease.
  */
 
+import { getBackend } from "@/backend";
 import type { CronPromptQueueItem, DequeuedBatch } from "@/queue/queue-runtime";
 import { ensureConversationQueueRuntime } from "@/websocket/listener/conversation-runtime";
 import { scheduleQueuePump } from "@/websocket/listener/queue";
 import {
   getActiveRuntime,
   getOrCreateConversationRuntime,
+  safeEmitWsEvent,
 } from "@/websocket/listener/runtime";
-import type { ListenerTransport } from "@/websocket/listener/transport";
+import {
+  isListenerTransportOpen,
+  type ListenerTransport,
+} from "@/websocket/listener/transport";
 import type {
   IncomingMessage,
   StartListenerOptions,
 } from "@/websocket/listener/types";
 import {
+  type CronRunOutcome,
+  type CronRunReason,
   type CronTask,
   claimSchedulerLease,
   garbageCollect,
@@ -49,6 +56,9 @@ interface SchedulerState {
   token: string;
   tickInterval: NodeJS.Timeout;
   gcInterval: NodeJS.Timeout;
+  socket: ListenerTransport;
+  opts: StartListenerOptions;
+  processQueuedTurn: ProcessQueuedTurn;
   /** Last mtime of crons.json — skip re-reads when unchanged. */
   lastMtime: number;
   /** Cached active tasks (refreshed on file change). */
@@ -63,12 +73,25 @@ interface SchedulerState {
 
 let schedulerState: SchedulerState | null = null;
 
+/**
+ * Listener context stored independently of the scheduler lease.
+ * runCronTaskNow ("Send now") only needs an active listener — it doesn't
+ * need the tick loop or the lease. This lets it work even when another
+ * process holds the scheduler lease (e.g. desktop app vs local dev server).
+ */
+let listenerFireContext: {
+  socket: ListenerTransport;
+  opts: StartListenerOptions;
+  processQueuedTurn: ProcessQueuedTurn;
+} | null = null;
+
 // ── Constants ───────────────────────────────────────────────────────
 
 const TICK_INTERVAL_MS = 60_000;
 const GC_INTERVAL_MS = 60 * 60_000; // 1 hour
 const LEASE_RETRY_MS = 30_000; // 30 seconds between lease claim retries
 const MAX_LEASE_RETRIES = 3;
+const NEW_CONVERSATION_TARGET = "new";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
@@ -78,17 +101,62 @@ export function minuteKey(date: Date): string {
 
 export function wrapCronPrompt(task: CronTask): string {
   const lines = [
-    "<system-reminder>",
     `Scheduled task "${task.name}" is firing.`,
     `Description: ${task.description}`,
     task.recurring
       ? `This is fire #${task.fire_count + 1} (cron: ${task.cron}).`
       : `This is a one-off scheduled task.`,
     "",
-    task.prompt,
-    "</system-reminder>",
+    "You are running autonomously: no user is watching this turn and questions will not be answered. Deliver results through your available channels or record them in memory, and work until the task is done or genuinely blocked.",
+    "",
+    `Prompt: ${task.prompt}`,
   ];
   return lines.join("\n");
+}
+
+function getCronConversationSummary(task: CronTask): string {
+  return `[Schedule] ${task.name}`;
+}
+
+async function resolveCronFireConversationId(
+  task: CronTask,
+): Promise<string | undefined> {
+  if (task.conversation_id === NEW_CONVERSATION_TARGET) {
+    const conversation = await getBackend().createConversation({
+      agent_id: task.agent_id,
+      summary: getCronConversationSummary(task),
+    });
+    return conversation.id;
+  }
+
+  return task.conversation_id === "default" ? undefined : task.conversation_id;
+}
+
+function emitCronsUpdated(
+  socket: ListenerTransport,
+  task: CronTask,
+  conversationId?: string | null,
+): void {
+  if (!isListenerTransportOpen(socket)) {
+    return;
+  }
+
+  const payload = {
+    type: "crons_updated",
+    timestamp: Date.now(),
+    agent_id: task.agent_id,
+    conversation_id: conversationId ?? task.conversation_id,
+  };
+
+  try {
+    socket.send(JSON.stringify(payload));
+    safeEmitWsEvent("send", "protocol", payload);
+  } catch (err) {
+    console.error(
+      `[Cron] Error sending crons_updated for task ${task.id}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
 }
 
 // ── Core tick logic ─────────────────────────────────────────────────
@@ -99,6 +167,36 @@ function refreshTaskCache(state: SchedulerState): void {
     state.cachedTasks = getActiveTasks();
     state.lastMtime = mtime;
   }
+}
+
+function setLastRunOutcome(
+  taskId: string,
+  input: {
+    outcome: CronRunOutcome;
+    reason: CronRunReason;
+    runAt: Date;
+    error?: string | null;
+    missedAt?: Date;
+    missedCount?: number;
+  },
+): void {
+  const runAtIso = input.runAt.toISOString();
+  updateTask(taskId, (t) => {
+    t.last_run_at = runAtIso;
+    t.last_run_outcome = input.outcome;
+    t.last_run_reason = input.reason;
+    t.last_run_error = input.error ?? null;
+
+    if (input.outcome === "missed") {
+      const missedCount = Math.max(1, input.missedCount ?? 1);
+      t.last_missed_at = input.missedAt?.toISOString() ?? runAtIso;
+      t.missed_count = (t.missed_count ?? 0) + missedCount;
+    }
+
+    if (input.outcome === "failed") {
+      t.failed_count = (t.failed_count ?? 0) + 1;
+    }
+  });
 }
 
 export function shouldFireTask(task: CronTask, now: Date): boolean {
@@ -114,23 +212,69 @@ export function shouldFireTask(task: CronTask, now: Date): boolean {
   return cronMatchesTime(task.cron, now, task.timezone);
 }
 
-function fireCronTask(
+async function fireCronTask(
   task: CronTask,
   now: Date,
   socket: ListenerTransport,
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
-): void {
+): Promise<boolean> {
   const listener = getActiveRuntime();
-  if (!listener) return;
+  if (!listener) {
+    setLastRunOutcome(task.id, {
+      outcome: "failed",
+      reason: "runtime_unavailable",
+      runAt: now,
+      error: "No active runtime",
+    });
+    safeAppendCronRunLogForTask(task, {
+      status: "error",
+      outcome: "failed",
+      reason: "runtime_unavailable",
+      error: "No active runtime",
+      runAtMs: now.getTime(),
+      scheduledFor: task.scheduled_for,
+    });
+    return false;
+  }
+
+  let targetConversationId: string | undefined;
+  try {
+    targetConversationId = await resolveCronFireConversationId(task);
+  } catch (err) {
+    safeAppendCronRunLogForTask(task, {
+      status: "error",
+      error:
+        err instanceof Error ? err.message : "failed to resolve conversation",
+      runAtMs: now.getTime(),
+      scheduledFor: task.scheduled_for,
+    });
+    return false;
+  }
 
   const rawRuntime = getOrCreateConversationRuntime(
     listener,
     task.agent_id,
-    task.conversation_id === "default" ? undefined : task.conversation_id,
+    targetConversationId,
   );
 
-  if (!rawRuntime) return;
+  if (!rawRuntime) {
+    setLastRunOutcome(task.id, {
+      outcome: "failed",
+      reason: "runtime_unavailable",
+      runAt: now,
+      error: "Conversation runtime unavailable",
+    });
+    safeAppendCronRunLogForTask(task, {
+      status: "error",
+      outcome: "failed",
+      reason: "runtime_unavailable",
+      error: "Conversation runtime unavailable",
+      runAtMs: now.getTime(),
+      scheduledFor: task.scheduled_for,
+    });
+    return false;
+  }
 
   // Ensure the queue runtime is initialized (getOrCreateConversationRuntime
   // leaves queueRuntime as null — the listener's scoped helper initializes it).
@@ -147,17 +291,25 @@ function fireCronTask(
     text,
     cronTaskId: task.id,
     agentId: task.agent_id,
-    conversationId: task.conversation_id,
+    conversationId: targetConversationId ?? "default",
   } as Omit<CronPromptQueueItem, "id" | "enqueuedAt">);
 
   if (!queuedItem) {
+    setLastRunOutcome(task.id, {
+      outcome: "failed",
+      reason: "queue_full",
+      runAt: now,
+      error: "queue buffer limit",
+    });
     safeAppendCronRunLogForTask(task, {
       status: "error",
+      outcome: "failed",
+      reason: "queue_full",
       error: "queue buffer limit",
       runAtMs: now.getTime(),
       scheduledFor: task.scheduled_for,
     });
-    return;
+    return false;
   }
 
   scheduleQueuePump(conversationRuntime, socket, opts, processQueuedTurn);
@@ -168,6 +320,10 @@ function fireCronTask(
     updateTask(task.id, (t) => {
       t.last_fired_at = nowIso;
       t.fire_count += 1;
+      t.last_run_at = nowIso;
+      t.last_run_outcome = "queued";
+      t.last_run_reason = "scheduled_time_matched";
+      t.last_run_error = null;
     });
   } else {
     // One-shot: mark as fired
@@ -176,16 +332,25 @@ function fireCronTask(
       t.fired_at = nowIso;
       t.last_fired_at = nowIso;
       t.fire_count = 1;
+      t.last_run_at = nowIso;
+      t.last_run_outcome = "queued";
+      t.last_run_reason = "one_off_due";
+      t.last_run_error = null;
     });
   }
 
   safeAppendCronRunLogForTask(task, {
     status: "ok",
+    outcome: "queued",
+    reason: task.recurring ? "scheduled_time_matched" : "one_off_due",
     runAtMs: now.getTime(),
     queueItemId: queuedItem.id,
     scheduledFor: task.scheduled_for,
     firedAt: nowIso,
+    conversationId: targetConversationId ?? "default",
   });
+  emitCronsUpdated(socket, task, targetConversationId ?? "default");
+  return true;
 }
 
 /** Returns true if the task was marked as missed (caller should skip firing). */
@@ -195,19 +360,91 @@ export function handleMissedOneShot(task: CronTask, now: Date): boolean {
   const scheduledMs = new Date(task.scheduled_for).getTime();
   const missThreshold = 5 * 60_000;
   if (now.getTime() > scheduledMs + missThreshold && task.status === "active") {
+    const reason: CronRunReason =
+      task.last_run_outcome === "failed"
+        ? (task.last_run_reason ?? "scheduler_error")
+        : "scheduler_inactive";
+    const error =
+      task.last_run_outcome === "failed" ? task.last_run_error : null;
     updateTask(task.id, (t) => {
       t.status = "missed";
       t.missed_at = now.toISOString();
+      t.last_run_at = now.toISOString();
+      t.last_run_outcome = "missed";
+      t.last_run_reason = reason;
+      t.last_run_error = error ?? null;
+      t.last_missed_at = task.scheduled_for;
+      t.missed_count = (t.missed_count ?? 0) + 1;
     });
     safeAppendCronRunLogForTask(task, {
       status: "skipped",
+      outcome: "missed",
+      reason,
       summary: "missed",
+      error: error ?? undefined,
       runAtMs: now.getTime(),
       scheduledFor: task.scheduled_for,
+      missedCount: 1,
     });
     return true;
   }
   return false;
+}
+
+export async function runCronTaskNow(taskId: string): Promise<{
+  success: boolean;
+  found: boolean;
+  task?: CronTask;
+  error?: string;
+}> {
+  const task = getTask(taskId);
+  if (!task) {
+    return { success: false, found: false, error: "Schedule not found" };
+  }
+
+  if (task.status !== "active") {
+    return {
+      success: false,
+      found: true,
+      task,
+      error: "Schedule is not active",
+    };
+  }
+
+  // Prefer the full scheduler state, but fall back to the listener context.
+  // "Send now" only needs the active listener — not the tick loop or the lease.
+  const ctx = schedulerState ?? listenerFireContext;
+  if (!ctx) {
+    return {
+      success: false,
+      found: true,
+      task,
+      error: "Cron scheduler is not running",
+    };
+  }
+
+  const now = new Date();
+  const fired = await fireCronTask(
+    task,
+    now,
+    ctx.socket,
+    ctx.opts,
+    ctx.processQueuedTurn,
+  );
+
+  if (!fired) {
+    return {
+      success: false,
+      found: true,
+      task,
+      error: "Failed to enqueue schedule run",
+    };
+  }
+
+  if (schedulerState) {
+    refreshTaskCache(schedulerState);
+  }
+  return { success: true, found: true, task: getTask(taskId) ?? task };
 }
 
 function tick(
@@ -258,17 +495,29 @@ function tick(
         const freshTask = getTask(taskId);
         if (!freshTask || freshTask.status !== "active") return;
 
-        try {
-          fireCronTask(freshTask, now, socket, opts, processQueuedTurn);
-        } catch (err) {
+        void fireCronTask(
+          freshTask,
+          now,
+          socket,
+          opts,
+          processQueuedTurn,
+        ).catch((err) => {
           console.error(`[Cron] Error firing task ${taskId}:`, err);
+          setLastRunOutcome(freshTask.id, {
+            outcome: "failed",
+            reason: "scheduler_error",
+            runAt: now,
+            error: err instanceof Error ? err.message : String(err),
+          });
           safeAppendCronRunLogForTask(freshTask, {
             status: "error",
+            outcome: "failed",
+            reason: "scheduler_error",
             error: err instanceof Error ? err.message : String(err),
             runAtMs: now.getTime(),
             scheduledFor: freshTask.scheduled_for,
           });
-        }
+        });
       };
 
       if (jitterMs > 0) {
@@ -301,6 +550,10 @@ export function startScheduler(
   processQueuedTurn: ProcessQueuedTurn,
   _retryCount = 0,
 ): void {
+  // Always store the listener context so runCronTaskNow ("Send now") works
+  // even when this process doesn't hold the scheduler lease.
+  listenerFireContext = { socket, opts, processQueuedTurn };
+
   if (schedulerState) return;
 
   let token: string;
@@ -334,6 +587,9 @@ export function startScheduler(
     token,
     tickInterval: null as unknown as NodeJS.Timeout,
     gcInterval: null as unknown as NodeJS.Timeout,
+    socket,
+    opts,
+    processQueuedTurn,
     lastMtime: 0,
     cachedTasks: [],
     firedThisMinute: new Set(),
@@ -366,6 +622,7 @@ export function startScheduler(
  * Stop the cron scheduler. Should be called when the WS listener disconnects.
  */
 export function stopScheduler(): void {
+  listenerFireContext = null;
   if (!schedulerState) return;
 
   clearInterval(schedulerState.tickInterval);

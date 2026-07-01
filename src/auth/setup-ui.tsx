@@ -2,7 +2,7 @@
  * Ink UI components for OAuth setup flow
  */
 
-import { Box, useApp, useInput } from "ink";
+import { Box, useInput } from "ink";
 import { useState } from "react";
 import { configureBackendMode } from "@/backend";
 import { AnimatedLogo } from "@/cli/components/AnimatedLogo";
@@ -12,39 +12,62 @@ import { settingsManager } from "@/settings-manager";
 import { ConstellationLoginView } from "./ConstellationLoginView";
 
 type SetupMode = "menu" | "device-code" | "auth-code" | "self-host" | "done";
+export type SetupInitialMode = "menu" | "device-code";
+export type SetupResult =
+  | { kind: "cloud-login" }
+  | { kind: "local" }
+  | { kind: "cancelled" };
 
 const AUTH_LOGIN_LABEL = "Login to Constellation";
 const LOCAL_MODE_LABEL = "Proceed locally";
 const AUTH_LOGO_ANIMATE = false;
 
 interface SetupUIProps {
-  onComplete: () => void;
+  onComplete: (result: SetupResult) => void;
+  onCancel: () => void;
+  initialMode?: SetupInitialMode;
+  localModeDisabledReason?: string;
 }
 
-export function SetupUI({ onComplete }: SetupUIProps) {
-  const [mode, setMode] = useState<SetupMode>("menu");
-  const [selectedOption, setSelectedOption] = useState(1);
+export function SetupUI({
+  onComplete,
+  onCancel,
+  initialMode = "menu",
+  localModeDisabledReason,
+}: SetupUIProps) {
+  const localModeDisabled = Boolean(localModeDisabledReason);
+  const [mode, setMode] = useState<SetupMode>(initialMode);
+  const [selectedOption, setSelectedOption] = useState(
+    initialMode === "device-code" || localModeDisabled ? 0 : 1,
+  );
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState("Starting Letta Code...");
-
-  const { exit } = useApp();
+  const selectNextOption = (current: number, delta: 1 | -1): number => {
+    const options = localModeDisabled ? [0, 2] : [0, 1, 2];
+    const currentIndex = options.indexOf(current);
+    const nextIndex = Math.min(
+      options.length - 1,
+      Math.max(0, currentIndex + delta),
+    );
+    return options[nextIndex] ?? current;
+  };
 
   // Handle menu navigation
   useInput(
     (_input, key) => {
       if (mode === "menu") {
         if (key.upArrow) {
-          setSelectedOption((prev) => Math.max(0, prev - 1));
+          setSelectedOption((prev) => selectNextOption(prev, -1));
         } else if (key.downArrow) {
-          setSelectedOption((prev) => Math.min(2, prev + 1));
+          setSelectedOption((prev) => selectNextOption(prev, 1));
         } else if (key.return) {
           if (selectedOption === 0) {
             // Login to Constellation - start device code flow
             setMode("device-code");
-          } else if (selectedOption === 1) {
+          } else if (selectedOption === 1 && !localModeDisabled) {
             proceedLocally();
           } else if (selectedOption === 2) {
-            exit();
+            onCancel();
           }
         }
       }
@@ -61,7 +84,7 @@ export function SetupUI({ onComplete }: SetupUIProps) {
         "Local mode enabled. Agents you create now will be stored on this device. To sign into Letta Cloud later, run `letta setup` or `letta backend api`.",
       );
       setMode("done");
-      setTimeout(() => onComplete(), 500);
+      setTimeout(() => onComplete({ kind: "local" }), 500);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -96,8 +119,9 @@ export function SetupUI({ onComplete }: SetupUIProps) {
         <Text bold>{AUTH_LOGIN_LABEL}</Text>
         <Text> </Text>
         <ConstellationLoginView
-          onComplete={onComplete}
-          onAlreadyLoggedIn={onComplete}
+          onComplete={() => onComplete({ kind: "cloud-login" })}
+          onCancel={() => setMode("menu")}
+          successMessage="Signed in to Constellation. Starting Letta Code..."
         />
       </Box>
     );
@@ -133,18 +157,25 @@ export function SetupUI({ onComplete }: SetupUIProps) {
       <Box>
         <Text
           color={
-            selectedOption === 1 ? colors.selector.itemHighlighted : undefined
+            selectedOption === 1 && !localModeDisabled
+              ? colors.selector.itemHighlighted
+              : undefined
           }
+          dimColor={localModeDisabled}
         >
           {selectedOption === 1 ? "> " : "  "}
-          {LOCAL_MODE_LABEL} (default)
+          {LOCAL_MODE_LABEL} {localModeDisabled ? "(unavailable)" : "(default)"}
         </Text>
       </Box>
       <Box paddingLeft={2}>
-        <Text dimColor>
-          Store agent state on this device. Agents you create are local to this
-          machine.
-        </Text>
+        {localModeDisabledReason ? (
+          <Text dimColor>{localModeDisabledReason}</Text>
+        ) : (
+          <Text dimColor>
+            Store agent state on this device. Agents you create are local to
+            this machine.
+          </Text>
+        )}
       </Box>
       <Box>
         <Text

@@ -148,10 +148,10 @@ export async function handleConnectionCommand(
           buffersRef,
           refreshDerived,
           setCommandRunning,
-          onCodexConnected: () => {
+          onCodexConnected: (providerName) => {
             markLocalModelsAvailable();
             setModelSelectorOptions({
-              filterProvider: "chatgpt-plus-pro",
+              filterProvider: providerName,
               forceRefresh: true,
             });
             openOverlay(
@@ -161,26 +161,6 @@ export async function handleConnectionCommand(
               "Models dialog dismissed",
             );
           },
-        },
-        msg,
-      );
-    } finally {
-      setActiveConnectCommandId(null);
-    }
-    return { submitted: true };
-  }
-
-  if (trimmed.startsWith("/disconnect")) {
-    const cmd = commandRunner.start(msg, "Disconnecting...");
-    const { handleDisconnect, setActiveCommandId: setActiveConnectCommandId } =
-      await import("@/cli/commands/connect");
-    setActiveConnectCommandId(cmd.id);
-    try {
-      await handleDisconnect(
-        {
-          buffersRef,
-          refreshDerived,
-          setCommandRunning,
         },
         msg,
       );

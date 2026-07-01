@@ -49,12 +49,16 @@ describe("shared CLI arg schema", () => {
     expect(interactiveFlags).not.toContain("memfs-startup");
     expect(headlessFlags).toContain("agent");
     expect(interactiveFlags).toContain("agent");
+    expect(headlessFlags).toContain("no-mods");
+    expect(interactiveFlags).toContain("no-mods");
   });
 
   test("rendered OPTIONS help is generated from catalog metadata", () => {
     const help = renderCliOptionsHelp();
     expect(help).toContain("-h, --help");
     expect(help).toContain("--backend <mode>");
+    expect(help).toContain("--no-mods");
+    expect(help).toContain("LETTA_DISABLE_MODS=1 letta");
     expect(help).toContain("--memfs-startup <m>");
     expect(help).toContain("Default: text");
     expect(help).not.toContain("--run");
@@ -97,8 +101,6 @@ describe("shared CLI arg schema", () => {
         "skill-a,skill-b",
         "--max-turns",
         "3",
-        "--block-value",
-        "persona=hello",
         "--dev-backend",
         "fake-headless",
       ]),
@@ -107,7 +109,6 @@ describe("shared CLI arg schema", () => {
     expect(parsed.values["memfs-startup"]).toBe("background");
     expect(parsed.values["pre-load-skills"]).toBe("skill-a,skill-b");
     expect(parsed.values["max-turns"]).toBe("3");
-    expect(parsed.values["block-value"]).toEqual(["persona=hello"]);
     expect(parsed.values["dev-backend"]).toBe("fake-headless");
   });
 
@@ -131,6 +132,22 @@ describe("shared CLI arg schema", () => {
       true,
     );
     expect(parsed.values["disable-memory-guard"]).toBe(true);
+  });
+
+  test("recognizes no-mods as a boolean recovery flag", () => {
+    const parsed = parseCliArgs(
+      preprocessCliArgs(["node", "script", "--no-mods", "-p", "hi"]),
+      true,
+    );
+    expect(parsed.values["no-mods"]).toBe(true);
+  });
+
+  test("normalizes legacy no-extensions flag to no-mods", () => {
+    const parsed = parseCliArgs(
+      preprocessCliArgs(["node", "script", "--no-extensions", "-p", "hi"]),
+      true,
+    );
+    expect(parsed.values["no-mods"]).toBe(true);
   });
 
   test("validates backend mode values", () => {

@@ -8,6 +8,7 @@ import { settingsManager } from "@/settings-manager";
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
 const originalNodeFlag = process.env.LETTA_NODE;
+const originalArtifactsFlag = process.env.LETTA_ARTIFACTS;
 
 let testHomeDir = "";
 
@@ -17,6 +18,7 @@ beforeEach(async () => {
   process.env.HOME = testHomeDir;
   process.env.USERPROFILE = testHomeDir;
   delete process.env.LETTA_NODE;
+  delete process.env.LETTA_ARTIFACTS;
   await settingsManager.initialize();
 });
 
@@ -39,14 +41,22 @@ afterEach(async () => {
   } else {
     process.env.LETTA_NODE = originalNodeFlag;
   }
+
+  if (originalArtifactsFlag === undefined) {
+    delete process.env.LETTA_ARTIFACTS;
+  } else {
+    process.env.LETTA_ARTIFACTS = originalArtifactsFlag;
+  }
 });
 
 describe("experimentManager", () => {
-  test("conversation title generation is opt-in by default", () => {
-    expect(experimentManager.getSnapshot("conversation_titles")).toMatchObject({
-      id: "conversation_titles",
-      enabled: false,
-      source: "default",
+  test("falls back to LETTA_ARTIFACTS when no override is stored", () => {
+    process.env.LETTA_ARTIFACTS = "true";
+
+    expect(experimentManager.getSnapshot("artifacts")).toMatchObject({
+      id: "artifacts",
+      enabled: true,
+      source: "env",
       override: null,
     });
   });
@@ -84,12 +94,15 @@ describe("experimentManager", () => {
     });
   });
 
-  test("persists explicit conversation title overrides", async () => {
+  test("maps conversation title experiment controls to the persistent setting", async () => {
+    expect(experimentManager.getSnapshot("conversation_titles")).toMatchObject({
+      id: "conversation_titles",
+      enabled: false,
+    });
+
     expect(experimentManager.set("conversation_titles", true)).toMatchObject({
       id: "conversation_titles",
       enabled: true,
-      source: "override",
-      override: true,
     });
     await settingsManager.flush();
 
@@ -99,8 +112,6 @@ describe("experimentManager", () => {
     expect(experimentManager.getSnapshot("conversation_titles")).toMatchObject({
       id: "conversation_titles",
       enabled: true,
-      source: "override",
-      override: true,
     });
   });
 });

@@ -11,6 +11,8 @@ import type {
   ConversationMessageCreateBody,
   ConversationMessageListBody,
   ConversationMessageStreamBody,
+  ConversationResumeTail,
+  ConversationResumeTailOptions,
   RunMessageStreamBody,
 } from "@/backend/backend";
 import {
@@ -304,6 +306,39 @@ export class HeadlessBackend implements Backend {
     return this.store.retrieveMessage(messageId) as never;
   }
 
+  async getConversationResumeTail(
+    agentId: string,
+    conversationId: string,
+    options: ConversationResumeTailOptions,
+  ): Promise<ConversationResumeTail> {
+    const body = {
+      limit: options.limit,
+      order: "desc",
+      include_return_message_types: options.includeReturnMessageTypes,
+    } as ConversationMessageListBody;
+
+    if (conversationId && conversationId !== "default") {
+      const conversation = this.store.retrieveConversation(
+        conversationId,
+        agentId,
+      );
+      return {
+        conversation,
+        messages: this.store.listConversationMessages(conversation.id, {
+          ...body,
+          agent_id: agentId,
+        } as ConversationMessageListBody) as never,
+      };
+    }
+
+    return {
+      messages: this.store.listAgentMessages(agentId, {
+        ...body,
+        conversation_id: "default",
+      } as never) as never,
+    };
+  }
+
   async listModels(): ReturnType<Backend["listModels"]> {
     return [
       {
@@ -426,7 +461,7 @@ export class HeadlessBackend implements Backend {
         turnInput.agentId,
       ),
     );
-    const systemPrompt = await this.resolveSystemPromptForTurn({
+    const resolvedPrompt = await this.resolveSystemPromptForTurn({
       conversationId: turnInput.conversationId,
       agentId: turnInput.agentId,
       agent,
@@ -434,6 +469,14 @@ export class HeadlessBackend implements Backend {
       history,
       uiMessages,
     });
+    const systemPrompt =
+      typeof resolvedPrompt === "string"
+        ? resolvedPrompt
+        : resolvedPrompt.systemPrompt;
+    const midConversationSystemPrompt =
+      typeof resolvedPrompt === "string"
+        ? undefined
+        : resolvedPrompt.midConversationSystemPrompt;
     let stream: Stream<LettaStreamingResponse>;
     try {
       stream = await this.executor.execute({
@@ -441,6 +484,7 @@ export class HeadlessBackend implements Backend {
         agentId: turnInput.agentId,
         agent,
         systemPrompt,
+        midConversationSystemPrompt,
         body,
         history,
         uiMessages,
@@ -465,7 +509,9 @@ export class HeadlessBackend implements Backend {
     body: ConversationMessageCreateBody | ConversationMessageStreamBody;
     history: ReturnType<LocalStore["listConversationMessages"]>;
     uiMessages: ReturnType<LocalStore["listLocalMessages"]>;
-  }): Promise<string> {
+  }): Promise<
+    string | { systemPrompt: string; midConversationSystemPrompt?: string }
+  > {
     return input.agent.system;
   }
 

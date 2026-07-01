@@ -2,7 +2,7 @@
  * Pure startup agent resolution logic.
  *
  * Encodes the decision tree for which agent to use when `letta` starts:
- *   local LRU → global LRU → selector → create default
+ *   pinned → local LRU → global LRU → selector → create default
  *
  * Extracted from index.ts/headless.ts so it can be unit-tested without
  * React effects or real network calls.
@@ -14,6 +14,17 @@ export type StartupTarget =
   | { action: "create" };
 
 export interface StartupResolutionInput {
+  /** The pinned agent to resume when exactly one pin exists for the active org */
+  pinnedAgentId: string | null;
+  /** Whether the pinned agent still exists on the server */
+  pinnedAgentExists: boolean;
+  /** Number of pinned agents configured for the active backend, including stale
+   * or cross-org pins that no longer resolve (drives the selector fallback) */
+  pinnedCount: number;
+  /** Number of pinned agents that actually exist in the active org (drives the
+   * single-resume and multi-pin select decisions) */
+  existingPinnedCount: number;
+
   /** Agent ID from local project LRU (via getLocalLastAgentId) */
   localAgentId: string | null;
   /** Conversation ID from local project LRU */
@@ -26,9 +37,6 @@ export interface StartupResolutionInput {
   /** Whether the global agent still exists on the server */
   globalAgentExists: boolean;
 
-  /** Number of merged pinned agents (local + global) */
-  mergedPinnedCount: number;
-
   /** Backend-store fallback when settings LRU entries are missing/stale */
   fallbackAgentId?: string | null;
   fallbackConversationId?: string | null;
@@ -36,7 +44,7 @@ export interface StartupResolutionInput {
   /** --new-agent flag: skip all resume logic, create fresh */
   forceNew: boolean;
 
-  /** Self-hosted server with no available default model */
+  /** Custom API backend with no available default model */
   needsModelPicker: boolean;
 }
 
@@ -45,12 +53,14 @@ export interface StartupResolutionInput {
  *
  * Decision tree:
  * 1. forceNew → create
- * 2. local LRU valid → resume (with local conversation)
- * 3. global LRU valid → resume (no conversation — project-scoped)
- * 4. backend-store fallback → resume
- * 5. needsModelPicker → select
- * 6. pinned agents exist → select
- * 7. nothing → create
+ * 2. single existing pin → resume (with local conversation only if it matches LRU)
+ * 3. multiple existing pins → select
+ * 4. local LRU valid → resume (with local conversation)
+ * 5. global LRU valid → resume (no conversation — project-scoped)
+ * 6. backend-store fallback → resume
+ * 7. needsModelPicker → select
+ * 8. pins configured (even if stale) → select
+ * 9. nothing → create
  */
 export function resolveStartupTarget(
   input: StartupResolutionInput,
@@ -60,7 +70,26 @@ export function resolveStartupTarget(
     return { action: "create" };
   }
 
-  // Step 1: Local project LRU
+  // Step 1: Pinned agent
+  if (input.pinnedAgentId && input.pinnedAgentExists) {
+    const conversationId =
+      input.pinnedAgentId === input.localAgentId
+        ? (input.localConversationId ?? undefined)
+        : undefined;
+    return {
+      action: "resume",
+      agentId: input.pinnedAgentId,
+      ...(conversationId ? { conversationId } : {}),
+    };
+  }
+
+  // Step 2: Multiple existing pins should ask instead of picking implicitly.
+  // (Stale/cross-org pins are excluded — see existingPinnedCount.)
+  if (input.existingPinnedCount > 1) {
+    return { action: "select" };
+  }
+
+  // Step 3: Local project LRU
   if (input.localAgentId && input.localAgentExists) {
     return {
       action: "resume",
@@ -69,7 +98,7 @@ export function resolveStartupTarget(
     };
   }
 
-  // Step 2: Global LRU (directory-switching fallback)
+  // Step 4: Global LRU (directory-switching fallback)
   // Do NOT restore global conversation — keep conversations project-scoped
   if (input.globalAgentId && input.globalAgentExists) {
     return {
@@ -88,13 +117,13 @@ export function resolveStartupTarget(
     };
   }
 
-  // Step 5: Self-hosted model picker
+  // Step 5: Custom API model picker
   if (input.needsModelPicker) {
     return { action: "select" };
   }
 
   // Step 6: Show selector if any pinned agents exist
-  if (input.mergedPinnedCount > 0) {
+  if (input.pinnedCount > 0) {
     return { action: "select" };
   }
 

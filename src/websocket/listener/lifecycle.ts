@@ -1,12 +1,10 @@
 import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import WebSocket from "ws";
-import { getMemoryFilesystemRoot } from "@/agent/memory-filesystem";
 import {
   getSubagents,
   subscribe as subscribeToSubagentState,
   subscribeToStreamEvents as subscribeToSubagentStreamEvents,
 } from "@/agent/subagent-state";
-import { getBackend } from "@/backend";
 import {
   buildChannelModelListMessage,
   buildChannelModelListUnavailableMessage,
@@ -15,14 +13,7 @@ import {
 } from "@/channels/commands";
 import { getChannelRegistry } from "@/channels/registry";
 import type { ChannelTurnSource } from "@/channels/types";
-import { handleMemorySubagentCompletion } from "@/cli/helpers/memory-subagent-completion";
-import { isReflectionSubagentActive } from "@/cli/helpers/reflection-gate";
-import {
-  buildAutoReflectionPayload,
-  buildParentMemorySnapshot,
-  buildReflectionSubagentPrompt,
-  finalizeAutoReflectionPayload,
-} from "@/cli/helpers/reflection-transcript";
+import { launchReflectionSubagent } from "@/cli/helpers/reflection-launcher";
 import {
   startScheduler as startCronScheduler,
   stopScheduler as stopCronScheduler,
@@ -31,7 +22,11 @@ import type { DequeuedBatch } from "@/queue/queue-runtime";
 import { createSharedReminderState } from "@/reminders/state";
 import { getCurrentWorkingDirectory } from "@/runtime-context";
 import { settingsManager } from "@/settings-manager";
-import { telemetry } from "@/telemetry";
+import {
+  getListenerTelemetrySurface,
+  getTerminalTelemetrySurface,
+  telemetry,
+} from "@/telemetry";
 import { trackBoundaryError } from "@/telemetry/error-reporting";
 import { loadTools } from "@/tools/manager";
 import { isDebugEnabled } from "@/utils/debug";
@@ -46,6 +41,9 @@ import {
 } from "./commands/model-toolset";
 import {
   INITIAL_RETRY_DELAY_MS,
+  isListenerPongStale,
+  LISTENER_HEARTBEAT_INTERVAL_MS,
+  LISTENER_PONG_TIMEOUT_MS,
   MAX_RETRY_DELAY_MS,
   MAX_RETRY_DURATION_MS,
 } from "./constants";
@@ -59,9 +57,17 @@ import {
   findFallbackRuntime,
   getOrCreateScopedRuntime,
 } from "./conversation-runtime";
-import { loadPersistedCwdMap } from "./cwd";
+import { loadPersistedCwdMap, seedConversationWorkingDirectory } from "./cwd";
+import {
+  installExternalToolBridge,
+  rejectPendingExternalToolCalls,
+} from "./external-tools";
 import { createFileCommandSession } from "./file-commands";
 import { createListenerMessageHandler } from "./message-router";
+import {
+  disposeListenerModAdapter,
+  reloadListenerModAdapter,
+} from "./mod-adapter";
 import {
   getOrCreateConversationPermissionModeStateRef,
   loadPersistedPermissionModeMap,
@@ -203,6 +209,7 @@ export async function replaySyncStateForRuntime(
       runtime: ListenerRuntime,
       scope: { agent_id: string; conversation_id: string },
     ) => void;
+    forceDeviceStatus?: boolean;
   },
 ): Promise<void> {
   const syncScopedRuntime = getOrCreateScopedRuntime(
@@ -228,7 +235,9 @@ export async function replaySyncStateForRuntime(
     }
   }
 
-  emitStateSync(socket, listenerRuntime, scope);
+  emitStateSync(socket, listenerRuntime, scope, {
+    forceDeviceStatus: opts?.forceDeviceStatus,
+  });
   (opts?.scheduleWarmupsAfterSync ?? scheduleListenerWarmupsAfterSync)(
     listenerRuntime,
     scope,
@@ -430,6 +439,16 @@ export async function wireChannelIngress(
     );
     if (!rawRuntime) return;
 
+    const seededWorkingDirectory = seedConversationWorkingDirectory(
+      listener,
+      delivery.route.agentId,
+      delivery.route.conversationId,
+      listener.bootWorkingDirectory,
+    );
+    if (seededWorkingDirectory) {
+      emitDeviceStatusUpdate(socket, rawRuntime);
+    }
+
     if (delivery.defaultPermissionMode) {
       const permissionModeState = getOrCreateConversationPermissionModeStateRef(
         listener,
@@ -595,137 +614,84 @@ export async function wireChannelIngress(
     const agentId = runtime.agent_id;
     const conversationId = runtime.conversation_id;
 
-    if (!settingsManager.isMemfsEnabled(agentId)) {
-      return {
-        handled: true,
-        text: "Reflection needs the memory filesystem to be enabled for this agent. Use /remember for a lightweight memory update instead.",
-      };
-    }
+    const result = await launchReflectionSubagent({
+      agentId,
+      conversationId,
+      memfsEnabled: settingsManager.isMemfsEnabled(agentId),
+      triggerSource: "manual",
+      description: "Reflecting on channel conversation",
+      recompileByConversation: listener.systemPromptRecompileByConversation,
+      recompileQueuedByConversation:
+        listener.queuedSystemPromptRecompileByConversation,
+      feedbackContext: {
+        surface: getListenerTelemetrySurface(),
+      },
+      onCompletionMessage: async (completionMessage, result) => {
+        const conversationRuntime = getOrCreateConversationRuntime(
+          listener,
+          agentId,
+          conversationId,
+        );
+        const reflectionAgentIdTag = result.reflectionAgentId
+          ? `<reflection-agent-id>${escapeTaskNotificationSummary(
+              result.reflectionAgentId,
+            )}</reflection-agent-id>`
+          : "";
+        const notificationXml = `<task-notification><summary>${escapeTaskNotificationSummary(
+          completionMessage,
+        )}</summary>${reflectionAgentIdTag}</task-notification>`;
+        emitStreamDelta(
+          socket,
+          conversationRuntime,
+          {
+            type: "message",
+            id: `user-msg-${crypto.randomUUID()}`,
+            date: new Date().toISOString(),
+            message_type: "user_message",
+            content: [{ type: "text", text: notificationXml }],
+          } as import("@/types/protocol_v2").StreamDelta,
+          {
+            agent_id: agentId,
+            conversation_id: conversationId,
+          },
+        );
+      },
+    });
 
-    if (isReflectionSubagentActive(getSubagents(), agentId, conversationId)) {
-      return {
-        handled: true,
-        text: "A reflection agent is already running for this conversation.",
-      };
-    }
-
-    try {
-      let systemPrompt: string | undefined;
-      try {
-        const agent = await getBackend().retrieveAgent(agentId);
-        systemPrompt = agent.system ?? undefined;
-      } catch {
-        // Non-fatal — the reflection payload can omit the system prompt.
+    if (!result.launched) {
+      if (result.reason === "memfs_disabled") {
+        return {
+          handled: true,
+          text: "Reflection needs the memory filesystem to be enabled for this agent. Use /remember for a lightweight memory update instead.",
+        };
       }
-
-      const autoPayload = await buildAutoReflectionPayload(
-        agentId,
-        conversationId,
-        systemPrompt,
-      );
-      if (!autoPayload) {
+      if (result.reason === "already_active") {
+        return {
+          handled: true,
+          text: "A reflection agent is already running for this conversation.",
+        };
+      }
+      if (result.reason === "no_payload") {
         return {
           handled: true,
           text: "No new transcript content to reflect on for this conversation.",
         };
       }
 
-      const memoryDir = getMemoryFilesystemRoot(agentId);
-      const parentMemory = await buildParentMemorySnapshot(memoryDir);
-      const reflectionPrompt = buildReflectionSubagentPrompt({
-        memoryDir,
-        parentMemory,
-      });
-
-      const { spawnBackgroundSubagentTask, waitForBackgroundSubagentAgentId } =
-        await import("@/tools/impl/task");
-      const { subagentId } = spawnBackgroundSubagentTask({
-        subagentType: "reflection",
-        prompt: reflectionPrompt,
-        description: "Reflecting on channel conversation",
-        silentCompletion: true,
-        transcriptPath: autoPayload.payloadPath,
-        parentScope: { agentId, conversationId },
-        onComplete: async ({ success, error, agentId: reflectionAgentId }) => {
-          telemetry.trackReflectionEnd("manual", success, {
-            subagentId: reflectionAgentId ?? undefined,
-            conversationId,
-            error,
-          });
-          await finalizeAutoReflectionPayload(
-            agentId,
-            conversationId,
-            autoPayload.payloadPath,
-            autoPayload.endSnapshotLine,
-            success,
-          );
-
-          const completionMessage = await handleMemorySubagentCompletion(
-            {
-              agentId,
-              conversationId,
-              subagentType: "reflection",
-              success,
-              error,
-            },
-            {
-              recompileByConversation:
-                listener.systemPromptRecompileByConversation,
-              recompileQueuedByConversation:
-                listener.queuedSystemPromptRecompileByConversation,
-              logRecompileFailure: (message) =>
-                isDebugEnabled() && console.warn(message),
-            },
-          );
-
-          const conversationRuntime = getOrCreateConversationRuntime(
-            listener,
-            agentId,
-            conversationId,
-          );
-          const notificationXml = `<task-notification><summary>${escapeTaskNotificationSummary(
-            completionMessage,
-          )}</summary></task-notification>`;
-          emitStreamDelta(
-            socket,
-            conversationRuntime,
-            {
-              type: "message",
-              id: `user-msg-${crypto.randomUUID()}`,
-              date: new Date().toISOString(),
-              message_type: "user_message",
-              content: [{ type: "text", text: notificationXml }],
-            } as import("@/types/protocol_v2").StreamDelta,
-            {
-              agent_id: agentId,
-              conversation_id: conversationId,
-            },
-          );
-        },
-      });
-
-      const reflectionAgentId = await waitForBackgroundSubagentAgentId(
-        subagentId,
-        1000,
-      );
-      telemetry.trackReflectionStart("manual", {
-        subagentId: reflectionAgentId ?? undefined,
-        conversationId,
-        startMessageId: autoPayload.startMessageId,
-        endMessageId: autoPayload.endMessageId,
-      });
-
-      return {
-        handled: true,
-        text: "Started a reflection pass for this conversation.",
-      };
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const message =
+        result.error instanceof Error
+          ? result.error.message
+          : String(result.error ?? "Unknown error");
       return {
         handled: true,
         text: `Failed to start reflection: ${message}`,
       };
     }
+
+    return {
+      handled: true,
+      text: "Started a reflection pass for this conversation.",
+    };
   });
 
   registry.setReady();
@@ -816,6 +782,7 @@ export function createRuntime(): ListenerRuntime {
     streamTransport: null,
     heartbeatInterval: null,
     reconnectTimeout: null,
+    lastPongAt: null,
     intentionallyClosed: false,
     hasSuccessfulConnection: false,
     everConnected: false,
@@ -842,6 +809,7 @@ export function createRuntime(): ListenerRuntime {
     secretsHydrationByAgent: new Map(),
     secretsHydrationFreshnessByAgent: new Map(),
     secretsDirtyAgents: new Set(),
+    pendingExternalToolCalls: new Map(),
     agentMetadataByAgent: new Map(),
     lastEmittedStatus: null,
   };
@@ -851,6 +819,8 @@ export function stopRuntime(
   runtime: ListenerRuntime,
   suppressCallbacks: boolean,
 ): void {
+  disposeListenerModAdapter(runtime);
+  rejectPendingExternalToolCalls(runtime, "Listener runtime stopped");
   setMessageQueueAdder(null); // Clear bridge for ALL stop paths
   runtime.intentionallyClosed = true;
   clearRuntimeTimers(runtime);
@@ -1063,14 +1033,45 @@ export async function startConnectedListenerRuntime(
   });
 
   if (shouldStartHeartbeat) {
+    // Seed the pong clock so the watchdog tolerates the first ping/pong
+    // round-trip before considering the peer dead.
+    runtime.lastPongAt = Date.now();
     runtime.heartbeatInterval = setInterval(() => {
+      // Dead-peer detection. The relay replies to every `ping` with a `pong`
+      // (recorded as runtime.lastPongAt in the message router). If pongs stop
+      // arriving, the underlying TCP is likely half-open (laptop sleep,
+      // network switch, NAT/idle timeout) and will never emit a `close`
+      // event — leaving a zombie listener that the relay marks offline after
+      // ~120s while client-side tool execution silently breaks. Force a
+      // terminate so the socket's `close` handler fires and reconnects.
+      // Gated on websocket transports: the local app-server path does not run
+      // a heartbeat, and only websockets carry the relay pong round-trip.
+      if (
+        getListenerTransportKind(transport) === "websocket" &&
+        isListenerPongStale(
+          runtime.lastPongAt,
+          Date.now(),
+          LISTENER_PONG_TIMEOUT_MS,
+        )
+      ) {
+        trackListenerError(
+          "listener_pong_timeout",
+          new Error(
+            `No relay pong within ${LISTENER_PONG_TIMEOUT_MS}ms; terminating half-open socket to force reconnect`,
+          ),
+          "listener_heartbeat",
+        );
+        runtime.socket?.terminate();
+        return;
+      }
+
       safeTransportSend(
         transport,
         { type: "ping" },
         "listener_ping_send_failed",
         "listener_heartbeat",
       );
-    }, 30000);
+    }, LISTENER_HEARTBEAT_INTERVAL_MS);
   }
 
   if (shouldStartCronScheduler) {
@@ -1091,6 +1092,166 @@ export async function startConnectedListenerRuntime(
 }
 
 /**
+ * Attach an already-open, locally accepted websocket to a listener runtime.
+ *
+ * Unlike the cloud listener client path, this helper does not reconnect on
+ * close. It is intended for local app-server transports where the HTTP server
+ * keeps running and the next client connection creates a fresh runtime.
+ */
+
+export async function attachOpenListenerSocket(
+  runtime: ListenerRuntime,
+  socket: WebSocket,
+  opts: StartListenerOptions,
+  options: {
+    streamSocket?: WebSocket | null;
+    startHeartbeat?: boolean;
+    startCronScheduler?: boolean;
+    startupReady?: Promise<void>;
+  } = {},
+): Promise<void> {
+  if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
+    return;
+  }
+
+  const streamSocket = options.streamSocket ?? null;
+  const fileCommandSession = createFileCommandSession({
+    socket,
+    safeSocketSend,
+    runDetachedListenerTask,
+  });
+
+  runtime.socket = socket;
+  runtime.streamSocket = streamSocket;
+  installExternalToolBridge(runtime);
+  const transport = socket;
+  const processQueuedTurn: ProcessQueuedTurn = async (
+    queuedTurn: IncomingMessage,
+    dequeuedBatch: DequeuedBatch,
+  ): Promise<void> => {
+    const scopedRuntime = getOrCreateScopedRuntime(
+      runtime,
+      queuedTurn.agentId,
+      queuedTurn.conversationId,
+    );
+    await handleIncomingMessage(
+      queuedTurn,
+      transport,
+      scopedRuntime,
+      opts.onStatusChange,
+      opts.connectionId,
+      dequeuedBatch.batchId,
+    );
+  };
+
+  const handleMessage = createListenerMessageHandler({
+    runtime,
+    socket,
+    opts,
+    processQueuedTurn,
+    fileCommandSession,
+    getParsedRuntimeScope,
+    replaySyncStateForRuntime,
+    getOrCreateScopedRuntime,
+    handleApprovalResponseInput,
+    handleChangeDeviceStateInput,
+    handleAbortMessageInput,
+    stampInboundUserMessageOtids,
+    safeSocketSend,
+    runDetachedListenerTask,
+    trackListenerError,
+    wireChannelIngress,
+  });
+  socket.on("message", (data: WebSocket.RawData) => {
+    void (async () => {
+      await options.startupReady;
+      await handleMessage(data);
+    })().catch((error) => {
+      trackListenerError(
+        "listener_message_handler_failed",
+        error,
+        "listener_message_handler",
+      );
+      opts.onError(error instanceof Error ? error : new Error(String(error)));
+    });
+  });
+
+  socket.on("close", (code: number, reason: Buffer) => {
+    if (runtime !== getActiveRuntime()) {
+      return;
+    }
+
+    const reasonText = reason.toString();
+    safeEmitWsEvent("recv", "lifecycle", {
+      type: "_ws_close",
+      code,
+      reason: reasonText,
+    });
+    fileCommandSession.dispose();
+    stopCronScheduler();
+    getChannelRegistry()?.pause();
+    stopRuntime(runtime, true);
+    if (getActiveRuntime() === runtime) {
+      setActiveRuntime(null);
+    }
+    opts.onDisconnected();
+  });
+
+  socket.on("error", (error: Error) => {
+    trackListenerError("listener_websocket_error", error, "listener_socket");
+    safeEmitWsEvent("recv", "lifecycle", {
+      type: "_ws_error",
+      message: error.message,
+    });
+    if (isDebugEnabled()) {
+      console.error("[Listen] WebSocket error:", error);
+    }
+  });
+
+  if (streamSocket) {
+    streamSocket.on("error", (error: Error) => {
+      trackListenerError(
+        "listener_stream_socket_error",
+        error,
+        "listener_stream_socket",
+      );
+      if (isDebugEnabled()) {
+        console.error("[Listen] Stream WebSocket error:", error);
+      }
+    });
+
+    streamSocket.on("close", (code: number, reason: Buffer) => {
+      if (isDebugEnabled()) {
+        console.log(
+          `[Listen] Stream WebSocket closed (code: ${code}, reason: ${reason.toString()})`,
+        );
+      }
+
+      if (runtime.streamSocket === streamSocket) {
+        runtime.streamSocket = null;
+        runtime.streamTransport = null;
+      }
+    });
+  }
+
+  await options.startupReady;
+
+  const streamTransport =
+    streamSocket?.readyState === WebSocket.OPEN ? streamSocket : null;
+  await startConnectedListenerRuntime(
+    runtime,
+    transport,
+    opts,
+    processQueuedTurn,
+    {
+      startHeartbeat: options.startHeartbeat ?? false,
+      startCronScheduler: options.startCronScheduler ?? true,
+      streamTransport,
+    },
+  );
+}
+
+/**
  * Start the listener WebSocket client with automatic retry.
  */
 export async function startListenerClient(
@@ -1107,9 +1268,10 @@ export async function startListenerClient(
   runtime.connectionId = opts.connectionId;
   runtime.connectionName = opts.connectionName;
   setActiveRuntime(runtime);
-  telemetry.setSurface("websocket");
+  telemetry.setSurface(getListenerTelemetrySurface());
   telemetry.init();
 
+  await reloadListenerModAdapter(runtime);
   await connectWithRetry(runtime, opts);
 }
 
@@ -1140,10 +1302,11 @@ export async function startLocalChannelListener(
   runtime.connectionId = opts.connectionId;
   runtime.connectionName = opts.connectionName;
   setActiveRuntime(runtime);
-  telemetry.setSurface("websocket");
+  telemetry.setSurface(getListenerTelemetrySurface());
   telemetry.init();
 
   try {
+    await reloadListenerModAdapter(runtime);
     await loadTools();
     const transport = new LocalListenerTransport();
     const processQueuedTurn: ProcessQueuedTurn = async (
@@ -1500,6 +1663,6 @@ export function stopListenerClient(): void {
     return;
   }
   setActiveRuntime(null);
-  telemetry.setSurface(process.stdin.isTTY ? "tui" : "headless");
+  telemetry.setSurface(getTerminalTelemetrySurface(!process.stdin.isTTY));
   stopRuntime(runtime, true);
 }

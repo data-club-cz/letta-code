@@ -7,10 +7,14 @@ import { Box, useInput } from "ink";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { type Backend, getBackend } from "@/backend";
 import { CLI_GLYPHS } from "@/cli/helpers/glyphs";
-import { useTerminalWidth } from "@/cli/hooks/use-terminal-width";
+import {
+  useTerminalRows,
+  useTerminalWidth,
+} from "@/cli/hooks/use-terminal-width";
 import { SYSTEM_ALERT_OPEN, SYSTEM_REMINDER_OPEN } from "@/constants";
 import { colors } from "./colors";
 import { MarkdownDisplay } from "./MarkdownDisplay";
+import { PasteAwareTextInput } from "./PasteAwareTextInput";
 import { Text } from "./Text";
 
 // Horizontal line character (matches approval dialogs)
@@ -27,7 +31,7 @@ interface ConversationSelectorProps {
       messageCount: number;
     },
   ) => void;
-  onNewConversation: () => void;
+  onNewConversation?: () => void;
   onCancel: () => void;
 }
 
@@ -41,12 +45,13 @@ interface PreviewLine {
 interface EnrichedConversation {
   conversation: Conversation;
   previewLines: PreviewLine[] | null; // null = not yet loaded
+  searchPreview?: string;
   lastActiveAt: string | null; // Falls back to updated_at until enriched
   messageCount: number; // -1 = unknown/loading
   enriched: boolean; // Whether message data has been fetched
 }
 
-const DISPLAY_PAGE_SIZE = 3;
+const MAX_DISPLAY_PAGE_SIZE = 5;
 const FETCH_PAGE_SIZE = 20;
 const ENRICH_MESSAGE_LIMIT = 20; // Same as original fetch limit
 
@@ -54,6 +59,10 @@ const RESUME_PREVIEW_MESSAGE_TYPES: MessageType[] = [
   "user_message",
   "assistant_message",
 ];
+
+export function buildConversationSelectorHints(): string {
+  return "Enter select · ↑↓ navigate · Esc clear/cancel";
+}
 
 function paginatedItems<T>(value: T[] | { getPaginatedItems(): T[] }): T[] {
   return Array.isArray(value) ? value : value.getPaginatedItems();
@@ -276,7 +285,6 @@ export function ConversationSelector({
   agentName,
   currentConversationId,
   onSelect,
-  onNewConversation,
   onCancel,
 }: ConversationSelectorProps) {
   const backendRef = useRef<Backend | null>(null);
@@ -295,11 +303,15 @@ export function ConversationSelector({
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [enriching, setEnriching] = useState(false);
+  const [, setEnriching] = useState(false);
 
   // Selection state
   const [selectedIndex, setSelectedIndex] = useState(0);
-  const [page, setPage] = useState(0);
+  const [searchInput, setSearchInput] = useState("");
+  const [searchResults, setSearchResults] = useState<
+    EnrichedConversation[] | null
+  >(null);
+  const [searching, setSearching] = useState(false);
 
   // Enrich a single conversation with message data, updating state in-place
   const enrichConversation = useCallback(
@@ -326,6 +338,20 @@ export function ConversationSelector({
               : c,
           ),
         );
+        setSearchResults(
+          (prev) =>
+            prev?.map((c) =>
+              c.conversation.id === convId
+                ? {
+                    ...c,
+                    previewLines: stats.previewLines,
+                    lastActiveAt: stats.lastActiveAt || c.lastActiveAt,
+                    messageCount: stats.messageCount,
+                    enriched: true,
+                  }
+                : c,
+            ) ?? null,
+        );
         return stats.messageCount;
       } catch {
         // Mark as enriched even on error so we don't retry
@@ -335,6 +361,14 @@ export function ConversationSelector({
               ? { ...c, previewLines: [], enriched: true }
               : c,
           ),
+        );
+        setSearchResults(
+          (prev) =>
+            prev?.map((c) =>
+              c.conversation.id === convId
+                ? { ...c, previewLines: [], enriched: true }
+                : c,
+            ) ?? null,
         );
         return -1;
       }
@@ -421,11 +455,10 @@ export function ConversationSelector({
         if (isLoadingMore) {
           setConversations((prev) => [...prev, ...nonEmptyList]);
         } else {
-          const allConversations = defaultConversation
+          const initialConversations = defaultConversation
             ? [defaultConversation, ...nonEmptyList]
             : nonEmptyList;
-          setConversations(allConversations);
-          setPage(0);
+          setConversations(initialConversations);
           setSelectedIndex(0);
         }
         setCursor(newCursor);
@@ -439,10 +472,10 @@ export function ConversationSelector({
         }
 
         // Phase 2: enrich visible page first, then rest in background
-        setEnriching(true);
         const toEnrich = nonEmptyList.filter((c) => !c.enriched);
-        const firstPageItems = toEnrich.slice(0, DISPLAY_PAGE_SIZE);
-        const restItems = toEnrich.slice(DISPLAY_PAGE_SIZE);
+        setEnriching(toEnrich.length > 0);
+        const firstPageItems = toEnrich.slice(0, MAX_DISPLAY_PAGE_SIZE);
+        const restItems = toEnrich.slice(MAX_DISPLAY_PAGE_SIZE);
 
         // Enrich first page in parallel
         const firstPageResults = await Promise.all(
@@ -478,6 +511,7 @@ export function ConversationSelector({
         setError(err instanceof Error ? err.message : String(err));
         setLoading(false);
         setLoadingMore(false);
+        setEnriching(false);
       }
     },
     [agentId, enrichConversation, selectorBackend],
@@ -488,31 +522,128 @@ export function ConversationSelector({
     loadConversations();
   }, [loadConversations]);
 
-  // Re-enrich when page changes (prioritize newly visible unenriched items)
+  const terminalRows = useTerminalRows();
+  const listPageSize = Math.max(
+    1,
+    Math.min(MAX_DISPLAY_PAGE_SIZE, Math.floor((terminalRows - 11) / 4)),
+  );
+
+  useEffect(() => {
+    const query = searchInput.trim();
+    if (!query) {
+      setSearchResults(null);
+      setSearching(false);
+      return;
+    }
+
+    let cancelled = false;
+    const timeout = setTimeout(() => {
+      (async () => {
+        const backend = backendRef.current ?? selectorBackend();
+        backendRef.current = backend;
+        setSearching(true);
+        try {
+          const page = await backend.listConversations({
+            agent_id: agentId,
+            limit: 20,
+            order: "desc",
+            order_by: "last_run_completion",
+            summary_search: query,
+          });
+          const results = paginatedItems<Conversation>(page);
+          const seenConversationIds = new Set<string>();
+          const dedupedResults = results.filter((conversation) => {
+            const conversationId = conversation.id;
+            if (seenConversationIds.has(conversationId)) return false;
+            seenConversationIds.add(conversationId);
+            return true;
+          });
+          if (cancelled) return;
+          setSearchResults(
+            dedupedResults.map((conversation) => ({
+              conversation,
+              preview: null,
+              previewLines: null,
+              searchPreview: conversation.summary || undefined,
+              lastActiveAt:
+                conversation.updated_at ?? conversation.created_at ?? null,
+              messageCount: -1,
+              enriched: false,
+            })),
+          );
+        } catch {
+          if (!cancelled) {
+            setSearchResults(null);
+          }
+        } finally {
+          if (!cancelled) {
+            setSearching(false);
+          }
+        }
+      })();
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timeout);
+    };
+  }, [agentId, searchInput, selectorBackend]);
+
+  const normalizedSearch = searchInput.trim().toLowerCase();
+  const locallyFilteredConversations = normalizedSearch
+    ? conversations.filter((item) => {
+        const summary = item.conversation.summary?.toLowerCase() ?? "";
+        const searchPreview = item.searchPreview?.toLowerCase() ?? "";
+        const id = item.conversation.id.toLowerCase();
+        return (
+          summary.includes(normalizedSearch) ||
+          searchPreview.includes(normalizedSearch) ||
+          id.includes(normalizedSearch)
+        );
+      })
+    : conversations;
+  const filteredConversations = normalizedSearch
+    ? (() => {
+        const merged: EnrichedConversation[] = [];
+        const seenConversationIds = new Set<string>();
+        for (const item of searchResults ?? []) {
+          merged.push(item);
+          seenConversationIds.add(item.conversation.id);
+        }
+        for (const item of locallyFilteredConversations) {
+          if (!seenConversationIds.has(item.conversation.id)) {
+            merged.push(item);
+          }
+        }
+        return merged;
+      })()
+    : conversations;
+
+  // Sliding window calculations (same interaction model as /search).
+  const startIndex = Math.max(
+    0,
+    Math.min(
+      selectedIndex - Math.floor(listPageSize / 2),
+      filteredConversations.length - listPageSize,
+    ),
+  );
+  const visibleConversations = filteredConversations.slice(
+    startIndex,
+    startIndex + listPageSize,
+  );
+
+  // Re-enrich when visible conversations change (including search results).
   useEffect(() => {
     const backend = backendRef.current;
     if (!backend || loading) return;
 
-    const visibleItems = conversations.slice(
-      page * DISPLAY_PAGE_SIZE,
-      (page + 1) * DISPLAY_PAGE_SIZE,
-    );
-    const unenriched = visibleItems.filter((c) => !c.enriched);
+    const unenriched = visibleConversations.filter((c) => !c.enriched);
     if (unenriched.length === 0) return;
 
     for (const item of unenriched) {
       enrichConversation(backend, item.conversation.id);
     }
-  }, [page, loading, conversations, enrichConversation]);
-
-  // Pagination calculations
-  const totalPages = Math.ceil(conversations.length / DISPLAY_PAGE_SIZE);
-  const startIndex = page * DISPLAY_PAGE_SIZE;
-  const pageConversations = conversations.slice(
-    startIndex,
-    startIndex + DISPLAY_PAGE_SIZE,
-  );
-  const canGoNext = page < totalPages - 1 || hasMore;
+  }, [loading, visibleConversations, enrichConversation]);
 
   // Fetch more when needed
   const fetchMore = useCallback(async () => {
@@ -529,14 +660,21 @@ export function ConversationSelector({
 
     if (loading) return;
 
-    if (key.upArrow) {
+    if (key.upArrow || input === "k") {
       setSelectedIndex((prev) => Math.max(0, prev - 1));
-    } else if (key.downArrow) {
+    } else if (key.downArrow || input === "j") {
       setSelectedIndex((prev) =>
-        Math.min(pageConversations.length - 1, prev + 1),
+        Math.max(0, Math.min(filteredConversations.length - 1, prev + 1)),
       );
+      if (
+        !normalizedSearch &&
+        hasMore &&
+        selectedIndex >= filteredConversations.length - 2
+      ) {
+        fetchMore();
+      }
     } else if (key.return) {
-      const selected = pageConversations[selectedIndex];
+      const selected = filteredConversations[selectedIndex];
       if (selected?.conversation.id) {
         onSelect(selected.conversation.id, {
           summary: selected.conversation.summary ?? undefined,
@@ -544,31 +682,14 @@ export function ConversationSelector({
         });
       }
     } else if (key.escape) {
+      if (searchInput) {
+        setSearchInput("");
+        return;
+      }
       onCancel();
-    } else if (input === "n" || input === "N") {
-      // New conversation
-      onNewConversation();
-    } else if (key.leftArrow) {
-      // Previous page
-      if (page > 0) {
-        setPage((prev) => prev - 1);
-        setSelectedIndex(0);
-      }
-    } else if (key.rightArrow) {
-      // Next page
-      if (canGoNext) {
-        const nextPageIndex = page + 1;
-        const nextStartIndex = nextPageIndex * DISPLAY_PAGE_SIZE;
-
-        if (nextStartIndex >= conversations.length && hasMore) {
-          fetchMore();
-        }
-
-        if (nextStartIndex < conversations.length) {
-          setPage(nextPageIndex);
-          setSelectedIndex(0);
-        }
-      }
+    } else if (key.leftArrow || key.rightArrow) {
+      // Let the search input own horizontal cursor movement.
+      return;
     }
   });
 
@@ -599,6 +720,16 @@ export function ConversationSelector({
 
       // Still loading message data
       if (previewLines === null) {
+        if (enrichedConv.searchPreview) {
+          return (
+            <Box flexDirection="row" marginLeft={2}>
+              {bracket}
+              <Text dimColor italic>
+                {enrichedConv.searchPreview}
+              </Text>
+            </Box>
+          );
+        }
         return (
           <Box flexDirection="row" marginLeft={2}>
             {bracket}
@@ -709,6 +840,19 @@ export function ConversationSelector({
         </Text>
       </Box>
 
+      <Box marginBottom={1}>
+        <Text dimColor>Search: </Text>
+        <PasteAwareTextInput
+          value={searchInput}
+          onChange={(value) => {
+            if (value === searchInput) return;
+            setSearchInput(value);
+            setSelectedIndex(0);
+          }}
+          placeholder="search conversation titles"
+        />
+      </Box>
+
       {/* Error state */}
       {error && (
         <Box flexDirection="column">
@@ -724,30 +868,36 @@ export function ConversationSelector({
         </Box>
       )}
 
-      {/* Enriching indicator */}
-      {!loading && enriching && (
+      {/* Search indicator */}
+      {!loading && searching && (
         <Box marginBottom={1}>
           <Text dimColor italic>
-            Loading previews...
+            Searching conversations...
           </Text>
         </Box>
       )}
 
       {/* Empty state */}
-      {!loading && !error && conversations.length === 0 && (
+      {!loading && !error && filteredConversations.length === 0 && (
         <Box flexDirection="column">
           <Text dimColor>
-            No conversations for {agentName || agentId.slice(0, 12)}
+            {searchInput
+              ? "No matching conversations"
+              : `No conversations for ${agentName || agentId.slice(0, 12)}`}
           </Text>
-          <Text dimColor>Press N to start a new conversation</Text>
+          <Text dimColor>Press Esc to cancel</Text>
         </Box>
       )}
 
       {/* Conversation list */}
-      {!loading && !error && conversations.length > 0 && (
+      {!loading && !error && filteredConversations.length > 0 && (
         <Box flexDirection="column">
-          {pageConversations.map((conv, index) =>
-            renderConversationItem(conv, index, index === selectedIndex),
+          {visibleConversations.map((conv, index) =>
+            renderConversationItem(
+              conv,
+              index,
+              startIndex + index === selectedIndex,
+            ),
           )}
         </Box>
       )}
@@ -755,12 +905,11 @@ export function ConversationSelector({
       {/* Footer */}
       {!loading &&
         !error &&
-        conversations.length > 0 &&
+        filteredConversations.length > 0 &&
         (() => {
           const footerWidth = Math.max(0, terminalWidth - 2);
-          const pageText = `Page ${page + 1}${hasMore ? "+" : `/${totalPages || 1}`}${loadingMore ? " (loading...)" : ""}`;
-          const hintsText =
-            "Enter select · ↑↓ navigate · ←→ page · N new · Esc cancel";
+          const pageText = `Showing ${startIndex + 1}-${Math.min(startIndex + visibleConversations.length, filteredConversations.length)} of ${filteredConversations.length}${!normalizedSearch && hasMore ? "+" : ""}${loadingMore ? " (loading...)" : ""}`;
+          const hintsText = buildConversationSelectorHints();
 
           return (
             <Box flexDirection="column">

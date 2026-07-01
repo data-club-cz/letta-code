@@ -9,10 +9,26 @@ import {
   buildSubagentArgs,
   buildSubagentPrompt,
   getModelHandleFromAgent,
+  recallPromptForBackend,
   resolveSubagentLauncher,
   resolveSubagentModel,
   resolveSubagentWorkingDirectory,
 } from "@/agent/subagents/manager";
+
+describe("recallPromptForBackend", () => {
+  test("uses separate API and local recall prompts", () => {
+    const apiPrompt = recallPromptForBackend("api");
+    const localPrompt = recallPromptForBackend("local");
+
+    expect(apiPrompt).toContain("Semantic similarity search");
+    expect(apiPrompt).not.toContain("transcript-backed exact text search");
+    expect(localPrompt).toContain("transcript-backed full-text search");
+    expect(localPrompt).toContain("Accessing the Underlying Files");
+    expect(localPrompt).toContain("~/.letta/lc-local-backend");
+    expect(localPrompt).not.toContain("--mode <mode>");
+    expect(localPrompt).not.toContain("Semantic similarity search");
+  });
+});
 
 describe("resolveSubagentLauncher", () => {
   test("explicit launcher takes precedence over .ts script autodetection", () => {
@@ -188,7 +204,7 @@ describe("resolveSubagentWorkingDirectory", () => {
     expect(cwd).toBe("/tmp/repo-root");
   });
 
-  test("reflection memory-mode subagents run from the inherited parent memory root", () => {
+  test("reflection subagents with the memory-subagent profile run from the inherited parent memory root", () => {
     const cwd = resolveSubagentWorkingDirectory(
       {
         USER_CWD: "/tmp/project-root",
@@ -196,7 +212,7 @@ describe("resolveSubagentWorkingDirectory", () => {
       "/tmp/fallback-root",
       {
         subagentType: "reflection",
-        permissionMode: "memory",
+        launchProfile: "memory-subagent",
         inheritedPrimaryRoot: "/Users/test/.letta/agents/agent-parent/memory",
       },
     );
@@ -212,7 +228,7 @@ describe("resolveSubagentWorkingDirectory", () => {
       "/tmp/fallback-root",
       {
         subagentType: "general-purpose",
-        permissionMode: "memory",
+        launchProfile: "memory-subagent",
         inheritedPrimaryRoot: "/Users/test/.letta/agents/agent-parent/memory",
       },
     );
@@ -229,18 +245,55 @@ describe("buildSubagentArgs", () => {
     allowedTools: "all",
     recommendedModel: "inherit",
     skills: [],
-    memoryBlocks: "none",
-    mode: "stateful",
     fork: false,
     background: false,
+    launchProfile: "default",
   };
 
   test("adds --no-memfs for newly spawned subagents by default", () => {
     const args = buildSubagentArgs("test-subagent", baseConfig, null, "hello");
 
-    expect(args).toContain("--init-blocks");
-    expect(args).toContain("none");
     expect(args).toContain("--no-memfs");
+  });
+
+  test("tags new subagents with type and combines parent into one --tags value", () => {
+    const args = buildSubagentArgs(
+      "explore",
+      baseConfig,
+      null,
+      "hello",
+      undefined,
+      undefined,
+      undefined,
+      { parentAgentId: "agent-parent-123" },
+    );
+
+    const tagFlagCount = args.filter((a) => a === "--tags").length;
+    expect(tagFlagCount).toBe(1);
+    const tagsValue = args[args.indexOf("--tags") + 1];
+    expect(tagsValue).toBe("type:explore,parent:agent-parent-123");
+  });
+
+  test("omits parent tag when no parentAgentId is provided", () => {
+    const args = buildSubagentArgs("explore", baseConfig, null, "hello");
+
+    const tagsValue = args[args.indexOf("--tags") + 1];
+    expect(tagsValue).toBe("type:explore");
+  });
+
+  test("does not tag when deploying an existing agent (fork/recall)", () => {
+    const args = buildSubagentArgs(
+      "fork",
+      baseConfig,
+      null,
+      "hello",
+      "agent-existing",
+      undefined,
+      undefined,
+      { parentAgentId: "agent-parent-123" },
+    );
+
+    expect(args).not.toContain("--tags");
   });
 
   test("passes --backend local and --no-memfs for local backend subagents", () => {
@@ -274,19 +327,19 @@ describe("buildSubagentArgs", () => {
     expect(args).not.toContain("--no-memfs");
   });
 
-  test("passes memory permission mode through when configured", () => {
+  test("subagents always use unrestricted permission mode", () => {
     const args = buildSubagentArgs(
       "test-subagent",
       {
         ...baseConfig,
-        permissionMode: "memory",
+        launchProfile: "memory-subagent",
       },
       null,
       "hello",
     );
 
     expect(args).toContain("--permission-mode");
-    expect(args).toContain("memory");
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("unrestricted");
   });
 
   test("caps reflection system prompt plus initial message to startup budget", () => {
@@ -478,6 +531,15 @@ describe("getModelHandleFromAgent", () => {
     ).toBe("ollama/llama3.1:8b");
   });
 
+  test("reconstructs provider-qualified handles from model settings", () => {
+    expect(
+      getModelHandleFromAgent({
+        model: "llama3.1:8b",
+        model_settings: { provider_type: "ollama" },
+      }),
+    ).toBe("ollama/llama3.1:8b");
+  });
+
   test("falls back to llm_config endpoint and model for server agents", () => {
     expect(
       getModelHandleFromAgent({
@@ -569,6 +631,39 @@ describe("resolveSubagentModel", () => {
     expect(result).toBe("lc-openrouter/custom-model");
   });
 
+  test("explicit user inherit follows subagent inherit instead of literal model", async () => {
+    const result = await resolveSubagentModel({
+      userModel: "inherit",
+      recommendedModel: "inherit",
+      parentModelHandle: "lc-anthropic/parent-model",
+      availableHandles: new Set(["lc-anthropic/parent-model"]),
+    });
+
+    expect(result).toBe("lc-anthropic/parent-model");
+    expect(result).not.toBe("inherit");
+  });
+
+  test("explicit user inherit overrides subagent recommended model", async () => {
+    const result = await resolveSubagentModel({
+      userModel: "inherit",
+      recommendedModel: "anthropic/test-model",
+      parentModelHandle: "openai/parent-model",
+      availableHandles: new Set(["anthropic/test-model"]),
+    });
+
+    expect(result).toBe("openai/parent-model");
+  });
+
+  test("explicit user inherit still allows default fallback without a parent model", async () => {
+    const result = await resolveSubagentModel({
+      userModel: "inherit",
+      recommendedModel: "inherit",
+      availableHandles: new Set(["letta/auto"]),
+    });
+
+    expect(result).toBe("letta/auto");
+  });
+
   test("inherits parent when recommended is inherit", async () => {
     const result = await resolveSubagentModel({
       recommendedModel: "inherit",
@@ -650,12 +745,12 @@ describe("resolveSubagentModel", () => {
     const result = await resolveSubagentModel({
       subagentType: "reflection",
       recommendedModel: "inherit",
-      parentModelHandle: "chatgpt-plus-pro/gpt-5.3-codex",
+      parentModelHandle: "chatgpt-plus-pro/gpt-5.5",
       backendMode: "local",
       availableHandles: new Set(),
     });
 
-    expect(result).toBe("chatgpt-plus-pro/gpt-5.3-codex");
+    expect(result).toBe("chatgpt-plus-pro/gpt-5.5");
   });
 
   test("local backend inherits parent model for non-reflection subagents", async () => {

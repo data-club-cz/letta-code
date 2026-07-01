@@ -5,7 +5,6 @@ import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents"
 import { Box } from "ink";
 import type { Dispatch, RefObject, SetStateAction } from "react";
 import { getResumeDataFromBackend } from "@/agent/check-approval";
-import { ISOLATED_BLOCK_LABELS } from "@/agent/memory";
 import { isActiveMemfsEnabled } from "@/agent/memory-runtime";
 import type { ModelReasoningEffort } from "@/agent/model";
 import type { PersonalityId } from "@/agent/personality";
@@ -35,7 +34,10 @@ import { MemfsTreeViewer } from "@/cli/components/MemfsTreeViewer";
 import { MemoryTabViewer } from "@/cli/components/MemoryTabViewer";
 import { MessageSearch } from "@/cli/components/MessageSearch";
 import { ModelReasoningSelector } from "@/cli/components/ModelReasoningSelector";
-import { ModelSelector } from "@/cli/components/ModelSelector";
+import {
+  ModelSelector,
+  type ModelSelectorSelection,
+} from "@/cli/components/ModelSelector";
 import { PendingApprovalStub } from "@/cli/components/PendingApprovalStub";
 import { PersonalitySelector } from "@/cli/components/PersonalitySelector";
 import { PinDialog } from "@/cli/components/PinDialog";
@@ -54,7 +56,6 @@ import { WelcomeScreen } from "@/cli/components/WelcomeScreen";
 import { WindowTitlePicker } from "@/cli/components/WindowTitlePicker";
 import { WorktreeDiffSelector } from "@/cli/components/WorktreeDiffSelector";
 import { AnimationProvider } from "@/cli/contexts/AnimationContext";
-import type { LocalExtensionRuntime } from "@/cli/extensions/use-local-extension-runtime";
 import { type Buffers, type Line, toLines } from "@/cli/helpers/accumulator";
 import { backfillBuffers } from "@/cli/helpers/backfill";
 import {
@@ -75,8 +76,11 @@ import {
   isFileEditTool,
   isFileWriteTool,
   isPatchTool,
+  isShellTool,
 } from "@/cli/helpers/tool-name-mapping";
 import { isTaskTool } from "@/cli/helpers/tool-name-mapping.js";
+import type { WindowTitleData } from "@/cli/helpers/window-title-config";
+import type { LocalModAdapter } from "@/cli/mods/use-local-mod-adapter";
 import { experimentManager } from "@/experiments/manager";
 import type { ExperimentId } from "@/experiments/types";
 import type { ApprovalContext } from "@/permissions/analyzer";
@@ -104,7 +108,11 @@ type ModelReasoningPrompt = {
   modelLabel: string;
   initialModelId: string;
   initialEffort?: ModelReasoningEffort;
-  options: Array<{ effort: ModelReasoningEffort; modelId: string }>;
+  options: Array<{
+    effort: ModelReasoningEffort;
+    modelId: string;
+    selection?: ModelSelectorSelection;
+  }>;
 };
 
 type QueuedApprovalDecision = {
@@ -140,6 +148,7 @@ type AppViewProps = {
   currentModelDisplay: string | null;
   currentModelHandle: string | null;
   currentModelId: string | null;
+  currentModelServiceTier: string | null;
   currentModelProvider: string | null;
   isLocalBackend: boolean;
   currentPersonalityId: PersonalityId | null;
@@ -200,7 +209,7 @@ type AppViewProps = {
   handleFeedbackSubmit: (message: string) => Promise<void>;
   handleInterrupt: () => Promise<void>;
   handleModelSelect: (
-    modelId: string,
+    model: string | ModelSelectorSelection,
     commandId?: string | null,
     opts?: {
       promptReasoning?: boolean;
@@ -251,7 +260,6 @@ type AppViewProps = {
   pendingApprovals: ApprovalRequest[];
   pendingConversationSwitchRef: RefObject<ConversationSwitchContext | null>;
   pendingIds: Set<string>;
-  pinDialogLocal: boolean;
   precomputedDiffsRef: RefObject<Map<string, AdvancedDiffSuccess>>;
   profileConfirmPending: {
     name: string;
@@ -311,7 +319,11 @@ type AppViewProps = {
   staticRenderEpoch: number;
   statusLinePayload: StatusLinePayload;
   statusLinePrompt: string;
-  extensionRuntime: LocalExtensionRuntime;
+  terminalTitleData: WindowTitleData;
+  onTitlePreview: (title: string | null) => void;
+  onTitlePreviewEnd: () => void;
+  modAdapter: LocalModAdapter;
+  fileAutocompleteFdPath?: string | null;
   streaming: boolean;
   stubDescriptions: Map<string, string>;
   thinkingMessage: string;
@@ -343,13 +355,13 @@ export function AppView(props: AppViewProps) {
     contextTrackerRef,
     continueSession,
     conversationId,
-    conversationSummary,
     projectDirectory,
     currentApproval,
     currentApprovalContext,
     currentModelDisplay,
     currentModelHandle,
     currentModelId,
+    currentModelServiceTier,
     currentModelProvider,
     isLocalBackend,
     currentPersonalityId,
@@ -410,11 +422,11 @@ export function AppView(props: AppViewProps) {
     modelSelectorOptions,
     networkPhase,
     executionPhase,
+    fileAutocompleteFdPath,
     onSubmit,
     pendingApprovals,
     pendingConversationSwitchRef,
     pendingIds,
-    pinDialogLocal,
     precomputedDiffsRef,
     profileConfirmPending,
     queueDisplay,
@@ -454,7 +466,10 @@ export function AppView(props: AppViewProps) {
     staticRenderEpoch,
     statusLinePayload,
     statusLinePrompt,
-    extensionRuntime,
+    terminalTitleData,
+    onTitlePreview,
+    onTitlePreviewEnd,
+    modAdapter,
     streaming,
     stubDescriptions,
     thinkingMessage,
@@ -509,6 +524,15 @@ export function AppView(props: AppViewProps) {
                       (ln.toolCallId === currentApproval?.toolCallId ||
                         pendingIds.has(ln.toolCallId) ||
                         queuedIds.has(ln.toolCallId));
+                    if (
+                      ln.kind === "tool_call" &&
+                      ln.name &&
+                      isShellTool(ln.name) &&
+                      !isApprovalTracked &&
+                      (ln.phase === "streaming" || ln.phase === "ready")
+                    ) {
+                      return null;
+                    }
                     if (isFileTool && !isApprovalTracked) {
                       return null;
                     }
@@ -716,6 +740,7 @@ export function AppView(props: AppViewProps) {
                 isLocalBackend={isLocalBackend}
                 hasTemporaryModelOverride={hasTemporaryModelOverride}
                 currentReasoningEffort={currentReasoningEffort}
+                fileAutocompleteFdPath={fileAutocompleteFdPath}
                 messageQueue={queueDisplay}
                 onQueueEdit={handleQueueEdit}
                 onEscapeCancel={
@@ -734,7 +759,7 @@ export function AppView(props: AppViewProps) {
                 terminalWidth={chromeColumns}
                 shouldAnimate={shouldAnimate}
                 statusLinePayload={statusLinePayload}
-                extensionRuntime={extensionRuntime}
+                modAdapter={modAdapter}
                 statusLinePrompt={statusLinePrompt}
                 footerNotification={footerUpdateText}
                 showInspirationalPromptHints={showInspirationalPromptHints}
@@ -751,10 +776,14 @@ export function AppView(props: AppViewProps) {
                   initialEffort={modelReasoningPrompt.initialEffort}
                   onSelect={(selectedOption) => {
                     setModelReasoningPrompt(null);
-                    void handleModelSelect(selectedOption.modelId, null, {
-                      skipReasoningPrompt: true,
-                      reasoningEffort: selectedOption.effort,
-                    });
+                    void handleModelSelect(
+                      selectedOption.selection ?? selectedOption.modelId,
+                      null,
+                      {
+                        skipReasoningPrompt: true,
+                        reasoningEffort: selectedOption.effort,
+                      },
+                    );
                   }}
                   onCancel={() => setModelReasoningPrompt(null)}
                 />
@@ -762,8 +791,9 @@ export function AppView(props: AppViewProps) {
                 <ModelSelector
                   currentModelId={currentModelId ?? undefined}
                   currentModelHandle={currentModelHandle}
-                  onSelect={(modelId) => {
-                    void handleModelSelect(modelId, null, {
+                  currentModelServiceTier={currentModelServiceTier}
+                  onSelect={(selection) => {
+                    void handleModelSelect(selection, null, {
                       promptReasoning: true,
                     });
                   }}
@@ -825,9 +855,10 @@ export function AppView(props: AppViewProps) {
             {/* Window Title Configurator - for customizing terminal title */}
             {activeOverlay === "window-title" && (
               <WindowTitlePicker
-                agentName={agentName ?? null}
                 projectDirectory={projectDirectory}
-                conversationSummary={conversationSummary}
+                titleData={terminalTitleData}
+                onTitlePreview={onTitlePreview}
+                onTitlePreviewEnd={onTitlePreviewEnd}
                 onClose={closeOverlay}
               />
             )}
@@ -912,7 +943,7 @@ export function AppView(props: AppViewProps) {
             {activeOverlay === "connect" && (
               <ProviderSelector
                 onCancel={closeOverlay}
-                onStartOAuth={async (provider, target) => {
+                onStartOAuth={async (provider, target, providerName) => {
                   const overlayCommand = completeOverlay("connect");
                   const cmd =
                     overlayCommand ??
@@ -929,10 +960,10 @@ export function AppView(props: AppViewProps) {
                         refreshDerived,
                         setCommandRunning,
                         target,
-                        onCodexConnected: () => {
+                        onCodexConnected: (providerName) => {
                           markLocalModelsAvailable();
                           setModelSelectorOptions({
-                            filterProvider: "chatgpt-plus-pro",
+                            filterProvider: providerName,
                             forceRefresh: true,
                           });
                           openOverlay(
@@ -943,7 +974,12 @@ export function AppView(props: AppViewProps) {
                           );
                         },
                       },
-                      `/connect ${provider.id === "openai-codex-oauth" ? "chatgpt" : provider.id}`,
+                      `/connect ${
+                        provider.id === "openai-codex-oauth" ||
+                        provider.providerType === "chatgpt_oauth"
+                          ? "chatgpt"
+                          : provider.id
+                      }${providerName ? ` --name ${providerName}` : ""}`,
                     );
                   } finally {
                     setActiveConnectCommandId(null);
@@ -1305,7 +1341,6 @@ export function AppView(props: AppViewProps) {
                     // Create a new conversation
                     const conversation = await getBackend().createConversation({
                       agent_id: agentId,
-                      isolated_block_labels: [...ISOLATED_BLOCK_LABELS],
                     });
 
                     await maybeCarryOverActiveConversationModel(
@@ -1637,7 +1672,6 @@ export function AppView(props: AppViewProps) {
             {activeOverlay === "pin" && (
               <PinDialog
                 currentName={agentName || ""}
-                local={pinDialogLocal}
                 onSubmit={async (newName) => {
                   const overlayCommand = completeOverlay("pin");
                   setCommandRunning(true);
@@ -1645,14 +1679,11 @@ export function AppView(props: AppViewProps) {
                   const cmd =
                     overlayCommand ??
                     commandRunner.start("/pin", "Pinning agent...");
-                  const scopeText = pinDialogLocal
-                    ? "to this project"
-                    : "globally";
                   const displayName =
                     newName || agentName || agentId.slice(0, 12);
 
                   cmd.update({
-                    output: `Pinning "${displayName}" ${scopeText}...`,
+                    output: `Pinning "${displayName}"...`,
                     phase: "running",
                   });
 
@@ -1666,17 +1697,13 @@ export function AppView(props: AppViewProps) {
                     }
 
                     // Pin the agent
-                    if (pinDialogLocal) {
-                      settingsManager.pinLocal(agentId);
-                    } else {
-                      settingsManager.pinGlobal(agentId);
-                    }
+                    settingsManager.pinAgent(agentId);
 
                     if (newName && newName !== agentName) {
                       cmd.agentHint = `Your name is now "${newName}" — acknowledge this and save your new name to memory.`;
                     }
                     cmd.finish(
-                      `Pinned "${newName || agentName || agentId.slice(0, 12)}" ${scopeText}.`,
+                      `Pinned "${newName || agentName || agentId.slice(0, 12)}".`,
                       true,
                     );
                   } catch (error) {

@@ -14,9 +14,12 @@ export function deriveReasoningEffort(
   llmConfig: LlmConfig | null | undefined,
 ): ModelReasoningEffort | null {
   if (modelSettings && "provider_type" in modelSettings) {
+    const providerType = modelSettings.provider_type as string | undefined;
     // OpenAI/OpenRouter: reasoning.reasoning_effort
     if (
-      modelSettings.provider_type === "openai" &&
+      (providerType === "openai" ||
+        providerType === "openai-codex" ||
+        providerType === "chatgpt_oauth") &&
       "reasoning" in modelSettings &&
       modelSettings.reasoning
     ) {
@@ -34,10 +37,7 @@ export function deriveReasoningEffort(
     }
 
     // Anthropic/Bedrock: effort field
-    if (
-      modelSettings.provider_type === "anthropic" ||
-      modelSettings.provider_type === "bedrock"
-    ) {
+    if (providerType === "anthropic" || providerType === "bedrock") {
       const effort = (modelSettings as { effort?: string | null }).effort;
       if (effort === "low" || effort === "medium" || effort === "high")
         return effort;
@@ -111,8 +111,35 @@ export function getPreferredAgentModelHandle(
   return buildModelHandleFromLlmConfig(agent.llm_config);
 }
 
+export function providerTypeFromModelSettings(
+  modelSettings: unknown,
+): string | null {
+  if (
+    typeof modelSettings !== "object" ||
+    modelSettings === null ||
+    !("provider_type" in modelSettings)
+  ) {
+    return null;
+  }
+  const providerType = (modelSettings as { provider_type?: unknown })
+    .provider_type;
+  return typeof providerType === "string" && providerType.length > 0
+    ? providerType
+    : null;
+}
+
+export function providerTypeFromUpdateArgs(
+  updateArgs: Record<string, unknown> | undefined | null,
+): string | null {
+  const providerType = updateArgs?.provider_type;
+  return typeof providerType === "string" && providerType.length > 0
+    ? providerType
+    : null;
+}
+
 export function mapHandleToLlmConfigPatch(
   modelHandle: string,
+  providerType?: string | null,
 ): Partial<LlmConfig> {
   const [provider, ...modelParts] = modelHandle.split("/");
   const modelName = modelParts.join("/");
@@ -121,8 +148,31 @@ export function mapHandleToLlmConfigPatch(
       model: modelHandle,
     };
   }
+  const knownEndpointTypes = new Set([
+    "anthropic",
+    "bedrock",
+    "chatgpt_oauth",
+    "google_ai",
+    "google_vertex",
+    "minimax",
+    "moonshot",
+    "moonshot_coding",
+    "openai",
+    "openrouter",
+    "zai",
+    "zai_coding",
+  ]);
   const endpointType =
-    provider === OPENAI_CODEX_PROVIDER_NAME ? "chatgpt_oauth" : provider;
+    typeof providerType === "string" && providerType.length > 0
+      ? providerType
+      : provider === OPENAI_CODEX_PROVIDER_NAME || provider === "openai-codex"
+        ? "chatgpt_oauth"
+        : knownEndpointTypes.has(provider)
+          ? provider
+          : null;
+  if (!endpointType) {
+    return { model: modelHandle };
+  }
   return {
     model: modelName,
     model_endpoint_type: endpointType as LlmConfig["model_endpoint_type"],
@@ -152,7 +202,7 @@ export function getErrorHintForStopReason(
   // Build the /model swap suggestion -- mention Bedrock Opus if applicable.
   const bedrockOpusSuggestion =
     modelEndpointType === "anthropic" &&
-    (currentModelId === "opus" || currentModelId?.startsWith("opus-4.7")) &&
+    currentModelId?.startsWith("opus-4.7") &&
     getModelInfo("bedrock-opus-4.7")
       ? "Opus 4.7 via Amazon Bedrock"
       : modelEndpointType === "anthropic" &&

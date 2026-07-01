@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildConversationSelectorHints,
   buildDefaultConversationEntry,
   formatConversationTimestampText,
 } from "@/cli/components/ConversationSelector";
@@ -68,5 +69,13 @@ describe("ConversationSelector timestamps", () => {
 
     expect(text).toContain("Active 2 hours ago");
     expect(text).toContain("Created 1 week ago");
+  });
+});
+
+describe("ConversationSelector hints", () => {
+  test("shows navigation hints without pin shortcuts", () => {
+    expect(buildConversationSelectorHints()).toBe(
+      "Enter select · ↑↓ navigate · Esc clear/cancel",
+    );
   });
 });

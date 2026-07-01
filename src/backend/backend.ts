@@ -1,14 +1,23 @@
 import { homedir } from "node:os";
+import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
 import type { getClient } from "./api/client";
 import type {
   ForkConversationOptions,
   forkConversation as forkConversationRequest,
 } from "./api/conversations";
+import {
+  type BackendMode,
+  resolveBackendMode,
+  setConfiguredBackendMode,
+} from "./backend-mode";
 import { LocalBackend } from "./local/local-backend";
 import {
   getLocalBackendStorageDir as getLocalBackendStorageDirFromPaths,
   LOCAL_BACKEND_EXPERIMENTAL_ENV,
 } from "./local/paths";
+
+export type { BackendMode };
+export { isExperimentalLocalBackendEnabled } from "./backend-mode";
 
 export type APIClient = Awaited<ReturnType<typeof getClient>>;
 type GetAPIClient = typeof getClient;
@@ -107,6 +116,16 @@ export type MessageRetrieveOptions = MessageRetrieveParams[1];
 export type ModelsListParams = Parameters<APIClient["models"]["list"]>;
 export type ModelsListOptions = ModelsListParams[0];
 
+export interface ConversationResumeTailOptions {
+  limit: number;
+  includeReturnMessageTypes?: string[];
+}
+
+export interface ConversationResumeTail {
+  conversation?: Awaited<ReturnType<APIClient["conversations"]["retrieve"]>>;
+  messages: Message[];
+}
+
 export interface BackendCapabilities {
   remoteMemfs: boolean;
   serverSideToolManagement: boolean;
@@ -199,6 +218,12 @@ export interface Backend {
     options?: MessageRetrieveOptions,
   ): Promise<Awaited<ReturnType<APIClient["messages"]["retrieve"]>>>;
 
+  getConversationResumeTail(
+    agentId: string,
+    conversationId: string,
+    options: ConversationResumeTailOptions,
+  ): Promise<ConversationResumeTail>;
+
   listModels(
     options?: ModelsListOptions,
   ): Promise<Awaited<ReturnType<APIClient["models"]["list"]>>>;
@@ -237,14 +262,14 @@ export interface Backend {
     conversationId: string,
     options?: ForkConversationOptions,
   ): ReturnType<typeof forkConversationRequest>;
+
+  getLocalStorageDir?(): string | undefined;
 }
 
 interface APIBackendDeps {
   getClient?: GetAPIClient;
   forkConversation?: ForkConversation;
 }
-
-export type BackendMode = "api" | "local";
 
 export class APIBackend implements Backend {
   readonly capabilities: BackendCapabilities = {
@@ -374,6 +399,35 @@ export class APIBackend implements Backend {
     return client.messages.retrieve(messageId, options);
   }
 
+  async getConversationResumeTail(
+    agentId: string,
+    conversationId: string,
+    options: ConversationResumeTailOptions,
+  ): Promise<ConversationResumeTail> {
+    const body = {
+      limit: options.limit,
+      order: "desc",
+      include_return_message_types: options.includeReturnMessageTypes,
+    };
+
+    if (conversationId && conversationId !== "default") {
+      const [conversation, page] = await Promise.all([
+        this.retrieveConversation(conversationId),
+        this.listConversationMessages(
+          conversationId,
+          body as ConversationMessageListBody,
+        ),
+      ]);
+      return { conversation, messages: page.getPaginatedItems() };
+    }
+
+    const page = await this.listAgentMessages(agentId, {
+      ...body,
+      conversation_id: "default",
+    } as AgentMessageListBody);
+    return { messages: page.getPaginatedItems() };
+  }
+
   async listModels(options?: ModelsListOptions) {
     const client = await this.getClient();
     return client.models.list(options);
@@ -428,14 +482,6 @@ export class APIBackend implements Backend {
   }
 }
 
-function isTruthyEnv(value: string | undefined): boolean {
-  return value === "1" || value?.toLowerCase() === "true";
-}
-
-export function isExperimentalLocalBackendEnabled(): boolean {
-  return resolveBackendMode() === "local";
-}
-
 export function getLocalBackendStorageDir(homeDir = homedir()): string {
   return getLocalBackendStorageDirFromPaths(homeDir);
 }
@@ -448,15 +494,6 @@ function createExperimentalLocalBackend(): Backend {
         ? "deterministic"
         : "pi",
   });
-}
-
-let configuredBackendMode: BackendMode | null = null;
-
-function resolveBackendMode(): BackendMode {
-  if (configuredBackendMode) return configuredBackendMode;
-  return isTruthyEnv(process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL)
-    ? "local"
-    : "api";
 }
 
 function createBackendForMode(mode: BackendMode): Backend {
@@ -483,7 +520,7 @@ export function getBackendForMode(mode: BackendMode): Backend {
 }
 
 export function configureBackendMode(mode: BackendMode): void {
-  configuredBackendMode = mode;
+  setConfiguredBackendMode(mode);
   process.env[LOCAL_BACKEND_EXPERIMENTAL_ENV] = mode === "local" ? "1" : "0";
   backend = createBackendForMode(mode);
 }

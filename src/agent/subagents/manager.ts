@@ -9,14 +9,16 @@
 
 import { spawn } from "node:child_process";
 import { getAvailableModelHandles } from "@/agent/available-models";
-import { getCurrentAgentId } from "@/agent/context";
+import { getConversationId, getCurrentAgentId } from "@/agent/context";
 import { getDefaultModelForTier, resolveModel } from "@/agent/model";
 import recallSubagentPrompt from "@/agent/prompts/recall_subagent.md";
+import recallSubagentLocalPrompt from "@/agent/prompts/recall_subagent_local.md";
 import {
   addToolCall,
   emitStreamEvent,
   updateSubagent,
 } from "@/agent/subagent-state.js";
+import { wrapSubagentLauncher } from "@/agent/subagents/sandbox";
 import {
   type BackendMode,
   getBackend,
@@ -32,7 +34,6 @@ import {
 } from "@/constants";
 import { cliPermissions } from "@/permissions/cli-permissions-instance";
 import { resolveAllowedMemoryRoots } from "@/permissions/memory-paths";
-import { permissionMode } from "@/permissions/mode";
 import { sessionPermissions } from "@/permissions/session";
 import {
   getCurrentWorkingDirectory,
@@ -48,7 +49,11 @@ import {
 } from "@/tools/impl/shell-env";
 import { debugLog, debugWarn } from "@/utils/debug";
 import { getErrorMessage } from "@/utils/error";
-import { getAllSubagentConfigs, type SubagentConfig } from ".";
+import {
+  getAllSubagentConfigs,
+  type SubagentConfig,
+  type SubagentLaunchProfile,
+} from ".";
 import {
   estimateStartupContextTokens,
   REFLECTION_STARTUP_CONTEXT_CHAR_LIMIT,
@@ -89,6 +94,8 @@ export interface SubagentResult {
   success: boolean;
   error?: string;
   totalTokens?: number;
+  stepCount?: number;
+  durationMs?: number;
 }
 
 /**
@@ -99,7 +106,11 @@ interface ExecutionState {
   conversationId: string | null;
   finalResult: string | null;
   finalError: string | null;
-  resultStats: { durationMs: number; totalTokens: number } | null;
+  resultStats: {
+    durationMs: number;
+    totalTokens: number;
+    stepCount?: number;
+  } | null;
   displayedToolCalls: Set<string>;
   pendingToolCalls: Map<string, { name: string; args: string }>;
 }
@@ -114,11 +125,16 @@ interface ExecutionState {
  */
 export function getModelHandleFromAgent(agent: {
   model?: string | null;
+  model_settings?: { provider_type?: unknown } | null;
   llm_config?: { model_endpoint_type?: string | null; model?: string | null };
 }): string | null {
   const directModel = agent.model;
   if (directModel?.includes("/")) {
     return directModel;
+  }
+  const settingsProvider = agent.model_settings?.provider_type;
+  if (typeof settingsProvider === "string" && directModel) {
+    return `${settingsProvider}/${directModel}`;
   }
   const endpoint = agent.llm_config?.model_endpoint_type;
   const model = agent.llm_config?.model;
@@ -128,17 +144,33 @@ export function getModelHandleFromAgent(agent: {
   return directModel || model || null;
 }
 
-async function getPrimaryAgentModelHandle(): Promise<{
+async function getPrimaryAgentModelHandle(
+  scope: { agentId?: string | null; conversationId?: string | null } = {},
+): Promise<{
   handle: string | null;
   agent: {
     model?: string | null;
     name?: string | null;
+    model_settings?: { provider_type?: unknown } | null;
     llm_config?: { model_endpoint_type?: string | null; model?: string | null };
   } | null;
 }> {
   try {
-    const agentId = getCurrentAgentId();
+    const agentId = scope.agentId ?? getCurrentAgentId();
     const agent = await getBackend().retrieveAgent(agentId);
+    const conversationId = scope.conversationId;
+    if (conversationId && conversationId !== "default") {
+      try {
+        const conversation =
+          await getBackend().retrieveConversation(conversationId);
+        const conversationHandle = getModelHandleFromAgent(conversation);
+        if (conversationHandle) {
+          return { handle: conversationHandle, agent };
+        }
+      } catch {
+        // Fall back to the agent default if the conversation is not available.
+      }
+    }
     return { handle: getModelHandleFromAgent(agent), agent };
   } catch {
     return { handle: null, agent: null };
@@ -194,6 +226,10 @@ function swapProviderPrefix(
   return `${parentProvider}/${modelPortion}`;
 }
 
+function isInheritModel(model: string | null | undefined): boolean {
+  return model?.trim().toLowerCase() === "inherit";
+}
+
 export async function resolveSubagentModel(options: {
   userModel?: string;
   recommendedModel?: string;
@@ -206,8 +242,12 @@ export async function resolveSubagentModel(options: {
   const { userModel, recommendedModel, parentModelHandle, billingTier } =
     options;
   const isFreeTier = billingTier?.toLowerCase() === "free";
+  const userRequestedInheritance = isInheritModel(userModel);
+  const effectiveRecommendedModel = userRequestedInheritance
+    ? "inherit"
+    : recommendedModel;
 
-  if (userModel) return userModel;
+  if (userModel && !userRequestedInheritance) return userModel;
 
   // Local backend has no server-side auto router. If the parent agent is
   // already running successfully on a local model, spawned subagents should use
@@ -218,8 +258,11 @@ export async function resolveSubagentModel(options: {
   }
 
   if (options.subagentType === "reflection") {
-    if (recommendedModel && recommendedModel !== "inherit") {
-      const recommendedHandle = resolveModel(recommendedModel);
+    if (
+      effectiveRecommendedModel &&
+      !isInheritModel(effectiveRecommendedModel)
+    ) {
+      const recommendedHandle = resolveModel(effectiveRecommendedModel);
       if (recommendedHandle) {
         return recommendedHandle;
       }
@@ -229,8 +272,8 @@ export async function resolveSubagentModel(options: {
   }
 
   let recommendedHandle: string | null = null;
-  if (recommendedModel && recommendedModel !== "inherit") {
-    recommendedHandle = resolveModel(recommendedModel);
+  if (effectiveRecommendedModel && !isInheritModel(effectiveRecommendedModel)) {
+    recommendedHandle = resolveModel(effectiveRecommendedModel);
   }
 
   let availableHandles: Set<string> | null = options.availableHandles ?? null;
@@ -405,7 +448,8 @@ function handleResultEvent(
     result?: string;
     is_error?: boolean;
     duration_ms?: number;
-    usage?: { total_tokens?: number };
+    usage?: { total_tokens?: number; step_count?: number };
+    num_turns?: number;
   },
   state: ExecutionState,
   subagentId: string,
@@ -414,6 +458,10 @@ function handleResultEvent(
   state.resultStats = {
     durationMs: event.duration_ms || 0,
     totalTokens: event.usage?.total_tokens || 0,
+    stepCount:
+      typeof event.usage?.step_count === "number"
+        ? event.usage.step_count
+        : undefined,
   };
 
   if (event.is_error) {
@@ -513,6 +561,14 @@ function parseResultFromStdout(
         report: result.result || "",
         success: !result.is_error,
         error: result.is_error ? result.result || "Unknown error" : undefined,
+        stepCount:
+          typeof result.usage?.step_count === "number"
+            ? result.usage.step_count
+            : undefined,
+        durationMs:
+          typeof result.duration_ms === "number"
+            ? result.duration_ms
+            : undefined,
       };
     }
 
@@ -559,13 +615,13 @@ export function resolveSubagentWorkingDirectory(
   fallbackCwd: string = getCurrentWorkingDirectory(),
   options: {
     subagentType?: string;
-    permissionMode?: string;
+    launchProfile?: SubagentLaunchProfile;
     inheritedPrimaryRoot?: string | null;
   } = {},
 ): string {
   if (
     options.subagentType === "reflection" &&
-    options.permissionMode === "memory" &&
+    options.launchProfile === "memory-subagent" &&
     options.inheritedPrimaryRoot
   ) {
     return options.inheritedPrimaryRoot;
@@ -634,12 +690,12 @@ export interface ComposeSubagentChildEnvOptions {
   /** Parent agent ID. When present, sets LETTA_PARENT_AGENT_ID so prompts,
    * scripts, and the cross-agent guard can identify the immediate parent. */
   parentAgentId: string | undefined;
-  /** The subagent config's declared permissionMode ("memory" triggers
-   * memory-dir override; other modes leave the parent's MEMORY_DIR alone). */
-  permissionMode: string | undefined;
-  /** Primary memory root for the parent, used when permissionMode=memory to
-   * point the child at its parent's memfs repo. Null means memfs disabled
-   * or unresolvable — child operates without a MEMORY_DIR. */
+  /** The subagent config's declared launch profile. Subagents with the memory-subagent profile
+   * operate on the parent's memory filesystem. */
+  launchProfile: SubagentLaunchProfile | undefined;
+  /** Primary memory root for the parent, used by the memory-subagent launch
+   * profile to point the child at its parent's memfs repo. Null means memfs
+   * disabled or unresolvable — child operates without a MEMORY_DIR. */
   inheritedPrimaryRoot: string | null;
   /** Forwarded API key to avoid per-subagent keychain lookups. */
   inheritedApiKey?: string | null;
@@ -682,9 +738,9 @@ function buildInheritedChannelContextPayload(
  *     inherit a broad cross-agent memory-guard opt-out from the parent.
  *
  *   - MEMORY_DIR / LETTA_MEMORY_DIR are only overridden when the subagent
- *     declares permissionMode=memory. Those subagents operate on the parent's
- *     memory as their working filesystem (reflection, memory, init,
- *     history-analyzer). Other subagents keep whatever MEMORY_DIR they
+ *     declares the memory-subagent launch profile. Those subagents operate on
+ *     the parent's memory as their working filesystem (reflection, memory,
+ *     init, history-analyzer). Other subagents keep whatever MEMORY_DIR they
  *     inherited from the parent process (usually unset).
  *
  * Pure function, no side effects — straightforward to unit-test.
@@ -697,7 +753,7 @@ export function composeSubagentChildEnv(
     backendMode,
     localBackendStorageDir,
     parentAgentId,
-    permissionMode,
+    launchProfile,
     inheritedPrimaryRoot,
     inheritedApiKey,
     inheritedBaseUrl,
@@ -728,10 +784,10 @@ export function composeSubagentChildEnv(
     childEnv.LETTA_LOCAL_BACKEND_EXPERIMENTAL = "0";
   }
 
-  // Only memory-mode subagents get MEMORY_DIR pointed at the parent. Other
+  // Only subagents with the memory-subagent profile get MEMORY_DIR pointed at the parent. Other
   // subagents either have their own memfs (if memfs-enabled) or no MEMORY_DIR
   // at all — their tools will surface resolution errors appropriately.
-  if (permissionMode === "memory") {
+  if (launchProfile === "memory-subagent") {
     if (inheritedPrimaryRoot) {
       childEnv.MEMORY_DIR = inheritedPrimaryRoot;
       childEnv.LETTA_MEMORY_DIR = inheritedPrimaryRoot;
@@ -860,6 +916,7 @@ interface BuildSubagentArgsOptions {
   backendMode?: BackendMode;
   promptTransport?: "argv" | "stdin";
   extraTools?: string[];
+  parentAgentId?: string | null;
 }
 
 /**
@@ -899,7 +956,11 @@ export function buildSubagentArgs(
   } else {
     // Create new agent (original behavior)
     args.push("--new-agent", "--system", type);
-    args.push("--tags", `type:${type}`);
+    const subagentTags = [`type:${type}`];
+    if (options.parentAgentId) {
+      subagentTags.push(`parent:${options.parentAgentId}`);
+    }
+    args.push("--tags", subagentTags.join(","));
     // Default all newly spawned subagents to non-memfs mode.
     // This avoids memfs startup overhead unless explicitly enabled elsewhere.
     args.push("--no-memfs");
@@ -926,14 +987,7 @@ export function buildSubagentArgs(
     args.push("-p", buildSubagentPrompt(type, config, userPrompt));
   }
   args.push("--output-format", "stream-json");
-
-  // Use subagent's configured permission mode, or inherit from parent
-  const subagentMode = config.permissionMode;
-  const parentMode = permissionMode.getMode();
-  const modeToUse = subagentMode || parentMode;
-  if (modeToUse !== "default") {
-    args.push("--permission-mode", modeToUse);
-  }
+  args.push("--permission-mode", "unrestricted");
 
   // Build list of auto-approved tools:
   // 1. Inherit from parent (CLI + session rules)
@@ -954,18 +1008,6 @@ export function buildSubagentArgs(
   const parentDisallowedTools = cliPermissions.getDisallowedTools();
   if (parentDisallowedTools.length > 0) {
     args.push("--disallowedTools", parentDisallowedTools.join(","));
-  }
-
-  // Add memory block filtering if specified (only for new agents)
-  if (!isDeployingExisting) {
-    if (config.memoryBlocks === "none") {
-      args.push("--init-blocks", "none");
-    } else if (
-      Array.isArray(config.memoryBlocks) &&
-      config.memoryBlocks.length > 0
-    ) {
-      args.push("--init-blocks", config.memoryBlocks.join(","));
-    }
   }
 
   // Add tool filtering if specified (applies to both new and existing agents)
@@ -1035,6 +1077,16 @@ async function executeSubagent(
     const inheritedChannelContext =
       buildInheritedChannelContextPayload(runtimeContext);
     const boundedUserPrompt = buildSubagentPrompt(type, config, userPrompt);
+
+    let parentAgentId = parentAgentIdOverride;
+    if (!parentAgentId) {
+      try {
+        parentAgentId = getCurrentAgentId();
+      } catch {
+        // Context not available — subagent will have no parent scope.
+      }
+    }
+
     const cliArgs = buildSubagentArgs(
       type,
       config,
@@ -1046,6 +1098,7 @@ async function executeSubagent(
       {
         backendMode,
         promptTransport: "stdin",
+        parentAgentId,
         extraTools:
           config.fork && inheritedChannelContext
             ? ["MessageChannel"]
@@ -1054,18 +1107,6 @@ async function executeSubagent(
     );
 
     const launcher = resolveSubagentLauncher(cliArgs);
-    // Prefer an explicit parentAgentId captured at the synchronous
-    // spawn call site. Only fall back to the in-process context (which
-    // can drift across async yields in the listener) when no explicit
-    // ID was provided.
-    let parentAgentId = parentAgentIdOverride;
-    if (!parentAgentId) {
-      try {
-        parentAgentId = getCurrentAgentId();
-      } catch {
-        // Context not available — subagent will have no parent scope.
-      }
-    }
 
     // Resolve auth once in parent and forward to child to avoid per-subagent
     // keychain lookups under high parallel fan-out.
@@ -1090,7 +1131,7 @@ async function executeSubagent(
       getCurrentWorkingDirectory(),
       {
         subagentType: type,
-        permissionMode: config.permissionMode,
+        launchProfile: config.launchProfile,
         inheritedPrimaryRoot,
       },
     );
@@ -1102,7 +1143,7 @@ async function executeSubagent(
       backendMode,
       localBackendStorageDir,
       parentAgentId,
-      permissionMode: config.permissionMode,
+      launchProfile: config.launchProfile,
       inheritedPrimaryRoot,
       inheritedApiKey,
       inheritedBaseUrl,
@@ -1110,9 +1151,33 @@ async function executeSubagent(
       inheritedChannelContext,
     });
 
-    const proc = spawn(launcher.command, launcher.args, {
+    // Optionally confine subagents with the memory-subagent profile to an OS filesystem sandbox.
+    // Returns null (spawn unchanged) when disabled, not applicable, or no
+    // backend is available on this host.
+    const sandbox = wrapSubagentLauncher({
+      launcher,
+      launchProfile: config.launchProfile,
+      backendMode,
+      memoryRoots: inheritedMemoryRoots.roots,
+      inheritedPrimaryRoot,
+      localBackendStorageDir,
+    });
+    const spawnLauncher = sandbox
+      ? { command: sandbox.command, args: sandbox.args }
+      : launcher;
+    const spawnEnv = sandbox
+      ? { ...childEnv, ...sandbox.sandboxEnv }
+      : childEnv;
+    if (sandbox) {
+      debugLog(
+        "subagent",
+        `memory subagent child sandboxed via ${sandbox.backend}`,
+      );
+    }
+
+    const proc = spawn(spawnLauncher.command, spawnLauncher.args, {
       cwd: subagentWorkingDirectory,
-      env: childEnv,
+      env: spawnEnv,
     });
     proc.stdin.on("error", () => {});
     proc.stdin.end(boundedUserPrompt);
@@ -1198,7 +1263,9 @@ async function executeSubagent(
     if (exitCode !== 0) {
       // Check if this is a provider-not-supported error and we haven't retried yet
       if (!isRetry && isProviderNotSupportedError(stderr)) {
-        const { handle: primaryModel } = await getPrimaryAgentModelHandle();
+        const { handle: primaryModel } = await getPrimaryAgentModelHandle({
+          agentId: parentAgentIdOverride,
+        });
         if (primaryModel) {
           // Retry with the primary agent's model
           return executeSubagent(
@@ -1240,6 +1307,8 @@ async function executeSubagent(
         success: !state.finalError,
         error: state.finalError || undefined,
         totalTokens: state.resultStats?.totalTokens,
+        stepCount: state.resultStats?.stepCount,
+        durationMs: state.resultStats?.durationMs,
       };
     }
 
@@ -1257,6 +1326,8 @@ async function executeSubagent(
         success: false,
         error: state.finalError,
         totalTokens: state.resultStats?.totalTokens,
+        stepCount: state.resultStats?.stepCount,
+        durationMs: state.resultStats?.durationMs,
       };
     }
 
@@ -1329,8 +1400,18 @@ ${SYSTEM_REMINDER_CLOSE}
 `;
 }
 
-function buildForkSystemReminder(subagentType?: string): string {
+export function recallPromptForBackend(backendMode?: BackendMode): string {
+  return backendMode === "local"
+    ? recallSubagentLocalPrompt
+    : recallSubagentPrompt;
+}
+
+function buildForkSystemReminder(
+  subagentType?: string,
+  backendMode?: BackendMode,
+): string {
   if (subagentType === "recall") {
+    const recallPrompt = recallPromptForBackend(backendMode);
     return `${SYSTEM_REMINDER_OPEN}
 You have been forked from the primary conversational thread to run as an independent subagent. The fork only exists so you can see the parent agent's conversation trajectory in-context as reference — you are NOT the primary agent and do not share its tools.
 
@@ -1341,7 +1422,7 @@ Your toolset is limited to Bash, Read, and TaskOutput. You cannot edit files, ru
 You CANNOT ask questions mid-execution — all instructions are provided upfront.
 Your final message will be returned to the caller.
 
-${recallSubagentPrompt}
+${recallPrompt}
 ${SYSTEM_REMINDER_CLOSE}
 
 `;
@@ -1388,6 +1469,7 @@ export async function spawnSubagent(
   forkedContext?: boolean,
   parentAgentId?: string,
   transcriptPath?: string,
+  parentConversationId?: string,
 ): Promise<SubagentResult> {
   const allConfigs = await getAllSubagentConfigs();
   const config = allConfigs[type];
@@ -1409,8 +1491,29 @@ export async function spawnSubagent(
   const backendMode: BackendMode = activeBackend.capabilities.localMemfs
     ? "local"
     : "api";
+  // Resolve parent scope before model selection so local subagents inherit the
+  // active conversation's model override, not just the agent default.
+  let resolvedParentAgentId = parentAgentId;
+  if (!resolvedParentAgentId) {
+    try {
+      resolvedParentAgentId = getCurrentAgentId();
+    } catch {
+      // Context unavailable — carry forward undefined.
+    }
+  }
+  let resolvedParentConversationId = parentConversationId;
+  if (!resolvedParentConversationId) {
+    try {
+      resolvedParentConversationId = getConversationId() ?? undefined;
+    } catch {
+      // Context unavailable — carry forward undefined.
+    }
+  }
   const { handle: parentModelHandle, agent: parentAgent } =
-    await getPrimaryAgentModelHandle();
+    await getPrimaryAgentModelHandle({
+      agentId: resolvedParentAgentId,
+      conversationId: resolvedParentConversationId,
+    });
   const billingTier = await getCurrentBillingTier();
 
   // For existing agents, don't override model; for new agents, use provided or config default
@@ -1426,18 +1529,6 @@ export async function spawnSubagent(
       });
   const baseURL = getBaseURL();
 
-  // Resolve parent agent ID: prefer the explicit value captured at the
-  // synchronous call site; fall back to the in-process context only when
-  // the caller didn't provide one.
-  let resolvedParentAgentId = parentAgentId;
-  if (!resolvedParentAgentId) {
-    try {
-      resolvedParentAgentId = getCurrentAgentId();
-    } catch {
-      // Context unavailable — carry forward undefined.
-    }
-  }
-
   // Build the prompt with system reminder for deployed agents
   let finalPrompt = prompt;
   if (isDeployingExisting && resolvedParentAgentId) {
@@ -1446,7 +1537,7 @@ export async function spawnSubagent(
         parentAgent ??
         (await getBackend().retrieveAgent(resolvedParentAgentId));
       if (forkedContext) {
-        const systemReminder = buildForkSystemReminder(type);
+        const systemReminder = buildForkSystemReminder(type, backendMode);
         finalPrompt = systemReminder + prompt;
       } else {
         const systemReminder = buildDeploySystemReminder(
@@ -1458,6 +1549,19 @@ export async function spawnSubagent(
     } catch {
       // If we can't get parent agent info, proceed without the reminder
     }
+  }
+
+  // Fork subagents (e.g. recall) deploy the parent agent into a forked
+  // conversation. They don't emit an init event carrying agent_id/
+  // conversation_id (which is the usual source of agentURL), so without this
+  // the card would have no link and any fallback would route to the parent's
+  // main conversation. Set the link eagerly to the forked conversation so it
+  // opens the subagent's own thread instead.
+  if (forkedContext && existingAgentId && existingConversationId) {
+    const forkAgentURL = buildAgentReference(existingAgentId, {
+      conversationId: existingConversationId,
+    });
+    updateSubagent(subagentId, { agentURL: forkAgentURL });
   }
 
   // Execute subagent - state updates are handled via the state store

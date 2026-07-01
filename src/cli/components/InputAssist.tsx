@@ -4,12 +4,13 @@ import type { ModelReasoningEffort } from "@/agent/model";
 import { AgentInfoBar } from "./AgentInfoBar";
 import { FileAutocomplete } from "./FileAutocomplete";
 import { SlashCommandAutocomplete } from "./SlashCommandAutocomplete";
-import type { ExtensionCommandAutocompleteItem } from "./types/autocomplete";
+import type { ModCommandAutocompleteItem } from "./types/autocomplete";
 
 interface InputAssistProps {
   currentInput: string;
   cursorPosition: number;
-  onFileSelect: (path: string) => void;
+  fdPath?: string | null;
+  onFileAutocompleteApply: (value: string, cursorPosition: number) => void;
   onCommandSelect: (command: string) => void;
   onCommandAutocomplete: (command: string) => void;
   onAutocompleteActiveChange: (isActive: boolean) => void;
@@ -20,7 +21,7 @@ interface InputAssistProps {
   serverUrl?: string;
   workingDirectory?: string;
   conversationId?: string;
-  extensionCommands?: Record<string, ExtensionCommandAutocompleteItem>;
+  modCommands?: Record<string, ModCommandAutocompleteItem>;
 }
 
 /**
@@ -32,7 +33,8 @@ interface InputAssistProps {
 export function InputAssist({
   currentInput,
   cursorPosition,
-  onFileSelect,
+  fdPath,
+  onFileAutocompleteApply,
   onCommandSelect,
   onCommandAutocomplete,
   onAutocompleteActiveChange,
@@ -43,7 +45,7 @@ export function InputAssist({
   serverUrl,
   workingDirectory,
   conversationId,
-  extensionCommands,
+  modCommands,
 }: InputAssistProps) {
   const showFileAutocomplete = currentInput.includes("@");
   const showCommandAutocomplete =
@@ -60,14 +62,15 @@ export function InputAssist({
     onAutocompleteActiveChange,
   ]);
 
-  // Show file autocomplete when @ is present
   if (showFileAutocomplete) {
     return (
       <FileAutocomplete
         currentInput={currentInput}
         cursorPosition={cursorPosition}
-        onSelect={onFileSelect}
+        fdPath={fdPath}
+        onApplyCompletion={onFileAutocompleteApply}
         onActiveChange={onAutocompleteActiveChange}
+        workingDirectory={workingDirectory}
       />
     );
   }
@@ -84,7 +87,7 @@ export function InputAssist({
           onActiveChange={onAutocompleteActiveChange}
           agentId={agentId}
           workingDirectory={workingDirectory}
-          extensionCommands={extensionCommands}
+          modCommands={modCommands}
         />
         <AgentInfoBar
           agentId={agentId}

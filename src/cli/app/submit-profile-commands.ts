@@ -36,7 +36,6 @@ type ProfileCommandRouterContext = {
   ) => Promise<void>;
   refreshDerived: () => void;
   setCommandRunning: (value: boolean) => void;
-  setPinDialogLocal: Dispatch<SetStateAction<boolean>>;
   setProfileConfirmPending: Dispatch<
     SetStateAction<ProfileConfirmPending | null>
   >;
@@ -62,7 +61,6 @@ export async function handleProfileCommand(
     handleAgentSelect,
     refreshDerived,
     setCommandRunning,
-    setPinDialogLocal,
     setProfileConfirmPending,
     openOverlay,
     updateAgentName,
@@ -152,36 +150,7 @@ export async function handleProfileCommand(
   if (trimmed === "/pin" || trimmed.startsWith("/pin ")) {
     const argsStr = trimmed.slice(4).trim();
 
-    if (argsStr === "help") {
-      const cmd = commandRunner.start(trimmed, "Showing pin help...");
-      const output = [
-        "/pin help",
-        "",
-        "Pin the current agent.",
-        "",
-        "USAGE",
-        "  /pin        — pin globally (interactive)",
-        "  /pin -l     — pin locally to this directory",
-        "  /pin help   — show this help",
-      ].join("\n");
-      cmd.finish(output, true);
-      return { submitted: true };
-    }
-
-    const parts = argsStr.split(/\s+/).filter(Boolean);
-    let hasNameArg = false;
-    let isLocal = false;
-
-    for (const part of parts) {
-      if (part === "-l" || part === "--local") {
-        isLocal = true;
-      } else {
-        hasNameArg = true;
-      }
-    }
-
-    if (!hasNameArg) {
-      setPinDialogLocal(isLocal);
+    if (!argsStr) {
       openOverlay(
         "pin",
         "/pin",
@@ -210,24 +179,6 @@ export async function handleProfileCommand(
   }
 
   if (trimmed === "/unpin" || trimmed.startsWith("/unpin ")) {
-    const unpinArgsStr = trimmed.slice(6).trim();
-
-    if (unpinArgsStr === "help") {
-      const cmd = commandRunner.start(trimmed, "Showing unpin help...");
-      const output = [
-        "/unpin help",
-        "",
-        "Unpin the current agent.",
-        "",
-        "USAGE",
-        "  /unpin       — unpin globally",
-        "  /unpin -l    — unpin locally",
-        "  /unpin help  — show this help",
-      ].join("\n");
-      cmd.finish(output, true);
-      return { submitted: true };
-    }
-
     const profileCtx: ProfileCommandContext = {
       buffersRef,
       refreshDerived,

@@ -2,14 +2,30 @@ import { useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { commands } from "@/cli/commands/registry";
 import { truncateText } from "@/cli/helpers/truncate-text";
 import { useAutocompleteNavigation } from "@/cli/hooks/use-autocomplete-navigation";
-import { useTerminalWidth } from "@/cli/hooks/use-terminal-width";
+import {
+  useTerminalRows,
+  useTerminalWidth,
+} from "@/cli/hooks/use-terminal-width";
 import { settingsManager } from "@/settings-manager";
 import { AutocompleteBox, AutocompleteItem } from "./Autocomplete";
 import { Text } from "./Text";
 import type { AutocompleteProps, CommandMatch } from "./types/autocomplete";
 
-const VISIBLE_COMMANDS = 5; // Number of commands visible at once
+// Match Codex's slash-command popup behavior: a small hard cap that can shrink
+// on short terminals, but never expands just because the terminal is tall.
+const MAX_POPUP_ROWS = 8;
 const CMD_COL_WIDTH = 14;
+
+const BUILTIN_SKILL_ALIASES = new Set([
+  "acquiring-skills",
+  "context-doctor",
+  "converting-mcps-to-skills",
+  "creating-skills",
+  "customizing-statusline",
+  "initializing-memory",
+  "migrating-memory",
+  "syncing-memory-filesystem",
+]);
 
 // Compute filtered command list (excluding hidden commands), sorted by order
 const _allCommands: CommandMatch[] = Object.entries(commands)
@@ -51,10 +67,11 @@ export function SlashCommandAutocomplete({
   onAutocomplete,
   onActiveChange,
   agentId,
-  workingDirectory = process.cwd(),
-  extensionCommands = {},
+  workingDirectory: _workingDirectory = process.cwd(),
+  modCommands = {},
 }: AutocompleteProps) {
   const columns = useTerminalWidth();
+  const terminalRows = useTerminalRows();
   const [customCommands, setCustomCommands] = useState<CommandMatch[]>([]);
   const [skillCommands, setSkillCommands] = useState<CommandMatch[]>([]);
 
@@ -89,7 +106,14 @@ export function SlashCommandAutocomplete({
         });
         if (cancelled) return;
         const matches: CommandMatch[] = discovery.skills
-          .filter(isUserInvocableSkill)
+          .filter(
+            (skill) =>
+              isUserInvocableSkill(skill) &&
+              !(
+                skill.source === "bundled" &&
+                BUILTIN_SKILL_ALIASES.has(skill.id)
+              ),
+          )
           .map((skill) => ({
             cmd: `/${skill.id}`,
             desc: `${skill.description}${skill.argumentHint ? ` ${skill.argumentHint}` : ""} (${skill.source} skill)`,
@@ -107,28 +131,21 @@ export function SlashCommandAutocomplete({
     };
   }, [agentId]);
 
-  // Check pin status to conditionally show/hide pin/unpin commands, merge with custom commands
+  // Check pin status to conditionally show/hide pin/unpin commands
   const allCommands = useMemo(() => {
     let builtins = _allCommands;
 
     if (agentId) {
       try {
-        const globalPinned = settingsManager.getGlobalPinnedAgents();
-        const localPinned =
-          settingsManager.getLocalPinnedAgents(workingDirectory);
-
-        const isPinnedGlobally = globalPinned.includes(agentId);
-        const isPinnedLocally = localPinned.includes(agentId);
-        const isPinnedAnywhere = isPinnedGlobally || isPinnedLocally;
-        const isPinnedBoth = isPinnedGlobally && isPinnedLocally;
+        const isPinned = settingsManager.isAgentPinned(agentId);
 
         builtins = _allCommands.filter((cmd) => {
-          // Hide /pin if agent is pinned both locally AND globally
-          if (cmd.cmd === "/pin" && isPinnedBoth) {
+          // Hide /pin if agent is already pinned
+          if (cmd.cmd === "/pin" && isPinned) {
             return false;
           }
-          // Hide /unpin if agent is not pinned anywhere
-          if (cmd.cmd === "/unpin" && !isPinnedAnywhere) {
+          // Hide /unpin if agent is not pinned
+          if (cmd.cmd === "/unpin" && !isPinned) {
             return false;
           }
           return true;
@@ -139,17 +156,27 @@ export function SlashCommandAutocomplete({
       }
     }
 
-    const extensionCommandMatches: CommandMatch[] = Object.values(
-      extensionCommands,
-    ).map((command) => ({
-      cmd: `/${command.id}`,
-      desc: `${command.description}${command.args ? ` ${command.args}` : ""} (extension)`,
-      order: command.order,
-    }));
+    const modCommandMatches: CommandMatch[] = Object.values(modCommands).map(
+      (command) => ({
+        cmd: `/${command.id}`,
+        desc: `${command.description}${command.args ? ` ${command.args}` : ""} (mod)`,
+        order: command.order,
+      }),
+    );
+
+    const customCommandNames = new Set(customCommands.map((cmd) => cmd.cmd));
+    const modCommandNames = new Set(modCommandMatches.map((cmd) => cmd.cmd));
+    const visibleBuiltins = builtins.filter(
+      (cmd) =>
+        !customCommandNames.has(cmd.cmd) && !modCommandNames.has(cmd.cmd),
+    );
+    const visibleModCommands = modCommandMatches.filter(
+      (cmd) => !customCommandNames.has(cmd.cmd),
+    );
 
     const reservedCommands = new Set([
-      ...builtins.map((cmd) => cmd.cmd),
-      ...extensionCommandMatches.map((cmd) => cmd.cmd),
+      ...visibleBuiltins.map((cmd) => cmd.cmd),
+      ...visibleModCommands.map((cmd) => cmd.cmd),
       ...customCommands.map((cmd) => cmd.cmd),
     ]);
     const visibleSkillCommands = skillCommands.filter(
@@ -158,18 +185,12 @@ export function SlashCommandAutocomplete({
 
     // Merge command sources and sort by order.
     return [
-      ...builtins,
-      ...extensionCommandMatches,
+      ...visibleBuiltins,
+      ...visibleModCommands,
       ...customCommands,
       ...visibleSkillCommands,
     ].sort((a, b) => (a.order ?? 100) - (b.order ?? 100));
-  }, [
-    agentId,
-    workingDirectory,
-    extensionCommands,
-    customCommands,
-    skillCommands,
-  ]);
+  }, [agentId, modCommands, customCommands, skillCommands]);
 
   const queryInfo = useMemo(
     () => extractSearchQuery(currentInput, cursorPosition),
@@ -252,23 +273,25 @@ export function SlashCommandAutocomplete({
     return null;
   }
 
-  // Calculate visible window based on selected index
+  // Calculate visible window based on selected index, bounded by viewport.
+  const availablePopupRows = Math.max(1, terminalRows - 8);
+  const visibleCommandCount = Math.min(MAX_POPUP_ROWS, availablePopupRows);
   const totalMatches = matches.length;
-  const needsScrolling = totalMatches > VISIBLE_COMMANDS;
+  const needsScrolling = totalMatches > visibleCommandCount;
 
   let startIndex = 0;
   if (needsScrolling) {
     // Keep selected item visible, preferring to show it in the middle
-    const halfWindow = Math.floor(VISIBLE_COMMANDS / 2);
+    const halfWindow = Math.floor(visibleCommandCount / 2);
     startIndex = Math.max(0, selectedIndex - halfWindow);
-    startIndex = Math.min(startIndex, totalMatches - VISIBLE_COMMANDS);
+    startIndex = Math.min(startIndex, totalMatches - visibleCommandCount);
   }
 
   const visibleMatches = matches.slice(
     startIndex,
-    startIndex + VISIBLE_COMMANDS,
+    startIndex + visibleCommandCount,
   );
-  const showScrollDown = startIndex + VISIBLE_COMMANDS < totalMatches;
+  const showScrollDown = startIndex + visibleCommandCount < totalMatches;
 
   return (
     <AutocompleteBox>
@@ -296,7 +319,7 @@ export function SlashCommandAutocomplete({
       })}
       {showScrollDown ? (
         <Text dimColor>
-          {"  "}↓ {totalMatches - startIndex - VISIBLE_COMMANDS} more below
+          {"  "}↓ {totalMatches - startIndex - visibleCommandCount} more below
         </Text>
       ) : needsScrolling ? (
         <Text> </Text>

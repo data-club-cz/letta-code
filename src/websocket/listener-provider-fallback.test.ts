@@ -22,7 +22,7 @@ function agentWithModel(
 describe("listener provider fallback", () => {
   test("maps sonnet to Bedrock after the first retry attempt", () => {
     const state = createProviderFallbackState(
-      agentWithModel("anthropic/claude-sonnet-4-6", {
+      agentWithModel("anthropic/claude-sonnet-5", {
         reasoning_effort: "high",
         enable_reasoner: true,
       }),
@@ -32,8 +32,8 @@ describe("listener provider fallback", () => {
     expect(maybeApplyProviderFallback(state, 1)).toBeNull();
 
     const fallbackHandle = maybeApplyProviderFallback(state, 2);
-    expect(fallbackHandle).toBe("bedrock/us.anthropic.claude-sonnet-4-6");
-    expect(state.overrideModel).toBe("bedrock/us.anthropic.claude-sonnet-4-6");
+    expect(fallbackHandle).toBe("bedrock/us.anthropic.claude-sonnet-5");
+    expect(state.overrideModel).toBe("bedrock/us.anthropic.claude-sonnet-5");
     expect(state.attempted).toBe(true);
     expect(maybeApplyProviderFallback(state, 3)).toBeNull();
   });
@@ -53,7 +53,7 @@ describe("listener provider fallback", () => {
 
   test("maps Opus 4.7 aliases to Bedrock Opus 4.7", () => {
     for (const [model, sourceModelId] of [
-      ["anthropic/claude-opus-4-7", "opus"],
+      ["anthropic/claude-opus-4-7", "opus-4.7-medium"],
       ["opus-4.7-high", "opus-4.7-high"],
       ["opus-4.7-max", "opus-4.7-max"],
     ] as const) {

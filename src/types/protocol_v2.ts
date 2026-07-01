@@ -6,12 +6,123 @@
  * from the legacy protocol.ts surface.
  */
 
-import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
-import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
+import type {
+  AgentCreateParams,
+  AgentListParams,
+  AgentState,
+  AgentUpdateParams,
+  MessageCreate,
+} from "@letta-ai/letta-client/resources/agents/agents";
+import type {
+  Message as LettaMessage,
+  LettaStreamingResponse,
+} from "@letta-ai/letta-client/resources/agents/messages";
+import type {
+  Conversation,
+  ConversationCreateParams,
+  ConversationListParams,
+  ConversationRecompileParams,
+  ConversationUpdateParams,
+} from "@letta-ai/letta-client/resources/conversations/conversations";
+import type {
+  CompactionResponse,
+  MessageCompactParams,
+  MessageListParams,
+} from "@letta-ai/letta-client/resources/conversations/messages";
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
-import type { DmPolicy } from "@/channels/types";
-import type { CronTask } from "@/cron";
-import type { ExperimentId, ExperimentSnapshot } from "@/experiments/types";
+
+export type DmPolicy = "pairing" | "allowlist" | "open";
+
+export type ExperimentId =
+  | "artifacts"
+  | "conversation_titles"
+  | "desktop_conversation_bootstrap"
+  | "diffs"
+  | "node"
+  | "tui_cron";
+
+export type ExperimentSource = "override" | "env" | "default";
+
+export interface ExperimentSnapshot {
+  id: ExperimentId;
+  label: string;
+  description: string;
+  envVar?: string;
+  enabled: boolean;
+  source: ExperimentSource;
+  override: boolean | null;
+}
+
+export type CronTaskStatus = "active" | "fired" | "missed" | "cancelled";
+export type CronCancelReason = "conversation_not_found" | "expired";
+export type CronRunOutcome = "queued" | "missed" | "failed" | "skipped";
+export type CronRunReason =
+  | "scheduled_time_matched"
+  | "one_off_due"
+  | "scheduler_inactive"
+  | "started_too_late"
+  | "queue_full"
+  | "runtime_unavailable"
+  | "task_cancelled"
+  | "scheduler_error";
+
+export interface CronTask {
+  id: string;
+  agent_id: string;
+  conversation_id: string;
+  name: string;
+  description: string;
+  cron: string;
+  timezone: string;
+  recurring: boolean;
+  prompt: string;
+  status: CronTaskStatus;
+  created_at: string;
+  expires_at: string | null;
+  last_fired_at: string | null;
+  fire_count: number;
+  cancel_reason: CronCancelReason | null;
+  jitter_offset_ms: number;
+  last_run_at: string | null;
+  last_run_outcome: CronRunOutcome | null;
+  last_run_reason: CronRunReason | null;
+  last_run_error: string | null;
+  last_missed_at: string | null;
+  missed_count: number;
+  failed_count: number;
+  scheduled_for: string | null;
+  fired_at: string | null;
+  missed_at: string | null;
+}
+
+export type CronRunLogStatus = "ok" | "error" | "skipped";
+
+export interface CronRunLogEntry {
+  ts: number;
+  jobId: string;
+  action: "finished";
+  status?: CronRunLogStatus;
+  outcome?: CronRunOutcome;
+  reason?: CronRunReason;
+  error?: string;
+  summary?: string;
+  agentId?: string;
+  conversationId?: string;
+  runId?: string;
+  runAtMs?: number;
+  queueItemId?: string;
+  scheduledFor?: string | null;
+  firedAt?: string;
+}
+
+export interface CronRunLogPage {
+  entries: CronRunLogEntry[];
+  total: number;
+  offset: number;
+  limit: number;
+  hasMore: boolean;
+  nextOffset: number | null;
+}
 
 /**
  * Runtime identity for all state and delta events.
@@ -41,11 +152,7 @@ export interface RuntimeEnvelope {
   idempotency_key: string;
 }
 
-export type DevicePermissionMode =
-  | "standard"
-  | "acceptEdits"
-  | "memory"
-  | "unrestricted";
+export type DevicePermissionMode = "standard" | "acceptEdits" | "unrestricted";
 
 export type ToolsetName =
   | "codex"
@@ -288,6 +395,7 @@ export interface ChannelRouteSnapshot {
   agent_id: string;
   conversation_id: string;
   enabled: boolean;
+  outbound_enabled?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -351,6 +459,21 @@ export interface DeviceStatus {
   reflection_settings: ReflectionSettingsSnapshot | null;
   /** Remote slash command IDs this letta-code version can handle via `execute_command`. */
   supported_commands: string[];
+  /**
+   * Slash commands contributed by locally loaded mods. Advertised separately
+   * from `supported_commands` (which gates the client's built-in allowlist) so
+   * clients can auto-surface mod commands by their own policy. Invoked through
+   * the same `execute_command` path. Omitted when no mod commands are loaded.
+   */
+  mod_commands?: ModCommandInfo[];
+}
+
+/** A mod-contributed slash command advertised to clients for rendering. */
+export interface ModCommandInfo {
+  id: string;
+  description: string;
+  /** Optional argument hint shown in the palette (e.g. "<query>"). */
+  args?: string;
 }
 
 export type LoopStatus =
@@ -368,7 +491,8 @@ export type QueueMessageKind =
   | "task_notification"
   | "cron_prompt"
   | "approval_result"
-  | "overlay_action";
+  | "overlay_action"
+  | "mod_continue";
 
 export type QueueMessageSource =
   | "user"
@@ -530,6 +654,7 @@ export interface SubagentSnapshot {
   subagent_id: string;
   subagent_type: string;
   description: string;
+  prompt?: string;
   status: "pending" | "running" | "completed" | "error";
   agent_url: string | null;
   model?: string;
@@ -590,6 +715,12 @@ export interface InputCreateMessagePayload {
    * client tools for this turn.
    */
   client_tool_allowlist?: string[];
+  /**
+   * Optional scoped external tools to expose for this turn. Runtime-start
+   * external tools with a scope_id stay hidden unless selected here; unscoped
+   * external tools for the runtime remain available normally.
+   */
+  external_tool_scope_ids?: string[];
 }
 
 export type InputApprovalResponsePayload = {
@@ -622,6 +753,7 @@ export interface ChangeDeviceStateCommand {
 export interface AbortMessageCommand {
   type: "abort_message";
   runtime: RuntimeScope;
+  /** When provided, app-server sends abort_message_response on the control channel. */
   request_id?: string;
   run_id?: string | null;
 }
@@ -629,12 +761,105 @@ export interface AbortMessageCommand {
 export interface SyncCommand {
   type: "sync";
   runtime: RuntimeScope;
+  /** When provided, app-server sends sync_response after replaying state. */
+  request_id?: string;
   /**
    * Whether the device should probe backend state for stale pending approvals.
    * Defaults to true for older clients. Lightweight status/recovery syncs should
    * set this false and only replay in-memory listener state.
    */
   recover_approvals?: boolean;
+  /**
+   * Force the sync replay to include update_device_status even when the
+   * listener's last device-status snapshot for this socket/scope is unchanged.
+   */
+  force_device_status?: boolean;
+}
+
+export interface RuntimeStartCreateAgentOptions {
+  /** Body forwarded to the Letta agents create API. */
+  body: AgentCreateParams;
+  /** Whether to pin the created agent globally. Defaults to true. */
+  pin_global?: boolean;
+}
+
+export interface RuntimeStartCreateConversationOptions {
+  /** Body forwarded to the Letta conversations create API. */
+  body?: Omit<ConversationCreateParams, "agent_id">;
+}
+
+export interface RuntimeStartClientInfo {
+  name: string;
+  title?: string;
+  version?: string;
+}
+
+export interface ExternalToolDefinitionPayload {
+  name: string;
+  label?: string;
+  description: string;
+  parameters: Record<string, unknown>;
+}
+
+export interface RuntimeStartExternalToolsGroup {
+  /** Hidden controller-defined scope used to select these tools on input turns. */
+  scope_id?: string;
+  tools: readonly ExternalToolDefinitionPayload[];
+}
+
+export interface RuntimeStartCommand {
+  type: "runtime_start";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Existing agent to start/resume a runtime for. Mutually exclusive with create_agent. */
+  agent_id?: string;
+  /** Create a new agent before starting the runtime. Mutually exclusive with agent_id. */
+  create_agent?: RuntimeStartCreateAgentOptions;
+  /** Existing conversation to start/resume. Mutually exclusive with create_conversation. */
+  conversation_id?: string;
+  /** Create a new conversation for the resolved agent before starting the runtime. */
+  create_conversation?: RuntimeStartCreateConversationOptions;
+  /** Initial working directory for this runtime scope. Null resets to listener boot CWD. */
+  cwd?: string | null;
+  /** Initial permission mode for this runtime scope. */
+  mode?: DevicePermissionMode;
+  /** Optional client metadata for diagnostics/future protocol negotiation. */
+  client_info?: RuntimeStartClientInfo;
+  /** Whether to probe backend state for stale pending approvals before replaying state. Defaults to true. */
+  recover_approvals?: boolean;
+  /** Force the initial state replay to include update_device_status. Defaults to true. */
+  force_device_status?: boolean;
+  /** Controller-owned tools registered atomically with the resolved runtime. */
+  external_tools?: readonly RuntimeStartExternalToolsGroup[];
+}
+
+export interface ExternalToolCallRequestMessage {
+  type: "external_tool_call_request";
+  request_id: string;
+  runtime?: RuntimeScope;
+  scope_id?: string;
+  tool_call_id: string;
+  tool_name: string;
+  input: Record<string, unknown>;
+}
+
+export interface ExternalToolCallResultContent {
+  type: string;
+  text?: string;
+  data?: string;
+  mimeType?: string;
+}
+
+export interface ExternalToolCallResult {
+  content: readonly ExternalToolCallResultContent[];
+  is_error?: boolean;
+}
+
+export interface ExternalToolCallResponseCommand {
+  type: "external_tool_call_response";
+  request_id: string;
+  result?: ExternalToolCallResult;
+  error?: string;
 }
 
 export interface TerminalSpawnCommand {
@@ -662,6 +887,43 @@ export interface TerminalResizeCommand {
 export interface TerminalKillCommand {
   type: "terminal_kill";
   terminal_id: string;
+}
+
+export interface TerminalOutputMessage {
+  type: "terminal_output";
+  terminal_id: string;
+  data: string;
+}
+
+export interface TerminalSpawnedMessage {
+  type: "terminal_spawned";
+  terminal_id: string;
+  pid: number;
+}
+
+export interface TerminalExitedMessage {
+  type: "terminal_exited";
+  terminal_id: string;
+  exitCode: number;
+  error?: string;
+}
+
+export interface AbortMessageResponseMessage {
+  type: "abort_message_response";
+  request_id: string;
+  runtime: RuntimeScope;
+  /** True when an active turn or pending approval was interrupted. */
+  aborted: boolean;
+  success: boolean;
+  error?: string;
+}
+
+export interface SyncResponseMessage {
+  type: "sync_response";
+  request_id: string;
+  runtime: RuntimeScope;
+  success: boolean;
+  error?: string;
 }
 
 export interface SearchFilesCommand {
@@ -722,6 +984,30 @@ export interface GrepInFilesMatch {
   after?: string[];
 }
 
+export interface SearchFilesEntry {
+  path: string;
+  type: "file";
+}
+
+export interface SearchFilesResponseMessage {
+  type: "search_files_response";
+  request_id: string;
+  files: SearchFilesEntry[];
+  success: boolean;
+  error?: string;
+}
+
+export interface GrepInFilesResponseMessage {
+  type: "grep_in_files_response";
+  request_id: string;
+  success: boolean;
+  matches: GrepInFilesMatch[];
+  total_matches: number;
+  total_files: number;
+  truncated: boolean;
+  error?: string;
+}
+
 export interface ListInDirectoryCommand {
   type: "list_in_directory";
   /** Absolute path to list entries in. */
@@ -736,6 +1022,18 @@ export interface ListInDirectoryCommand {
   request_id?: string;
 }
 
+export interface ListInDirectoryResponseMessage {
+  type: "list_in_directory_response";
+  path: string;
+  folders: string[];
+  files?: string[];
+  hasMore: boolean;
+  total?: number;
+  success: boolean;
+  error?: string;
+  request_id?: string;
+}
+
 export interface GetTreeCommand {
   type: "get_tree";
   /** Absolute path to the root of the subtree to fetch. */
@@ -746,12 +1044,36 @@ export interface GetTreeCommand {
   request_id: string;
 }
 
+export interface TreeEntry {
+  path: string;
+  type: "file" | "dir";
+}
+
+export interface GetTreeResponseMessage {
+  type: "get_tree_response";
+  path: string;
+  request_id: string;
+  entries: TreeEntry[];
+  has_more_depth: boolean;
+  success: boolean;
+  error?: string;
+}
+
 export interface ReadFileCommand {
   type: "read_file";
   /** Absolute path to the file to read. */
   path: string;
   /** Echoed back in the response for request correlation. */
   request_id: string;
+}
+
+export interface ReadFileResponseMessage {
+  type: "read_file_response";
+  request_id: string;
+  path: string;
+  content: string | null;
+  success: boolean;
+  error?: string;
 }
 
 export interface WriteFileCommand {
@@ -762,6 +1084,14 @@ export interface WriteFileCommand {
   content: string;
   /** Echoed back in the response for request correlation. */
   request_id: string;
+}
+
+export interface WriteFileResponseMessage {
+  type: "write_file_response";
+  request_id: string;
+  path: string;
+  success: boolean;
+  error?: string;
 }
 
 export interface WatchFileCommand {
@@ -818,6 +1148,23 @@ export interface EditFileCommand {
   request_id: string;
 }
 
+export interface EditFileResponseMessage {
+  type: "edit_file_response";
+  request_id: string;
+  file_path: string;
+  message: string | null;
+  replacements: number;
+  start_line?: number;
+  success: boolean;
+  error?: string;
+}
+
+export interface FileChangedMessage {
+  type: "file_changed";
+  path: string;
+  lastModified: number;
+}
+
 export interface ListMemoryCommand {
   type: "list_memory";
   /** Echoed back in every response chunk for request correlation. */
@@ -866,7 +1213,7 @@ export interface ReadMemoryFileCommand {
 }
 
 /**
- * Write a file into the agent's MemFS and commit + push.
+ * Write a file into the agent's MemFS and commit.
  *
  * Use for agent memory writes (e.g. profile images). Path is
  * relative to the memory root and is rejected if it escapes the root.
@@ -922,10 +1269,294 @@ export interface EnableMemfsCommand {
   agent_id: string;
 }
 
+export interface MemoryFileEntry {
+  relative_path: string;
+  is_system: boolean;
+  description: string | null;
+  content: string;
+  size: number;
+  references?: string[];
+}
+
+export interface ListMemoryResponseMessage {
+  type: "list_memory_response";
+  request_id: string;
+  entries: MemoryFileEntry[];
+  done: boolean;
+  total: number;
+  success: boolean;
+  error?: string;
+  memfs_enabled?: boolean;
+  memfs_initialized?: boolean;
+}
+
+export interface MemoryHistoryCommitEntry {
+  sha: string;
+  message: string;
+  timestamp: string;
+  author_name: string | null;
+}
+
+export interface MemoryHistoryResponseMessage {
+  type: "memory_history_response";
+  request_id: string;
+  file_path: string;
+  commits: MemoryHistoryCommitEntry[];
+  success: boolean;
+  error?: string;
+}
+
+export interface MemoryFileAtRefResponseMessage {
+  type: "memory_file_at_ref_response";
+  request_id: string;
+  file_path: string;
+  ref: string;
+  content: string | null;
+  success: boolean;
+  error?: string;
+}
+
+export interface ReadMemoryFileResponseMessage {
+  type: "read_memory_file_response";
+  request_id: string;
+  agent_id: string;
+  path: string;
+  content: string | null;
+  encoding: "utf8" | "base64";
+  success: boolean;
+  error?: string;
+}
+
+export interface WriteMemoryFileResponseMessage {
+  type: "write_memory_file_response";
+  request_id: string;
+  agent_id: string;
+  path: string;
+  success: boolean;
+  committed?: boolean;
+  commit_sha?: string;
+  error?: string;
+}
+
+export interface DeleteMemoryFileResponseMessage {
+  type: "delete_memory_file_response";
+  request_id: string;
+  agent_id: string;
+  path: string;
+  success: boolean;
+  committed?: boolean;
+  commit_sha?: string;
+  error?: string;
+}
+
+export interface MemoryCommitDiffResponseMessage {
+  type: "memory_commit_diff_response";
+  request_id: string;
+  sha: string;
+  diff: string | null;
+  success: boolean;
+  error?: string;
+}
+
+export interface EnableMemfsResponseMessage {
+  type: "enable_memfs_response";
+  request_id: string;
+  success: boolean;
+  memory_directory?: string;
+  error?: string;
+}
+
+export interface MemoryUpdatedMessage {
+  type: "memory_updated";
+  affected_paths: string[];
+  timestamp: number;
+}
+
 export interface ListModelsCommand {
   type: "list_models";
   /** Echoed back in the response for request correlation. */
   request_id: string;
+}
+
+export type ConnectProviderStorageTarget = "local";
+export type ChatGPTUsageReadTarget = "local" | "api";
+
+export interface ListConnectProvidersCommand {
+  type: "list_connect_providers";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Provider store to inspect. MVP supports local provider storage. */
+  target: ConnectProviderStorageTarget;
+}
+
+export interface ConnectProviderCommand {
+  type: "connect_provider";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Provider store to write. MVP supports local provider storage. */
+  target: ConnectProviderStorageTarget;
+  /** Provider id from list_connect_providers. */
+  provider_id: string;
+  /** Optional auth method id for providers with multiple auth methods. */
+  auth_method_id?: string;
+  /** User-provided connection fields keyed by field id. */
+  fields: Record<string, string>;
+}
+
+export interface DisconnectProviderCommand {
+  type: "disconnect_provider";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Provider store to write. MVP supports local provider storage. */
+  target: ConnectProviderStorageTarget;
+  /** Provider id from list_connect_providers. */
+  provider_id: string;
+  /** Optional connected provider name to remove when a row has multiple aliases. */
+  provider_name?: string;
+}
+
+export interface ChatGPTUsageReadCommand {
+  type: "chatgpt_usage_read";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Provider store to inspect. */
+  target: ChatGPTUsageReadTarget;
+  /** Optional connected ChatGPT provider alias. Defaults to the built-in alias. */
+  provider_name?: string;
+  /** Skip the short listener-side cache. */
+  force_refresh?: boolean;
+}
+
+export interface ConnectProviderField {
+  key: string;
+  label: string;
+  placeholder?: string;
+  secret?: boolean;
+  required?: boolean;
+}
+
+export interface ConnectProviderAuthMethod {
+  id: string;
+  label: string;
+  description: string;
+  fields: ConnectProviderField[];
+}
+
+export interface ConnectProviderConnectionState {
+  is_connected: boolean;
+  id?: string;
+  provider_name?: string;
+  provider_type?: string;
+  auth_type?: "api" | "oauth";
+  base_url?: string;
+  timeout?: number | false;
+  region?: string;
+}
+
+export interface ConnectProviderEntry {
+  id: string;
+  display_name: string;
+  description: string;
+  provider_type: string;
+  provider_name: string;
+  provider_names: string[];
+  is_oauth?: boolean;
+  oauth_provider_id?: string;
+  requires_api_key: boolean;
+  fields?: ConnectProviderField[];
+  auth_methods?: ConnectProviderAuthMethod[];
+  /** First connected provider, preserved for older clients. */
+  connected: ConnectProviderConnectionState;
+  /** All connected provider aliases represented by this row. */
+  connected_providers: ConnectProviderConnectionState[];
+}
+
+export interface ListConnectProvidersResponseMessage {
+  type: "list_connect_providers_response";
+  request_id: string;
+  success: boolean;
+  target: ConnectProviderStorageTarget;
+  providers: ConnectProviderEntry[];
+  error?: string;
+}
+
+export interface ConnectProviderResponseMessage {
+  type: "connect_provider_response";
+  request_id: string;
+  success: boolean;
+  target: ConnectProviderStorageTarget;
+  providers: ConnectProviderEntry[];
+  models_may_have_changed: boolean;
+  error?: string;
+}
+
+export interface DisconnectProviderResponseMessage {
+  type: "disconnect_provider_response";
+  request_id: string;
+  success: boolean;
+  target: ConnectProviderStorageTarget;
+  providers: ConnectProviderEntry[];
+  models_may_have_changed: boolean;
+  error?: string;
+}
+
+export interface ChatGPTUsageWindowPayload {
+  label: string;
+  usedPercent: number | null;
+  windowDurationMins: number | null;
+  resetsAt: number | null;
+}
+
+export interface ChatGPTUsageCreditsPayload {
+  balance?: string | null;
+  availableCount?: number | null;
+  hasCredits?: boolean | null;
+  unlimited?: boolean | null;
+}
+
+export interface ChatGPTUsageIndividualLimitPayload {
+  limit: string;
+  used: string;
+  remainingPercent: number;
+  resetsAt: number;
+}
+
+export interface ChatGPTUsageSnapshotPayload {
+  providerName: string;
+  fetchedAt: string;
+  summary: string;
+  planType?: string | null;
+  limitReached?: boolean | null;
+  rateLimitReachedType?: string | null;
+  primary: ChatGPTUsageWindowPayload | null;
+  secondary: ChatGPTUsageWindowPayload | null;
+  additional: ChatGPTUsageWindowPayload[];
+  credits?: ChatGPTUsageCreditsPayload | null;
+  individualLimit?: ChatGPTUsageIndividualLimitPayload | null;
+}
+
+export interface ChatGPTUsageReadErrorPayload {
+  code:
+    | "bad_request"
+    | "not_connected"
+    | "unsupported_target"
+    | "refresh_failed"
+    | "unauthorized"
+    | "forbidden"
+    | "rate_limited"
+    | "network_error"
+    | "bad_response";
+  message: string;
+  retryAfterMs?: number;
+}
+
+export interface ChatGPTUsageReadResponseMessage {
+  type: "chatgpt_usage_read_response";
+  request_id: string;
+  success: boolean;
+  target: ChatGPTUsageReadTarget;
+  usage?: ChatGPTUsageSnapshotPayload;
+  error?: ChatGPTUsageReadErrorPayload;
 }
 
 export interface UpdateModelPayload {
@@ -1014,6 +1645,12 @@ export interface CronAddCommand {
   /** Echoed back in the response for request correlation. */
   request_id: string;
   agent_id: string;
+  /**
+   * Conversation target for scheduled fires.
+   * - omitted/"default": agent default conversation
+   * - "new": create a fresh conversation for every fire
+   * - any other string: existing conversation id
+   */
   conversation_id?: string;
   name: string;
   description: string;
@@ -1030,6 +1667,42 @@ export interface CronGetCommand {
   /** Echoed back in the response for request correlation. */
   request_id: string;
   task_id: string;
+}
+
+export interface CronRunsCommand {
+  type: "cron_runs";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  task_id: string;
+  /** Maximum run-log entries to return. */
+  limit?: number;
+  /** Page offset for run-log entries. */
+  offset?: number;
+  /** Optional run id filter. */
+  run_id?: string;
+}
+
+export interface CronTriggerCommand {
+  type: "cron_trigger";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  task_id: string;
+}
+
+export interface CronUpdateCommand {
+  type: "cron_update";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  task_id: string;
+  name?: string;
+  description?: string;
+  conversation_id?: string;
+  cron?: string;
+  timezone?: string;
+  recurring?: boolean;
+  prompt?: string;
+  /** Optional ISO timestamp for one-shot tasks. */
+  scheduled_for?: string | null;
 }
 
 export interface CronDeleteCommand {
@@ -1054,12 +1727,33 @@ export interface SkillEnableCommand {
   skill_path: string;
 }
 
+export interface SkillEnableResponseMessage {
+  type: "skill_enable_response";
+  request_id: string;
+  success: boolean;
+  skill_name?: string;
+  error?: string;
+}
+
 export interface SkillDisableCommand {
   type: "skill_disable";
   /** Echoed back in the response for request correlation. */
   request_id: string;
   /** Skill name (symlink name in ~/.letta/skills/). */
   name: string;
+}
+
+export interface SkillDisableResponseMessage {
+  type: "skill_disable_response";
+  request_id: string;
+  success: boolean;
+  skill_name?: string;
+  error?: string;
+}
+
+export interface SkillsUpdatedMessage {
+  type: "skills_updated";
+  timestamp: number;
 }
 
 export interface CreateAgentCommand {
@@ -1072,6 +1766,119 @@ export interface CreateAgentCommand {
   model?: string;
   /** Whether to pin the agent globally after creation. Defaults to true. */
   pin_global?: boolean;
+}
+
+export interface AgentListCommand {
+  type: "agent_list";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Query params forwarded to the Letta agents list API. */
+  query?: AgentListParams;
+}
+
+export interface AgentRetrieveCommand {
+  type: "agent_retrieve";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  agent_id: string;
+}
+
+export interface AgentCreateCommand {
+  type: "agent_create";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Body forwarded to the Letta agents create API. */
+  body: AgentCreateParams;
+}
+
+export interface AgentUpdateCommand {
+  type: "agent_update";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  agent_id: string;
+  /** Body forwarded to the Letta agents update API. */
+  body: AgentUpdateParams;
+}
+
+export interface AgentDeleteCommand {
+  type: "agent_delete";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  agent_id: string;
+}
+
+export interface ConversationListCommand {
+  type: "conversation_list";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Query params forwarded to the Letta conversations list API. */
+  query?: ConversationListParams;
+}
+
+export interface ConversationRetrieveCommand {
+  type: "conversation_retrieve";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+}
+
+export interface ConversationCreateCommand {
+  type: "conversation_create";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  /** Body forwarded to the Letta conversations create API. */
+  body: ConversationCreateParams;
+}
+
+export interface ConversationUpdateCommand {
+  type: "conversation_update";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+  /** Body forwarded to the Letta conversations update API. */
+  body: ConversationUpdateParams;
+}
+
+export interface ConversationRecompileCommand {
+  type: "conversation_recompile";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+  /** Body/query forwarded to the Letta conversations recompile API. */
+  body?: ConversationRecompileParams;
+}
+
+export interface ConversationForkBody {
+  /** Agent ID for agent-direct mode with the default conversation. */
+  agent_id?: string | null;
+  /** Whether the forked conversation should be hidden. */
+  hidden?: boolean;
+}
+
+export interface ConversationForkCommand {
+  type: "conversation_fork";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+  body?: ConversationForkBody;
+}
+
+export interface ConversationMessagesListCommand {
+  type: "conversation_messages_list";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+  /** Query params forwarded to the Letta conversation messages list API. */
+  query?: MessageListParams;
+}
+
+export interface ConversationCompactCommand {
+  type: "conversation_compact";
+  /** Echoed back in the response for request correlation. */
+  request_id: string;
+  conversation_id: string;
+  /** Body forwarded to the Letta conversation messages compact API. */
+  body?: MessageCompactParams;
 }
 
 export interface GetCwdMapCommand {
@@ -1311,6 +2118,31 @@ export interface CronGetResponseMessage {
   error?: string;
 }
 
+export interface CronRunsResponseMessage {
+  type: "cron_runs_response";
+  request_id: string;
+  success: boolean;
+  page?: CronRunLogPage;
+  error?: string;
+}
+
+export interface CronTriggerResponseMessage {
+  type: "cron_trigger_response";
+  request_id: string;
+  success: boolean;
+  found: boolean;
+  task?: CronTask;
+  error?: string;
+}
+
+export interface CronUpdateResponseMessage {
+  type: "cron_update_response";
+  request_id: string;
+  success: boolean;
+  task?: CronTask;
+  error?: string;
+}
+
 export interface CronDeleteResponseMessage {
   type: "cron_delete_response";
   request_id: string;
@@ -1342,6 +2174,128 @@ export interface CreateAgentResponseMessage {
   agent_id?: string;
   name?: string;
   model?: string;
+  error?: string;
+}
+
+export interface AgentListResponseMessage {
+  type: "agent_list_response";
+  request_id: string;
+  success: boolean;
+  agents: AgentState[];
+  error?: string;
+}
+
+export interface AgentRetrieveResponseMessage {
+  type: "agent_retrieve_response";
+  request_id: string;
+  success: boolean;
+  agent: AgentState | null;
+  error?: string;
+}
+
+export interface AgentCreateResponseMessage {
+  type: "agent_create_response";
+  request_id: string;
+  success: boolean;
+  agent: AgentState | null;
+  error?: string;
+}
+
+export interface AgentUpdateResponseMessage {
+  type: "agent_update_response";
+  request_id: string;
+  success: boolean;
+  agent: AgentState | null;
+  error?: string;
+}
+
+export interface AgentDeleteResponseMessage {
+  type: "agent_delete_response";
+  request_id: string;
+  success: boolean;
+  agent_id: string;
+  error?: string;
+}
+
+export interface ConversationListResponseMessage {
+  type: "conversation_list_response";
+  request_id: string;
+  success: boolean;
+  conversations: Conversation[];
+  error?: string;
+}
+
+export interface ConversationRetrieveResponseMessage {
+  type: "conversation_retrieve_response";
+  request_id: string;
+  success: boolean;
+  conversation: Conversation | null;
+  error?: string;
+}
+
+export interface ConversationCreateResponseMessage {
+  type: "conversation_create_response";
+  request_id: string;
+  success: boolean;
+  conversation: Conversation | null;
+  error?: string;
+}
+
+export interface ConversationUpdateResponseMessage {
+  type: "conversation_update_response";
+  request_id: string;
+  success: boolean;
+  conversation: Conversation | null;
+  error?: string;
+}
+
+export interface ConversationRecompileResponseMessage {
+  type: "conversation_recompile_response";
+  request_id: string;
+  success: boolean;
+  result: string | null;
+  error?: string;
+}
+
+export interface ForkedConversationReference {
+  id: string;
+}
+
+export interface ConversationForkResponseMessage {
+  type: "conversation_fork_response";
+  request_id: string;
+  success: boolean;
+  conversation: ForkedConversationReference | null;
+  error?: string;
+}
+
+export interface ConversationMessagesListResponseMessage {
+  type: "conversation_messages_list_response";
+  request_id: string;
+  success: boolean;
+  messages: LettaMessage[];
+  error?: string;
+}
+
+export interface ConversationCompactResponseMessage {
+  type: "conversation_compact_response";
+  request_id: string;
+  success: boolean;
+  compaction: CompactionResponse | null;
+  error?: string;
+}
+
+export interface RuntimeStartResponseMessage {
+  type: "runtime_start_response";
+  request_id: string;
+  success: boolean;
+  runtime: RuntimeScope | null;
+  agent: AgentState | null;
+  conversation: Conversation | null;
+  created: {
+    agent: boolean;
+    conversation: boolean;
+  };
   error?: string;
 }
 
@@ -1751,6 +2705,8 @@ export type WsProtocolCommand =
   | ChangeDeviceStateCommand
   | AbortMessageCommand
   | SyncCommand
+  | RuntimeStartCommand
+  | ExternalToolCallResponseCommand
   | TerminalSpawnCommand
   | TerminalInputCommand
   | TerminalResizeCommand
@@ -1774,16 +2730,36 @@ export type WsProtocolCommand =
   | DeleteMemoryFileCommand
   | EnableMemfsCommand
   | ListModelsCommand
+  | ListConnectProvidersCommand
+  | ConnectProviderCommand
+  | DisconnectProviderCommand
+  | ChatGPTUsageReadCommand
   | UpdateModelCommand
   | UpdateToolsetCommand
   | CronListCommand
   | CronAddCommand
   | CronGetCommand
+  | CronRunsCommand
+  | CronTriggerCommand
+  | CronUpdateCommand
   | CronDeleteCommand
   | CronDeleteAllCommand
   | SkillEnableCommand
   | SkillDisableCommand
   | CreateAgentCommand
+  | AgentListCommand
+  | AgentRetrieveCommand
+  | AgentCreateCommand
+  | AgentUpdateCommand
+  | AgentDeleteCommand
+  | ConversationListCommand
+  | ConversationRetrieveCommand
+  | ConversationCreateCommand
+  | ConversationUpdateCommand
+  | ConversationRecompileCommand
+  | ConversationForkCommand
+  | ConversationMessagesListCommand
+  | ConversationCompactCommand
   | GetCwdMapCommand
   | GetReflectionSettingsCommand
   | SetReflectionSettingsCommand
@@ -1816,17 +2792,76 @@ export type WsProtocolCommand =
   | SecretListCommand
   | SecretApplyCommand;
 
+export type WsProtocolCommandType = WsProtocolCommand["type"];
+
 export type WsProtocolMessage =
   | DeviceStatusUpdateMessage
   | LoopStatusUpdateMessage
   | QueueUpdateMessage
   | StreamDeltaMessage
   | SubagentStateUpdateMessage
+  | ExternalToolCallRequestMessage
+  | AbortMessageResponseMessage
+  | SyncResponseMessage
+  | TerminalOutputMessage
+  | TerminalSpawnedMessage
+  | TerminalExitedMessage
+  | SearchFilesResponseMessage
+  | GrepInFilesResponseMessage
+  | ListInDirectoryResponseMessage
+  | GetTreeResponseMessage
+  | ReadFileResponseMessage
+  | WriteFileResponseMessage
+  | FileOpsCommand
+  | EditFileResponseMessage
+  | FileChangedMessage
+  | ListMemoryResponseMessage
+  | MemoryHistoryResponseMessage
+  | MemoryFileAtRefResponseMessage
+  | MemoryCommitDiffResponseMessage
+  | ReadMemoryFileResponseMessage
+  | WriteMemoryFileResponseMessage
+  | DeleteMemoryFileResponseMessage
+  | EnableMemfsResponseMessage
+  | MemoryUpdatedMessage
   | ListModelsResponseMessage
+  | ListConnectProvidersResponseMessage
+  | ConnectProviderResponseMessage
+  | DisconnectProviderResponseMessage
+  | ChatGPTUsageReadResponseMessage
   | UpdateModelResponseMessage
   | UpdateToolsetResponseMessage
+  | CronListResponseMessage
+  | CronAddResponseMessage
+  | CronGetResponseMessage
+  | CronRunsResponseMessage
+  | CronTriggerResponseMessage
+  | CronUpdateResponseMessage
+  | CronDeleteResponseMessage
+  | CronDeleteAllResponseMessage
+  | CronsUpdatedMessage
+  | SkillEnableResponseMessage
+  | SkillDisableResponseMessage
+  | SkillsUpdatedMessage
+  | CreateAgentResponseMessage
+  | AgentListResponseMessage
+  | AgentRetrieveResponseMessage
+  | AgentCreateResponseMessage
+  | AgentUpdateResponseMessage
+  | AgentDeleteResponseMessage
+  | ConversationListResponseMessage
+  | ConversationRetrieveResponseMessage
+  | ConversationCreateResponseMessage
+  | ConversationUpdateResponseMessage
+  | ConversationRecompileResponseMessage
+  | ConversationForkResponseMessage
+  | ConversationMessagesListResponseMessage
+  | ConversationCompactResponseMessage
+  | RuntimeStartResponseMessage
   | GetExperimentsResponseMessage
   | SetExperimentResponseMessage
+  | GetReflectionSettingsResponseMessage
+  | SetReflectionSettingsResponseMessage
   | ChannelsListResponseMessage
   | ChannelAccountsListResponseMessage
   | ChannelAccountCreateResponseMessage
@@ -1853,8 +2888,12 @@ export type WsProtocolMessage =
   | ChannelRoutesUpdatedMessage
   | ChannelTargetsUpdatedMessage
   | GetCwdMapResponseMessage
+  | SearchBranchesResponse
+  | CheckoutBranchResponse
   | SecretListResponse
   | SecretApplyResponse
   | RemoveQueueItemResponse;
+
+export type WsProtocolMessageType = WsProtocolMessage["type"];
 
 export type { StopReasonType };

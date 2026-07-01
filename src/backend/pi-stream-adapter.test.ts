@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { once } from "node:events";
 import { mkdtemp, rm } from "node:fs/promises";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -14,11 +16,17 @@ import {
   type PiStreamFunction,
 } from "@/backend/dev/pi-stream-adapter";
 import type {
+  LlmEndInfo,
+  LlmStartInfo,
   ProviderStreamEvent,
   ProviderTurnInput,
 } from "@/backend/dev/provider-turn-executor";
 import { emptyLocalUsage } from "@/backend/local/local-message";
-import { createOrUpdateLocalProvider } from "@/backend/local/local-provider-auth-store";
+import {
+  createOrUpdateLocalProvider,
+  LOCAL_CHATGPT_PROVIDER_NAME,
+  setLocalOAuthProvider,
+} from "@/backend/local/local-provider-auth-store";
 
 function assistantMessage(): AssistantMessage {
   return {
@@ -51,6 +59,28 @@ function streamFromEvents(
   }
   return Object.assign(iterator(), {
     result: async () => finalMessage,
+  });
+}
+
+async function collectEvents(
+  events: AsyncIterable<ProviderStreamEvent>,
+): Promise<ProviderStreamEvent[]> {
+  const collected: ProviderStreamEvent[] = [];
+  for await (const event of events) collected.push(event);
+  return collected;
+}
+
+async function closeServer(
+  server: ReturnType<typeof createServer>,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.close((error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
   });
 }
 
@@ -88,6 +118,555 @@ function emptyTextBlocks(messages: Context["messages"]) {
 }
 
 describe("PiStreamAdapter", () => {
+  test("downgrades images through Pi-AI payload conversion for text-only local models", async () => {
+    let capturedPayload: unknown;
+    const server = createServer(async (req, res) => {
+      if (req.method !== "POST" || req.url !== "/v1/chat/completions") {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      }
+      capturedPayload = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+
+      const responseChunks = [
+        {
+          id: "chatcmpl-test",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "deepseek-r1:8b",
+          choices: [
+            {
+              index: 0,
+              delta: { content: "ok" },
+              finish_reason: null,
+            },
+          ],
+        },
+        {
+          id: "chatcmpl-test",
+          object: "chat.completion.chunk",
+          created: 0,
+          model: "deepseek-r1:8b",
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+            },
+          ],
+          usage: {
+            prompt_tokens: 1,
+            completion_tokens: 1,
+            total_tokens: 2,
+          },
+        },
+      ];
+
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "close",
+      });
+      res.end(
+        `${responseChunks
+          .map((chunk) => `data: ${JSON.stringify(chunk)}`)
+          .join("\n\n")}\n\ndata: [DONE]\n\n`,
+      );
+    });
+
+    server.listen(0, "127.0.0.1");
+    await once(server, "listening");
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected tcp server address");
+    }
+
+    const previousOllamaBaseUrl = process.env.OLLAMA_BASE_URL;
+    process.env.OLLAMA_BASE_URL = `http://127.0.0.1:${address.port}/v1`;
+    const storageDir = await mkdtemp(
+      join(tmpdir(), "pi-stream-text-image-downgrade-"),
+    );
+
+    try {
+      const baseInput = input();
+      const events = await collectEvents(
+        new PiStreamAdapter({ localProviderAuthStorageDir: storageDir }).stream(
+          {
+            ...baseInput,
+            agent: {
+              ...baseInput.agent,
+              model: "ollama/deepseek-r1:8b",
+              model_settings: { provider_type: "ollama" },
+            },
+            uiMessages: [
+              {
+                id: "ui-msg-image",
+                role: "user",
+                content: [
+                  { type: "text", text: "describe this" },
+                  { type: "image", mimeType: "image/png", data: "abc" },
+                ],
+                timestamp: Date.now(),
+              },
+            ],
+          },
+        ),
+      );
+
+      expect(events.some((event) => event.type === "local-message")).toBe(true);
+      expect(capturedPayload).toMatchObject({
+        model: "deepseek-r1:8b",
+        stream: true,
+      });
+      const payloadJson = JSON.stringify(capturedPayload);
+      expect(payloadJson).toContain(
+        "(image omitted: model does not support images)",
+      );
+      expect(payloadJson).not.toContain("image_url");
+      expect(payloadJson).not.toContain("data:image/png;base64,abc");
+    } finally {
+      if (previousOllamaBaseUrl === undefined) {
+        delete process.env.OLLAMA_BASE_URL;
+      } else {
+        process.env.OLLAMA_BASE_URL = previousOllamaBaseUrl;
+      }
+      await rm(storageDir, { recursive: true, force: true });
+      await closeServer(server);
+    }
+  });
+
+  test("routes clean provider overflow errors into compaction and retries", async () => {
+    let providerCalls = 0;
+    const stream: PiStreamFunction = () => {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        const error = assistantErrorMessage(
+          "prompt is too long: 500000 tokens > 272000 maximum",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    let overflowError: unknown;
+    const adapter = new PiStreamAdapter({
+      stream,
+      onContextWindowOverflow: async (_input, error) => {
+        overflowError = error;
+        return {
+          uiMessages: [
+            {
+              id: "ui-msg-compacted",
+              role: "user",
+              content: "small",
+              timestamp: Date.now(),
+            },
+          ],
+          summary: "compacted old context",
+        };
+      },
+    });
+    const events = await collectEvents(adapter.stream(input()));
+
+    expect(providerCalls).toBe(2);
+    expect(String(overflowError)).toContain("prompt is too long");
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "letta-chunk",
+        chunk: expect.objectContaining({
+          message_type: "event_message",
+          event_type: "compaction",
+        }),
+      }),
+    );
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "letta-chunk",
+        chunk: expect.objectContaining({
+          message_type: "summary_message",
+          summary: "compacted old context",
+        }),
+      }),
+    );
+    expect(events.some((event) => event.type === "local-message")).toBe(true);
+  });
+
+  test("elides image payloads in-memory before retrying oversized transport failures", async () => {
+    let providerCalls = 0;
+    const contexts: Context[] = [];
+    const stream: PiStreamFunction = (_model, context) => {
+      providerCalls += 1;
+      contexts.push(context);
+      if (providerCalls === 1) {
+        const error = assistantErrorMessage(
+          "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    const adapter = new PiStreamAdapter({
+      stream,
+      onContextWindowOverflow: async () => {
+        throw new Error("Compaction should not run before image elision");
+      },
+    });
+    const baseInput = input();
+    const events = await collectEvents(
+      adapter.stream({
+        ...baseInput,
+        // Semantic image cost is tiny (1200 tokens), but the raw base64 body is
+        // oversized. After a real transport failure, retry with provider-only
+        // image elision instead of persisting a compaction that may not shed the
+        // kept image bytes.
+        uiMessages: [
+          {
+            id: "ui-msg-large-image",
+            role: "user",
+            content: [
+              {
+                type: "image",
+                mimeType: "image/png",
+                data: "a".repeat(8_000_001),
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      }),
+    );
+
+    expect(providerCalls).toBe(2);
+    expect(contexts[0]?.messages[0]?.content).toEqual([
+      {
+        type: "image",
+        mimeType: "image/png",
+        data: "a".repeat(8_000_001),
+      },
+    ]);
+    expect(contexts[1]?.messages[0]?.content).toEqual([
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("Image omitted"),
+      }),
+    ]);
+    const retryEvents = events.filter(
+      (event) =>
+        event.type === "letta-chunk" &&
+        (event.chunk as { event_type?: string }).event_type === "retry",
+    );
+    expect(retryEvents).toHaveLength(0);
+    const imageElisionEvents = events.filter(
+      (event) =>
+        event.type === "letta-chunk" &&
+        (event.chunk as { event_type?: string }).event_type ===
+          "context_image_elision",
+    );
+    expect(imageElisionEvents).toHaveLength(0);
+    expect(events.some((event) => event.type === "local-message")).toBe(true);
+  });
+
+  test("honors LETTA_LOCAL_REQUEST_BYTE_LIMIT for image elision threshold", async () => {
+    const previousLimit = process.env.LETTA_LOCAL_REQUEST_BYTE_LIMIT;
+    process.env.LETTA_LOCAL_REQUEST_BYTE_LIMIT = "3000000";
+    try {
+      let providerCalls = 0;
+      const contexts: Context[] = [];
+      const stream: PiStreamFunction = (_model, context) => {
+        providerCalls += 1;
+        contexts.push(context);
+        if (providerCalls === 1) {
+          const error = assistantErrorMessage(
+            "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+          );
+          return streamFromEvents(
+            [{ type: "error", reason: "error", error }],
+            error,
+          );
+        }
+        const finalMessage = assistantMessage();
+        return streamFromEvents(
+          [{ type: "done", reason: "stop", message: finalMessage }],
+          finalMessage,
+        );
+      };
+
+      const adapter = new PiStreamAdapter({
+        stream,
+        onContextWindowOverflow: async () => {
+          throw new Error("Compaction should not run before image elision");
+        },
+      });
+      const baseInput = input();
+      const events = await collectEvents(
+        adapter.stream({
+          ...baseInput,
+          uiMessages: [
+            {
+              id: "ui-msg-env-threshold-image",
+              role: "user",
+              content: [
+                {
+                  type: "image",
+                  mimeType: "image/png",
+                  data: "a".repeat(3_000_001),
+                },
+              ],
+              timestamp: Date.now(),
+            },
+          ],
+        }),
+      );
+
+      expect(providerCalls).toBe(2);
+      expect(contexts[1]?.messages[0]?.content).toEqual([
+        expect.objectContaining({
+          type: "text",
+          text: expect.stringContaining("Image omitted"),
+        }),
+      ]);
+      const imageElisionEvents = events.filter(
+        (event) =>
+          event.type === "letta-chunk" &&
+          (event.chunk as { event_type?: string }).event_type ===
+            "context_image_elision",
+      );
+      expect(imageElisionEvents).toHaveLength(0);
+    } finally {
+      if (previousLimit === undefined) {
+        delete process.env.LETTA_LOCAL_REQUEST_BYTE_LIMIT;
+      } else {
+        process.env.LETTA_LOCAL_REQUEST_BYTE_LIMIT = previousLimit;
+      }
+    }
+  });
+
+  test("adaptively elides images after repeated transport failures below byte limit", async () => {
+    let providerCalls = 0;
+    const contexts: Context[] = [];
+    const stream: PiStreamFunction = (_model, context) => {
+      providerCalls += 1;
+      contexts.push(context);
+      if (providerCalls <= 3) {
+        const error = assistantErrorMessage(
+          "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    const adapter = new PiStreamAdapter({ stream });
+    const baseInput = input();
+    const events = await collectEvents(
+      adapter.stream({
+        ...baseInput,
+        uiMessages: [
+          {
+            id: "ui-msg-under-limit-image",
+            role: "user",
+            content: [
+              {
+                type: "image",
+                mimeType: "image/png",
+                data: "a".repeat(3_000_001),
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      }),
+    );
+
+    expect(providerCalls).toBe(4);
+    expect(
+      contexts.slice(0, 3).map((context) => context.messages[0]?.content),
+    ).toEqual([
+      [expect.objectContaining({ type: "image" })],
+      [expect.objectContaining({ type: "image" })],
+      [expect.objectContaining({ type: "image" })],
+    ]);
+    expect(contexts[3]?.messages[0]?.content).toEqual([
+      expect.objectContaining({
+        type: "text",
+        text: expect.stringContaining("Image omitted"),
+      }),
+    ]);
+    const retryEvents = events.filter(
+      (event) =>
+        event.type === "letta-chunk" &&
+        (event.chunk as { event_type?: string }).event_type === "retry",
+    );
+    expect(retryEvents).toHaveLength(2);
+    const imageElisionEvents = events.filter(
+      (event) =>
+        event.type === "letta-chunk" &&
+        (event.chunk as { event_type?: string }).event_type ===
+          "context_image_elision",
+    );
+    expect(imageElisionEvents).toHaveLength(0);
+    expect(events.some((event) => event.type === "local-message")).toBe(true);
+  });
+
+  test("classifies non-image oversized transport failures as overflow instead of retrying", async () => {
+    let providerCalls = 0;
+    const stream: PiStreamFunction = () => {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        const error = assistantErrorMessage(
+          "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    let overflowError: unknown;
+    const adapter = new PiStreamAdapter({
+      stream,
+      onContextWindowOverflow: async (_input, error) => {
+        overflowError = error;
+        return {
+          uiMessages: [
+            {
+              id: "ui-msg-compacted",
+              role: "user",
+              content: "small",
+              timestamp: Date.now(),
+            },
+          ],
+          summary: "compacted oversized text",
+        };
+      },
+    });
+    const baseInput = input();
+    const events = await collectEvents(
+      adapter.stream({
+        ...baseInput,
+        uiMessages: [
+          {
+            id: "ui-msg-large-text",
+            role: "user",
+            content: "x".repeat(8_000_001),
+            timestamp: Date.now(),
+          },
+        ],
+      }),
+    );
+
+    expect(providerCalls).toBe(2);
+    expect(String(overflowError)).toContain("WebSocket closed 1006");
+    const retryEvents = events.filter(
+      (event) =>
+        event.type === "letta-chunk" &&
+        (event.chunk as { event_type?: string }).event_type === "retry",
+    );
+    expect(retryEvents).toHaveLength(0);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "letta-chunk",
+        chunk: expect.objectContaining({
+          message_type: "event_message",
+          event_type: "compaction",
+        }),
+      }),
+    );
+    expect(events.some((event) => event.type === "local-message")).toBe(true);
+  });
+
+  test("falls back to transient retry when oversized-payload compaction fails", async () => {
+    let providerCalls = 0;
+    const stream: PiStreamFunction = () => {
+      providerCalls += 1;
+      if (providerCalls === 1) {
+        const error = assistantErrorMessage(
+          "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    const adapter = new PiStreamAdapter({
+      stream,
+      onContextWindowOverflow: async () => {
+        // Simulates a summarizer failure (for example the summarization model
+        // call being rejected by the provider).
+        throw new Error("Local compaction failed");
+      },
+    });
+    const baseInput = input();
+    const events = await collectEvents(
+      adapter.stream({
+        ...baseInput,
+        uiMessages: [
+          {
+            id: "ui-msg-large-text",
+            role: "user",
+            content: "x".repeat(8_000_001),
+            timestamp: Date.now(),
+          },
+        ],
+      }),
+    );
+
+    // The retryable transport error must win over the compaction failure:
+    // the turn retries and completes instead of surfacing the summarizer
+    // error as a non-retryable run failure.
+    expect(providerCalls).toBe(2);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "letta-chunk",
+        chunk: expect.objectContaining({
+          message_type: "event_message",
+          event_type: "retry",
+        }),
+      }),
+    );
+    expect(events.some((event) => event.type === "local-message")).toBe(true);
+  });
+
   test("removes OpenAI Responses replay item IDs before provider submission", async () => {
     let sanitizedPayload: unknown;
     const stream: PiStreamFunction = (
@@ -361,6 +940,72 @@ describe("PiStreamAdapter", () => {
     }
   });
 
+  test("preserves max reasoning effort through pi-ai Fable payload", async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), "pi-stream-fable-"));
+    try {
+      await createOrUpdateLocalProvider({
+        storageDir,
+        providerType: "anthropic",
+        providerName: "lc-anthropic",
+        apiKey: "secret-key",
+      });
+
+      let capturedOptions:
+        | (SimpleStreamOptions & Record<string, unknown>)
+        | undefined;
+      const stream: PiStreamFunction = (
+        _model: Model<string>,
+        _context: Context,
+        options?: SimpleStreamOptions & Record<string, unknown>,
+      ) => {
+        capturedOptions = options;
+        const finalMessage = {
+          ...assistantMessage(),
+          api: "anthropic-messages",
+          provider: "anthropic",
+          model: "claude-fable-5",
+        } satisfies AssistantMessage;
+        return streamFromEvents(
+          [{ type: "done", reason: "stop", message: finalMessage }],
+          finalMessage,
+        );
+      };
+
+      const adapter = new PiStreamAdapter({
+        stream,
+        localProviderAuthStorageDir: storageDir,
+      });
+      const baseInput = input();
+      for await (const _event of adapter.stream({
+        ...baseInput,
+        agent: {
+          ...baseInput.agent,
+          model: "anthropic/claude-fable-5",
+          model_settings: {
+            provider_type: "anthropic",
+            effort: "max",
+          },
+        },
+      })) {
+        // drain
+      }
+
+      expect(capturedOptions).toMatchObject({ reasoning: "xhigh" });
+      const rewrittenPayload = await capturedOptions?.onPayload?.(
+        {
+          model: "claude-fable-5",
+          output_config: { effort: "xhigh" },
+        },
+        { id: "claude-fable-5" } as Model<string>,
+      );
+      expect(rewrittenPayload).toMatchObject({
+        output_config: { effort: "max" },
+      });
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
   test("strips trailing assistant messages from context before calling provider", async () => {
     let capturedContext: Context | undefined;
     const stream: PiStreamFunction = (
@@ -414,6 +1059,83 @@ describe("PiStreamAdapter", () => {
     expect(messages).toHaveLength(1);
   });
 
+  test("drops orphan tool results from provider context", async () => {
+    let capturedContext: Context | undefined;
+    const stream: PiStreamFunction = (
+      _model: Model<string>,
+      context: Context,
+    ) => {
+      capturedContext = context;
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    const adapter = new PiStreamAdapter({ stream });
+    const turnInput: ProviderTurnInput = {
+      ...input(),
+      uiMessages: [
+        {
+          id: "ui-msg-1",
+          role: "user",
+          content: "hello",
+          timestamp: Date.now(),
+        },
+        {
+          id: "ui-msg-2",
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "call-valid",
+              name: "Read",
+              arguments: { path: "README.md" },
+            },
+          ],
+          api: "openai-responses" as never,
+          provider: "openai" as never,
+          model: "gpt-5.5",
+          usage: emptyLocalUsage(),
+          stopReason: "toolUse",
+          timestamp: Date.now(),
+        },
+        {
+          id: "ui-msg-3",
+          role: "toolResult",
+          toolCallId: "call-valid",
+          toolName: "Read",
+          content: [{ type: "text", text: "README contents" }],
+          isError: false,
+          timestamp: Date.now(),
+        },
+        {
+          id: "ui-msg-4",
+          role: "toolResult",
+          toolCallId: "call-missing",
+          toolName: "Read",
+          content: [{ type: "text", text: "orphan contents" }],
+          isError: false,
+          timestamp: Date.now(),
+        },
+      ],
+    };
+
+    for await (const _event of adapter.stream(turnInput)) {
+      // drain
+    }
+
+    expect(capturedContext).toBeDefined();
+    // biome-ignore lint/style/noNonNullAssertion: capturedContext is asserted defined on the line above
+    const messages = capturedContext!.messages;
+    expect(JSON.stringify(messages)).toContain("README contents");
+    expect(JSON.stringify(messages)).not.toContain("orphan contents");
+    expect(
+      messages.filter((message) => message.role === "toolResult"),
+    ).toHaveLength(1);
+  });
+
   test("retries retryable Codex transport errors before model output", async () => {
     let calls = 0;
     const stream: PiStreamFunction = () => {
@@ -463,19 +1185,11 @@ describe("PiStreamAdapter", () => {
     expect(events.some((event) => event.type === "local-message")).toBe(true);
   });
 
-  test("retries empty local provider responses before persisting model output", async () => {
+  test("accepts empty successful local provider responses like pi agent loop", async () => {
     let calls = 0;
     const stream: PiStreamFunction = () => {
       calls += 1;
-      if (calls === 1) {
-        const empty = { ...assistantMessage(), content: [] };
-        return streamFromEvents(
-          [{ type: "done", reason: "stop", message: empty }],
-          empty,
-        );
-      }
-
-      const finalMessage = assistantMessage();
+      const finalMessage = { ...assistantMessage(), content: [] };
       return streamFromEvents(
         [{ type: "done", reason: "stop", message: finalMessage }],
         finalMessage,
@@ -488,7 +1202,7 @@ describe("PiStreamAdapter", () => {
       events.push(event);
     }
 
-    expect(calls).toBe(2);
+    expect(calls).toBe(1);
     expect(
       events.some((event) => {
         if (event.type !== "letta-chunk") return false;
@@ -500,11 +1214,229 @@ describe("PiStreamAdapter", () => {
           chunk.message_type === "event_message" && chunk.event_type === "retry"
         );
       }),
-    ).toBe(true);
+    ).toBe(false);
     const localMessages = events.filter(
       (event) => event.type === "local-message",
     );
     expect(localMessages).toHaveLength(1);
-    expect(JSON.stringify(localMessages[0])).toContain("ok");
+    expect(JSON.stringify(localMessages[0])).toContain('"content":[]');
+  });
+
+  test("accepts reasoning-only successful local provider responses like pi agent loop", async () => {
+    const finalMessage = {
+      ...assistantMessage(),
+      content: [{ type: "thinking", thinking: "done thinking" }],
+    } satisfies AssistantMessage;
+    const stream: PiStreamFunction = () =>
+      streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+
+    const adapter = new PiStreamAdapter({ stream });
+    const events: ProviderStreamEvent[] = [];
+    for await (const event of adapter.stream(input())) {
+      events.push(event);
+    }
+
+    const localMessages = events.filter(
+      (event) => event.type === "local-message",
+    );
+    expect(localMessages).toHaveLength(1);
+    expect(JSON.stringify(localMessages[0])).toContain("done thinking");
+  });
+
+  test("maps local ChatGPT priority service tier to pi-ai serviceTier", async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), "pi-stream-chatgpt-fast-"));
+    try {
+      setLocalOAuthProvider({
+        storageDir,
+        providerName: LOCAL_CHATGPT_PROVIDER_NAME,
+        providerType: "chatgpt_oauth",
+        auth: {
+          type: "oauth",
+          access: "access-token",
+          refresh: "refresh-token",
+          idToken: "id-token",
+          expires: Date.now() + 60_000,
+          accountId: "account-id",
+        },
+      });
+
+      let capturedOptions:
+        | (SimpleStreamOptions & Record<string, unknown>)
+        | undefined;
+      const stream: PiStreamFunction = (
+        _model: Model<string>,
+        _context: Context,
+        options?: SimpleStreamOptions & Record<string, unknown>,
+      ) => {
+        capturedOptions = options;
+        const finalMessage = {
+          ...assistantMessage(),
+          api: "openai-codex-responses",
+          provider: "openai-codex",
+          model: "gpt-5.5",
+        } satisfies AssistantMessage;
+        return streamFromEvents(
+          [{ type: "done", reason: "stop", message: finalMessage }],
+          finalMessage,
+        );
+      };
+
+      const adapter = new PiStreamAdapter({
+        stream,
+        localProviderAuthStorageDir: storageDir,
+      });
+      const baseInput = input();
+      for await (const _event of adapter.stream({
+        ...baseInput,
+        agent: {
+          ...baseInput.agent,
+          model: "openai-codex/gpt-5.5",
+          model_settings: {
+            provider_type: "chatgpt_oauth",
+            service_tier: "priority",
+          },
+        },
+      })) {
+        // drain
+      }
+
+      expect(capturedOptions).toMatchObject({ serviceTier: "priority" });
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("emits llm_start and llm_end around a provider request", async () => {
+    const finalMessage: AssistantMessage = {
+      ...assistantMessage(),
+      usage: { ...emptyLocalUsage(), input: 11, output: 7, totalTokens: 18 },
+    };
+    const stream: PiStreamFunction = () =>
+      streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+
+    const starts: LlmStartInfo[] = [];
+    const ends: LlmEndInfo[] = [];
+    const adapter = new PiStreamAdapter({
+      stream,
+      onLlmStart: (info) => {
+        starts.push(info);
+      },
+      onLlmEnd: (info) => {
+        ends.push(info);
+      },
+    });
+    await collectEvents(adapter.stream(input()));
+
+    expect(starts).toHaveLength(1);
+    expect(starts[0]).toMatchObject({
+      agentId: "agent-local-1",
+      conversationId: "local-conv-1",
+      model: "bedrock/us.anthropic.claude-sonnet-4-6",
+      messageCount: 1,
+    });
+    expect(starts[0]?.contextWindow).toBeGreaterThan(0);
+
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      agentId: "agent-local-1",
+      conversationId: "local-conv-1",
+      model: "bedrock/us.anthropic.claude-sonnet-4-6",
+      stopReason: "stop",
+      usage: { promptTokens: 11, completionTokens: 7, totalTokens: 18 },
+    });
+    expect(ends[0]?.durationMs).toBeGreaterThanOrEqual(0);
+  });
+
+  test("emits llm_end for failed and successful provider requests across retries", async () => {
+    let calls = 0;
+    const stream: PiStreamFunction = () => {
+      calls += 1;
+      if (calls === 1) {
+        const error = assistantErrorMessage(
+          "WebSocket closed 1006 Connection ended\nretry-after-ms: 0",
+        );
+        return streamFromEvents(
+          [{ type: "error", reason: "error", error }],
+          error,
+        );
+      }
+      const finalMessage = assistantMessage();
+      return streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+    };
+
+    let startCount = 0;
+    const ends: LlmEndInfo[] = [];
+    const adapter = new PiStreamAdapter({
+      stream,
+      onLlmStart: () => {
+        startCount += 1;
+      },
+      onLlmEnd: (info) => {
+        ends.push(info);
+      },
+    });
+    await collectEvents(adapter.stream(input()));
+
+    expect(calls).toBe(2);
+    expect(startCount).toBe(2);
+    expect(ends).toHaveLength(2);
+    expect(ends[0]).toMatchObject({
+      stopReason: "llm_api_error",
+      usage: null,
+      error: {
+        errorType: "llm_error",
+        retryable: true,
+      },
+    });
+    expect(ends[0]?.error?.message).toContain("WebSocket closed");
+    expect(ends[1]).toMatchObject({
+      stopReason: "stop",
+    });
+    expect(ends[1]?.error).toBeUndefined();
+    expect(ends[1]?.usage).not.toBeNull();
+  });
+
+  test("emits one llm_end with error details for final error messages", async () => {
+    const finalMessage = assistantErrorMessage("usage limit reached");
+    const stream: PiStreamFunction = () =>
+      streamFromEvents(
+        [{ type: "done", reason: "stop", message: finalMessage }],
+        finalMessage,
+      );
+
+    const ends: LlmEndInfo[] = [];
+    const adapter = new PiStreamAdapter({
+      stream,
+      onLlmEnd: (info) => {
+        ends.push(info);
+      },
+    });
+
+    await expect(collectEvents(adapter.stream(input()))).rejects.toThrow(
+      "usage limit reached",
+    );
+
+    expect(ends).toHaveLength(1);
+    expect(ends[0]).toMatchObject({
+      stopReason: "error",
+      usage: {
+        promptTokens: finalMessage.usage.input,
+        completionTokens: finalMessage.usage.output,
+        totalTokens: finalMessage.usage.totalTokens,
+      },
+      error: {
+        message: "usage limit reached",
+        retryable: false,
+      },
+    });
   });
 });

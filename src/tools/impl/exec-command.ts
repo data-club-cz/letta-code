@@ -15,8 +15,10 @@ import { getShellEnv } from "./shell-env.js";
 import {
   buildPowerShellCommand,
   buildShellLaunchers,
+  selectAvailableShellLauncher,
 } from "./shell-launchers.js";
-import { truncateByChars } from "./truncation.js";
+import { applyShellSandbox } from "./shell-sandbox.js";
+import { LIMITS, truncateByChars } from "./truncation.js";
 import { validateRequiredParams } from "./validation.js";
 
 const DEFAULT_EXEC_YIELD_TIME_MS = 10_000;
@@ -26,6 +28,7 @@ const MIN_EMPTY_WRITE_STDIN_YIELD_TIME_MS = 5_000;
 const MAX_YIELD_TIME_MS = 30_000;
 const MAX_EMPTY_WRITE_STDIN_YIELD_TIME_MS = 300_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 10_000;
+const MAX_INLINE_OUTPUT_CHARS = LIMITS.BASH_OUTPUT_CHARS;
 const MAX_SESSION_OUTPUT_CHARS = 1_000_000;
 const EXEC_SESSION_CLEANUP_MS = 5 * 60 * 1000;
 
@@ -52,6 +55,7 @@ interface WriteStdinArgs {
   chars?: string;
   yield_time_ms?: number;
   max_output_tokens?: number;
+  signal?: AbortSignal;
   onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
 }
 
@@ -129,8 +133,35 @@ type ExecOutputChunk = {
 
 const execSessions = new Map<string, ExecSession>();
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function createAbortError(): Error {
+  const error = new Error("The operation was aborted");
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(createAbortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function clampYieldTime(value: number | undefined, fallback: number): number {
@@ -164,7 +195,7 @@ function maxCharsForTokens(maxOutputTokens?: number): number {
     maxOutputTokens && maxOutputTokens > 0
       ? maxOutputTokens
       : DEFAULT_MAX_OUTPUT_TOKENS;
-  return Math.max(1, maxTokens * 4);
+  return Math.min(Math.max(1, maxTokens * 4), MAX_INLINE_OUTPUT_CHARS);
 }
 
 function truncateOutput(text: string, maxOutputTokens?: number): string {
@@ -568,12 +599,14 @@ async function waitForSessionOutput(params: {
   session: ExecSession;
   startOffset: number;
   yieldTimeMs: number;
+  signal?: AbortSignal;
   onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
 }): Promise<{ output: string; wallTimeMs: number }> {
   const startTime = Date.now();
   const deadline = startTime + params.yieldTimeMs;
   let emittedOffset = params.startOffset;
 
+  throwIfAborted(params.signal);
   while (Date.now() < deadline && params.session.status === "running") {
     if (params.onOutput && params.session.output.length > emittedOffset) {
       for (const chunk of getSessionOutputChunks(
@@ -585,8 +618,9 @@ async function waitForSessionOutput(params: {
       }
       emittedOffset = params.session.output.length;
     }
-    await sleep(25);
+    await sleep(25, params.signal);
   }
+  throwIfAborted(params.signal);
 
   if (params.onOutput && params.session.output.length > emittedOffset) {
     for (const chunk of getSessionOutputChunks(
@@ -613,10 +647,20 @@ async function startExecSession(args: ExecCommandArgs): Promise<ExecSession> {
   const cwd = resolveShellWorkdir(args.workdir);
   const env = { ...getShellEnv(), ...(args.secretEnv ?? {}) };
   const launchers = buildExecLaunchers(args);
-  const launcher = launchers[0];
-  if (!launcher) {
+  const rawLauncher = selectAvailableShellLauncher(launchers, env);
+  if (!rawLauncher) {
     throw new Error("Command must be a non-empty string");
   }
+  // Confine the session (pipe or PTY) under the cross-agent shell sandbox.
+  // The spawn helpers re-note the launcher for worktree ownership, but the
+  // wrapper hides the inner shell from that inspection, so note the unwrapped
+  // launcher here first.
+  const sandboxed = applyShellSandbox(rawLauncher, cwd, env);
+  if (sandboxed.backend) {
+    noteExpectedWorktreeForLauncher(rawLauncher, cwd);
+  }
+  const launcher = sandboxed.launcher;
+  const spawnEnv = sandboxed.env;
 
   const session: ExecSession = {
     id,
@@ -636,7 +680,7 @@ async function startExecSession(args: ExecCommandArgs): Promise<ExecSession> {
     processLauncher = spawnProcess({
       launcher,
       cwd,
-      env,
+      env: spawnEnv,
       session,
       outputFile,
     });
@@ -690,6 +734,7 @@ export async function exec_command(
     session,
     startOffset: 0,
     yieldTimeMs,
+    signal: args.signal,
     onOutput: args.onOutput,
   });
 
@@ -731,7 +776,7 @@ export async function write_stdin(
   }
   if (chars) {
     (backgroundProcess.process as ProcessLauncher).write(chars);
-    await sleep(100);
+    await sleep(100, args.signal);
   }
 
   const startOffset = session.readOffset;
@@ -740,6 +785,7 @@ export async function write_stdin(
     session,
     startOffset,
     yieldTimeMs,
+    signal: args.signal,
     onOutput: args.onOutput,
   });
 

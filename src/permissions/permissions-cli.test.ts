@@ -61,7 +61,7 @@ test("Handle whitespace in tool list", () => {
   expect(tools).toEqual(["Bash(:*)", "Read(**)", "Write(**)"]);
 });
 
-test("tracks disable-memory-guard CLI override", () => {
+test("tracks memory guard disabled state", () => {
   expect(cliPermissions.isMemoryGuardDisabled()).toBe(false);
   cliPermissions.setMemoryGuardDisabled(true);
   expect(cliPermissions.isMemoryGuardDisabled()).toBe(true);

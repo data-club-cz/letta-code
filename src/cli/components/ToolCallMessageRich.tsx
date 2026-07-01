@@ -20,11 +20,13 @@ import {
   isSearchTool,
   isShellOutputTool,
   isShellTool,
+  isTaskCrudTool,
   isTaskTool,
   isTodoTool,
 } from "@/cli/helpers/tool-name-mapping.js";
 import { formatUnifiedExecOutputForTui } from "@/cli/helpers/unified-exec-output.js";
 import { INTERRUPTED_BY_USER } from "@/constants";
+import { listTasks } from "@/tools/impl/tasks/store.js";
 import { clipToolReturn } from "@/tools/manager.js";
 import { isRecord } from "@/utils/type-guards";
 import { Text } from "./Text";
@@ -90,16 +92,16 @@ import { useTerminalWidth } from "@/cli/hooks/use-terminal-width";
 import { AdvancedDiffRenderer } from "./AdvancedDiffRenderer";
 import { BlinkDot } from "./BlinkDot.js";
 import { CollapsedOutputDisplay } from "./CollapsedOutputDisplay";
-import {
-  CreateWorktreeResultRenderer,
-  parseCreateWorktreeResult,
-} from "./CreateWorktreeResultRenderer.js";
 import { colors } from "./colors.js";
 import {
   EditRenderer,
   MultiEditRenderer,
   WriteRenderer,
 } from "./DiffRenderer.js";
+import {
+  EnterWorktreeResultRenderer,
+  parseEnterWorktreeResult,
+} from "./EnterWorktreeResultRenderer.js";
 import { MarkdownDisplay } from "./MarkdownDisplay.js";
 import { MemoryDiffRenderer } from "./MemoryDiffRenderer.js";
 import { PlanRenderer } from "./PlanRenderer.js";
@@ -468,6 +470,28 @@ export const ToolCallMessage = memo(
           }
         }
 
+        // Task CRUD family: after any TaskCreate/TaskUpdate/TaskList call,
+        // snapshot the current task store and render as a todo list so users
+        // see the live task state instead of raw JSON.
+        if (isTaskCrudTool(rawName) && line.resultOk !== false) {
+          try {
+            const tasks = listTasks();
+            if (tasks.length > 0) {
+              const safeTodos = tasks.map((t) => ({
+                content: t.subject,
+                status: (t.status === "deleted" ? "completed" : t.status) as
+                  | "pending"
+                  | "in_progress"
+                  | "completed",
+                id: t.taskId,
+              }));
+              return <TodoRenderer todos={safeTodos} />;
+            }
+          } catch {
+            // Fall through to regular rendering if store access fails
+          }
+        }
+
         // Check if this is an update_plan tool with successful result
         if (
           isPlanTool(rawName, displayName) &&
@@ -553,11 +577,11 @@ export const ToolCallMessage = memo(
           // Fall through to regular handling if parsing fails
         }
 
-        // Check if this is CreateWorktree - show a compact structured summary
+        // Check if this is EnterWorktree - show a compact structured summary
         // instead of the full instructional tool return.
-        if (rawName === "CreateWorktree" && line.resultOk !== false) {
-          if (parseCreateWorktreeResult(extractedText)) {
-            return <CreateWorktreeResultRenderer resultText={extractedText} />;
+        if (rawName === "EnterWorktree" && line.resultOk !== false) {
+          if (parseEnterWorktreeResult(extractedText)) {
+            return <EnterWorktreeResultRenderer resultText={extractedText} />;
           }
         }
 
