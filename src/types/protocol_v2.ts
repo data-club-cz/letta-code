@@ -1276,6 +1276,8 @@ export interface MemoryFileEntry {
   content: string;
   size: number;
   references?: string[];
+  kind?: "markdown" | "image";
+  mime_type?: string | null;
 }
 
 export interface ListMemoryResponseMessage {
@@ -2795,6 +2797,7 @@ export type WsProtocolCommand =
 export type WsProtocolCommandType = WsProtocolCommand["type"];
 
 export type WsProtocolMessage =
+  | ControlRequest
   | DeviceStatusUpdateMessage
   | LoopStatusUpdateMessage
   | QueueUpdateMessage

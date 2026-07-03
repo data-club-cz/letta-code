@@ -63,6 +63,7 @@ export interface ModBackgroundAgentContext {
   type: string;
   status: string;
   durationMs: number;
+  agentId: string | null;
 }
 
 export interface ModUiCapabilities {
@@ -430,6 +431,7 @@ export interface ModContext {
   workspace: ModWorkspaceContext;
   cwd: string;
   sessionId: string | null;
+  conversationSummary: string | null;
   lastRunId: string | null;
   agent: ModAgentContext;
   model: ModModelContext;

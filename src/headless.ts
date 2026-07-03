@@ -44,10 +44,8 @@ import {
   resolveModel,
 } from "./agent/model";
 import { updateAgentLLMConfig, updateAgentSystemPrompt } from "./agent/modify";
-import {
-  buildCreateAgentOptionsForPersonality,
-  resolvePersonalityId,
-} from "./agent/personality";
+import { buildCreateAgentOptionsForPersonality } from "./agent/personality";
+import { resolvePersonalityId } from "./agent/personality-presets";
 import type { MemoryPromptMode } from "./agent/prompt-assets";
 import { resolveSkillSourcesSelection } from "./agent/skill-sources";
 import type { SkillSource } from "./agent/skills";
@@ -58,10 +56,6 @@ import {
   type ConversationMessageStreamBody,
   getBackend,
 } from "./backend";
-import {
-  isLocalBackendNoMemfsEnvEnabled,
-  LOCAL_BACKEND_NO_MEMFS_ENV,
-} from "./backend/local/paths";
 import type { ParsedCliArgs } from "./cli/args";
 import {
   normalizeConversationShorthandFlags,
@@ -809,13 +803,19 @@ export async function handleHeadlessCommand(
   const noBundledSkillsFlag = values["no-bundled-skills"];
   const skillSourcesRaw = values["skill-sources"];
   const memfsFlag = values.memfs;
-  const noMemfsFlag = values["no-memfs"];
-  const localNoMemfsRequested = Boolean(
-    backend.capabilities.localMemfs &&
-      (noMemfsFlag || isLocalBackendNoMemfsEnvEnabled()),
-  );
-  if (localNoMemfsRequested) {
-    process.env[LOCAL_BACKEND_NO_MEMFS_ENV] = "1";
+  // Newly created subagents are ephemeral and deliberately stateless: they
+  // never get memfs (no repo clone per spawn). This role-based carve-out is
+  // the only supported non-memfs path — there is no user-facing opt-out.
+  // Fork/recall subagents deploy an EXISTING (memfs-tagged) agent instead of
+  // creating one (`--agent`/`--conv`, not `--new-agent`), so they keep their
+  // memory: the tag-driven sync below handles them like any other agent.
+  const isSubagentRole = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
+  const isStatelessSubagent = isSubagentRole && Boolean(values["new-agent"]);
+  if (isStatelessSubagent && backend.capabilities.localMemfs) {
+    const { disableLocalBackendMemfsForProcess } = await import(
+      "@/backend/local/paths"
+    );
+    disableLocalBackendMemfsForProcess();
   }
   // Startup policy for the git-backed memory pull on session init.
   // "blocking" (default): await the pull before proceeding.
@@ -826,11 +826,9 @@ export async function handleHeadlessCommand(
     memfsStartupRaw === "background" || memfsStartupRaw === "skip"
       ? memfsStartupRaw
       : "blocking";
-  const requestedMemoryPromptMode: "memfs" | "standard" | undefined = memfsFlag
+  const requestedMemoryPromptMode: "memfs" | undefined = memfsFlag
     ? "memfs"
-    : noMemfsFlag || localNoMemfsRequested
-      ? "standard"
-      : undefined;
+    : undefined;
   if (memfsFlag && !backend.capabilities.remoteMemfs) {
     trackHeadlessBoundaryError(
       "headless_memfs_unsupported_backend",
@@ -840,8 +838,7 @@ export async function handleHeadlessCommand(
     console.error("Error: --memfs is not supported by this backend yet");
     process.exit(1);
   }
-  const shouldAutoEnableMemfsForNewAgent =
-    !memfsFlag && !noMemfsFlag && !localNoMemfsRequested;
+  const shouldAutoEnableMemfsForNewAgent = !memfsFlag && !isStatelessSubagent;
   const fromAfFile = resolveImportFlagAlias({
     importFlagValue: values.import,
     fromAfFlagValue: values["from-af"],
@@ -1148,7 +1145,6 @@ export async function handleHeadlessCommand(
         modelOverride: model,
         stripMessages: true,
         stripSkills: false,
-        enableMemfs: noMemfsFlag || localNoMemfsRequested ? false : memfsFlag,
       });
     } else {
       // Import from local file
@@ -1158,7 +1154,6 @@ export async function handleHeadlessCommand(
         modelOverride: model,
         stripMessages: true,
         stripSkills: false,
-        enableMemfs: noMemfsFlag || localNoMemfsRequested ? false : memfsFlag,
       });
     }
 
@@ -1220,7 +1215,7 @@ export async function handleHeadlessCommand(
       (await isLettaCloud());
     const effectiveMemoryMode: MemoryPromptMode | undefined = backend
       .capabilities.localMemfs
-      ? localNoMemfsRequested
+      ? isStatelessSubagent
         ? "standard"
         : "local-memfs"
       : (requestedMemoryPromptMode ??
@@ -1385,7 +1380,7 @@ export async function handleHeadlessCommand(
       "@/agent/memory-filesystem"
     );
     const memfsEnabled = await hydrateMemfsSettingFromAgent(agent);
-    if (!memfsEnabled && !noMemfsFlag && (await isLettaCloud())) {
+    if (!memfsEnabled && !isStatelessSubagent && (await isLettaCloud())) {
       // Auto-enable memfs for existing agents that don't have it yet.
       // Matches interactive mode behavior where memfs defaults to enabled.
       startupMemfsFlag = true;
@@ -1410,15 +1405,13 @@ export async function handleHeadlessCommand(
   //   "skip"                 – skip the pull this session.
   if (!backend.capabilities.remoteMemfs) {
     if (backend.capabilities.localMemfs) {
-      settingsManager.setMemfsEnabled(agent.id, !localNoMemfsRequested);
-    } else if (noMemfsFlag || localNoMemfsRequested) {
-      settingsManager.setMemfsEnabled(agent.id, false);
+      settingsManager.setMemfsEnabled(agent.id, !isStatelessSubagent);
     }
   } else if (memfsStartupPolicy === "skip") {
-    // Run enable/disable logic but skip the git pull.
+    // Run enable logic but skip the git pull.
     try {
       const { applyMemfsFlags } = await import("@/agent/memory-filesystem");
-      await applyMemfsFlags(agent.id, startupMemfsFlag, noMemfsFlag, {
+      await applyMemfsFlags(agent.id, startupMemfsFlag, {
         pullOnExistingRepo: false,
         agentTags: agent.tags,
         skipPromptUpdate: forceNew,
@@ -1437,7 +1430,7 @@ export async function handleHeadlessCommand(
   } else if (memfsStartupPolicy === "background") {
     // Fire pull async; don't block session initialisation.
     const { applyMemfsFlags } = await import("@/agent/memory-filesystem");
-    memfsBgPromise = applyMemfsFlags(agent.id, startupMemfsFlag, noMemfsFlag, {
+    memfsBgPromise = applyMemfsFlags(agent.id, startupMemfsFlag, {
       pullOnExistingRepo: true,
       agentTags: agent.tags,
       skipPromptUpdate: forceNew,
@@ -1456,16 +1449,11 @@ export async function handleHeadlessCommand(
     // "blocking" — original behaviour.
     try {
       const { applyMemfsFlags } = await import("@/agent/memory-filesystem");
-      const memfsResult = await applyMemfsFlags(
-        agent.id,
-        startupMemfsFlag,
-        noMemfsFlag,
-        {
-          pullOnExistingRepo: true,
-          agentTags: agent.tags,
-          skipPromptUpdate: forceNew,
-        },
-      );
+      const memfsResult = await applyMemfsFlags(agent.id, startupMemfsFlag, {
+        pullOnExistingRepo: true,
+        agentTags: agent.tags,
+        skipPromptUpdate: forceNew,
+      });
       if (memfsResult.pullSummary?.includes("CONFLICT")) {
         trackHeadlessBoundaryError(
           "headless_memfs_conflict",
@@ -3291,6 +3279,7 @@ async function runBidirectionalMode(
       conversationId,
       memfsEnabled: settingsManager.isMemfsEnabled(agent.id),
       triggerSource,
+      reflectionSettings,
       description: AUTO_REFLECTION_DESCRIPTION,
       systemPrompt: agent.system ?? undefined,
       recompileByConversation: systemPromptRecompileByConversation,
