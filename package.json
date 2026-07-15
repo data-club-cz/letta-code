@@ -11,6 +11,8 @@
     "LICENSE",
     "README.md",
     "letta.js",
+    "amazon-bedrock.js",
+    "amazon-bedrock.js.map",
     "scripts",
     "skills",
     "vendor",

@@ -79,6 +79,40 @@ if (process.platform !== "win32") {
   await Bun.$`chmod +x letta.js`;
 }
 
+// ── Node-only provider sidecars ──────────────────────────────────────────────
+// pi-ai loads the AWS Bedrock provider through an indirect dynamic import
+// (`importNodeOnlyProvider("./amazon-bedrock.ts")`) so its Node-only AWS SDK /
+// SigV4 stack stays out of the main (edge-safe) bundle. Bun can't statically
+// analyse that indirect import, so it leaves a runtime `import("./amazon-bedrock.js")`
+// in letta.js that resolves *next to letta.js*. We must therefore emit that
+// sidecar here. This is required for the `local` backend's client-side Bedrock
+// inference (Pi). The `api` backend never loads it — the Letta server does
+// inference there — which is why this gap was invisible until the local-backend
+// migration. Without this file, a local-backend Bedrock turn fails at runtime
+// with "Cannot find module .../amazon-bedrock.js".
+const bedrockProviderEntry = join(
+  __dirname,
+  "node_modules/@earendil-works/pi-ai/dist/providers/amazon-bedrock.js",
+);
+if (existsSync(bedrockProviderEntry)) {
+  await Bun.build({
+    entrypoints: [bedrockProviderEntry],
+    outdir: ".",
+    target: "node",
+    format: "esm",
+    minify: false,
+    sourcemap: "external",
+    naming: { entry: "amazon-bedrock.js" },
+    external: ["ws", "@vscode/ripgrep", "node-pty", "grammy"],
+  });
+  console.log("🪣 Built node-only Bedrock provider sidecar: amazon-bedrock.js");
+} else {
+  console.warn(
+    `⚠️  Bedrock provider not found at ${bedrockProviderEntry} — ` +
+      "local-backend Bedrock inference will fail until it is built.",
+  );
+}
+
 await Bun.build({
   entrypoints: ["./src/app-server-client.ts"],
   outdir: "./dist",

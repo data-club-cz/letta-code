@@ -15,7 +15,12 @@ function printUsage(): void {
     `
 Usage:
   letta agents list [options]
+  letta agents get --agent <id>
   letta agents create [options]
+
+Get Options:
+  --agent <id>          Agent ID to retrieve (prints JSON; exit 3 if not found)
+  --agent-id <id>       Alias for --agent
 
 List Options:
   --name <name>         Exact name match
@@ -59,6 +64,8 @@ function parseTags(value: unknown): string[] | undefined {
 
 const AGENTS_OPTIONS = {
   help: { type: "boolean", short: "h" },
+  agent: { type: "string" },
+  "agent-id": { type: "string" },
   name: { type: "string" },
   query: { type: "string" },
   tags: { type: "string" },
@@ -104,6 +111,10 @@ export async function runAgentsSubcommand(argv: string[]): Promise<number> {
 
   if (action === "list") {
     return runListAction(parsed.values);
+  }
+
+  if (action === "get") {
+    return runGetAction(parsed.values);
   }
 
   console.error(`Unknown action: ${action}`);
@@ -183,6 +194,41 @@ async function runCreateAction(
     return 0;
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
+    return 1;
+  }
+}
+
+// Retrieve one agent by id and print it as JSON. Added for AI Hub's
+// server-less local-backend integration: the headless/SDK transport has no
+// agent-retrieve call, so AI Hub shells out to this action to validate agent
+// ids at admin-registration time. Exit codes: 0 = found (JSON on stdout),
+// 3 = not found, 1 = other error. Works on both backends via getBackend().
+async function runGetAction(
+  values: ReturnType<typeof parseAgentsArgs>["values"],
+): Promise<number> {
+  await settingsManager.initialize();
+
+  const agentId =
+    (typeof values.agent === "string" && values.agent) ||
+    (typeof values["agent-id"] === "string" && values["agent-id"]) ||
+    "";
+  if (!agentId) {
+    console.error("Missing agent id. Pass --agent <id> or --agent-id <id>.");
+    return 1;
+  }
+
+  try {
+    const agent = await getBackend().retrieveAgent(agentId);
+    console.log(JSON.stringify(agent, null, 2));
+    return 0;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const name = error instanceof Error ? error.name : "";
+    if (/not.?found/i.test(message) || /NotFound/i.test(name)) {
+      console.error(message);
+      return 3;
+    }
+    console.error(message);
     return 1;
   }
 }

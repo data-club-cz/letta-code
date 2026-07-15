@@ -49,6 +49,8 @@ Usage:
   letta messages search --query <text> [options]
   letta messages list [options]
   letta messages transcript --conversation <id> [options]
+  letta messages fork --conversation <id> [--agent <id>] [--hidden]
+  letta messages info --conversation <id>
 
 Search options:
   --query <text>        Search query (required)
@@ -149,6 +151,7 @@ const MESSAGES_OPTIONS = {
   order: { type: "string" },
   conversation: { type: "string" },
   "conversation-id": { type: "string" },
+  hidden: { type: "boolean" },
   "max-pages": { type: "string" },
   out: { type: "string" },
   output: { type: "string" },
@@ -537,6 +540,87 @@ export async function runMessagesSubcommand(
           2,
         ),
       );
+      return 0;
+    }
+
+    if (action === "info") {
+      // Retrieve one conversation's metadata as JSON. Added for AI Hub's
+      // server-less local-backend integration (same rationale as `fork`
+      // below): admin validation needs conversation → agent_id resolution and
+      // the headless/SDK transport has no conversation-retrieve call.
+      // Exit codes: 0 = found, 3 = not found, 1 = other error.
+      const conversationId =
+        parsed.values.conversation || parsed.values["conversation-id"];
+
+      if (!conversationId || typeof conversationId !== "string") {
+        console.error(
+          "Missing conversation id. Pass --conversation <id> or --conversation-id <id>.",
+        );
+        return 1;
+      }
+
+      try {
+        const conv = await backend.retrieveConversation(conversationId);
+        console.log(
+          JSON.stringify(
+            {
+              id: conv.id,
+              agent_id: conv.agent_id,
+              summary: conv.summary ?? null,
+            },
+            null,
+            2,
+          ),
+        );
+        return 0;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const name = error instanceof Error ? error.name : "";
+        if (/not.?found/i.test(message) || /NotFound/i.test(name)) {
+          console.error(message);
+          return 3;
+        }
+        console.error(message);
+        return 1;
+      }
+    }
+
+    if (action === "fork") {
+      // Fork an existing conversation into a new one (clones the transcript).
+      // Backend-agnostic: uses `backend.forkConversation` — the same call the
+      // TUI `/fork` slash command makes — so it works on both the `api` and the
+      // (server-less) `local` backend. Added for AI Hub, which drives Letta Code
+      // headlessly via the SDK: the SDK/headless stream-json transport exposes no
+      // fork, so AI Hub shells out to this subcommand. Prints `{ "id": "<newId>" }`
+      // on stdout for the caller to parse.
+      const conversationId =
+        parsed.values.conversation || parsed.values["conversation-id"];
+
+      if (!conversationId || typeof conversationId !== "string") {
+        console.error(
+          "Missing conversation id. Pass --conversation <id> or --conversation-id <id>.",
+        );
+        return 1;
+      }
+
+      const agentId = getAgentId(
+        parsed.values.agent,
+        parsed.values["agent-id"],
+      );
+
+      if (conversationId === "default" && !agentId) {
+        console.error(
+          'Conversation "default" requires an agent id. Set LETTA_AGENT_ID or pass --agent/--agent-id.',
+        );
+        return 1;
+      }
+
+      const forked = await backend.forkConversation(conversationId, {
+        ...(agentId ? { agentId } : {}),
+        ...(parsed.values.hidden === true ? { hidden: true } : {}),
+      });
+
+      console.log(JSON.stringify({ id: forked.id, agent_id: agentId || null }));
       return 0;
     }
 
