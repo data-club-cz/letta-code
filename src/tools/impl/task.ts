@@ -6,25 +6,55 @@
  */
 
 import { getConversationId, getCurrentAgentId } from "@/agent/context";
+import { getScopedMemoryFilesystemRoot } from "@/agent/memory-filesystem";
 import {
   completeSubagent,
   generateSubagentId,
   getSnapshot as getSubagentSnapshot,
   getSubagentToolCount,
   registerSubagent,
+  updateSubagent,
 } from "@/agent/subagent-state.js";
 import {
   clearSubagentConfigCache,
   discoverSubagents,
   getAllSubagentConfigs,
+  type SubagentConfig,
+  type SubagentMemoryScope,
 } from "@/agent/subagents";
+import {
+  waitForBackgroundSubagentAgentId,
+  waitForBackgroundSubagentLink,
+} from "@/agent/subagents/background-link";
+import { forkParentConversation } from "@/agent/subagents/fork-conversation";
 import { spawnSubagent } from "@/agent/subagents/manager";
 import { getBackend } from "@/backend";
 import { runSubagentStopHooks } from "@/hooks";
-import { getCurrentWorkingDirectory } from "@/runtime-context";
+import {
+  getCurrentWorkingDirectory,
+  getRuntimeActingUserAttribution,
+} from "@/runtime-context";
+import type {
+  SubagentLaunchArgs,
+  SubagentLaunchResult,
+} from "@/types/subagent-protocol";
 import { addToMessageQueue } from "@/utils/message-queue-bridge.js";
-import { sleep } from "@/utils/sleep";
-import { formatTaskNotification } from "@/utils/task-notifications.js";
+import {
+  formatTaskNotification,
+  resolveNotificationScope,
+} from "@/utils/task-notifications.js";
+import {
+  createExternalCodingAgentConfig,
+  isExternalCodingAgentType,
+  resolveExternalCodingAgentMcpReminder,
+  runExternalCodingAgent,
+  validateExternalCodingAgentMcpOptions,
+} from "./external-coding-agent";
+import { copyGitHubPullRequestTags } from "./github-pull-request-tracker.js";
+import {
+  ensureMemoryRepair,
+  runBackgroundMemoryTask,
+} from "./memory-task-lifecycle";
 import {
   appendToOutputFile,
   assertBackgroundTaskCapacity,
@@ -33,21 +63,17 @@ import {
   createBackgroundOutputFile,
   getNextTaskId,
   scheduleBackgroundTaskCleanup,
-  setBackgroundTaskOutput,
 } from "./process_manager.js";
+import {
+  buildTaskResultHeader,
+  writeTaskTranscriptResult,
+  writeTaskTranscriptStart,
+} from "./task-transcript";
 import { LIMITS, truncateByChars } from "./truncation.js";
 import { validateRequiredParams } from "./validation";
 
-interface TaskArgs {
+interface TaskArgs extends Partial<SubagentLaunchArgs> {
   command?: "run" | "refresh";
-  subagent_type?: string;
-  prompt?: string;
-  description?: string;
-  model?: string;
-  agent_id?: string; // Deploy an existing agent instead of creating new
-  conversation_id?: string; // Resume from an existing conversation
-  run_in_background?: boolean; // Run the task in background
-  max_turns?: number; // Maximum number of agentic turns
   toolCallId?: string; // Injected by executeTool for linking subagent to parent tool call
   signal?: AbortSignal; // Injected by executeTool for interruption handling
   parentScope?: { agentId: string; conversationId: string }; // Injected by executeTool for notification routing
@@ -55,39 +81,46 @@ interface TaskArgs {
 
 // Valid subagent_types when deploying an existing agent
 const VALID_DEPLOY_TYPES = new Set(["general-purpose"]);
-const BACKGROUND_STARTUP_POLL_MS = 50;
 
-type TaskRunResult = {
-  agentId: string;
-  conversationId?: string;
-  report: string;
-  success: boolean;
-  error?: string;
-  totalTokens?: number;
-  stepCount?: number;
-  durationMs?: number;
-};
+export {
+  waitForBackgroundSubagentAgentId,
+  waitForBackgroundSubagentConversationId,
+  waitForBackgroundSubagentLink,
+} from "@/agent/subagents/background-link";
 
 export interface SpawnBackgroundSubagentTaskArgs {
   subagentType: string;
+  /** Configuration resolved by the caller; omitted by legacy internal callers. */
+  config?: SubagentConfig;
+  /** User-facing task type; execution still uses subagentType. */
+  displayType?: string;
   prompt: string;
   description: string;
   model?: string;
+  /** Replace the subagent's configured system prompt/persona (advanced). */
+  systemPromptOverride?: string;
   toolCallId?: string;
   existingAgentId?: string;
   existingConversationId?: string;
+  /** Identity for this child's initial input only. */
+  clientMessageId?: string;
   maxTurns?: number;
   forkedContext?: boolean;
   /** Parent conversation scope for routing notifications in listener mode. */
   parentScope?: { agentId: string; conversationId: string };
-  /**
-   * Optional path to a transcript/payload file the subagent should read.
-   * Exposed to the child process as the `TRANSCRIPT_PATH` env var so
-   * prompts can reference `$TRANSCRIPT_PATH` (resolved via Bash) instead
-   * of interpolating an absolute path. Currently used by reflection
-   * subagents.
-   */
+  /** Authenticated Cloud user responsible for the launch-time turn. */
+  /** Null explicitly suppresses fallback to an ambient runtime actor. */
+  actingUserId?: string | null;
+  /** Transcript/payload file exposed as TRANSCRIPT_PATH for reflection prompts. */
   transcriptPath?: string;
+  /** Optional exact memory scope for harness-created memory worktrees. */
+  memoryScope?: SubagentMemoryScope;
+  /**
+   * Optional computer selector passed to the child as `--computer`.
+   * The child routes its turn to that connected computer and fails fast
+   * if the device is offline, ambiguous, or too old to support routing.
+   */
+  environment?: string;
   /**
    * When true, skip injecting the completion notification into the primary
    * agent's message queue and hide from SubagentGroupDisplay.
@@ -95,6 +128,12 @@ export interface SpawnBackgroundSubagentTaskArgs {
    * into the agent's context.
    */
   silentCompletion?: boolean;
+  /**
+   * Harness-triggered conflict repair: the attempt token from
+   * `claimMemoryConflictRepair`. The worker records its outcome under it and
+   * skips if another worker already resolved the conflict.
+   */
+  memoryRepairToken?: string;
   /**
    * Emit a completion notification even when `silentCompletion` is true.
    * Useful when the parent should not stream subagent tokens but still wants
@@ -122,6 +161,7 @@ export interface SpawnBackgroundSubagentTaskArgs {
     error?: string;
     agentId?: string;
     conversationId?: string;
+    model?: string;
     stepCount?: number;
     durationMs?: number;
     report?: string;
@@ -141,6 +181,7 @@ export interface SpawnBackgroundSubagentTaskResult {
 
 interface SpawnBackgroundSubagentTaskDeps {
   spawnSubagentImpl: typeof spawnSubagent;
+  copyGitHubPullRequestTagsImpl: typeof copyGitHubPullRequestTags;
   addToMessageQueueImpl: typeof addToMessageQueue;
   formatTaskNotificationImpl: typeof formatTaskNotification;
   runSubagentStopHooksImpl: typeof runSubagentStopHooks;
@@ -170,143 +211,6 @@ async function resolveCompletionSummary(
   return trimmed.length > 0 ? trimmed : defaultSummary;
 }
 
-function buildTaskResultHeader(
-  subagentType: string,
-  subagentId: string,
-  result?: Pick<TaskRunResult, "agentId" | "conversationId">,
-  status?: "success" | "error",
-): string {
-  return [
-    `subagent_type=${subagentType}`,
-    `subagent_id=${subagentId}`,
-    status ? `subagent_status=${status}` : undefined,
-    result?.agentId ? `agent_id=${result.agentId}` : undefined,
-    result?.conversationId
-      ? `conversation_id=${result.conversationId}`
-      : undefined,
-  ]
-    .filter(Boolean)
-    .join(" ");
-}
-
-function writeTaskTranscriptStart(
-  outputFile: string,
-  description: string,
-  subagentType: string,
-): void {
-  appendToOutputFile(
-    outputFile,
-    `[Task started: ${description}]\n[subagent_type: ${subagentType}]\n\n`,
-  );
-}
-
-function writeTaskTranscriptResult(
-  outputFile: string,
-  result: TaskRunResult,
-  header: string,
-): void {
-  if (result.success) {
-    appendToOutputFile(
-      outputFile,
-      `${header}\n\n${result.report}\n\n[Task completed]\n`,
-    );
-    return;
-  }
-
-  appendToOutputFile(
-    outputFile,
-    `${header ? `${header}\n\n` : ""}[error] ${result.error || "Subagent execution failed"}\n\n[Task failed]\n`,
-  );
-}
-
-function resolveParentScope(parentScope?: {
-  agentId: string;
-  conversationId: string;
-}): { agentId: string; conversationId: string } | undefined {
-  if (parentScope?.agentId) {
-    return {
-      agentId: parentScope.agentId,
-      conversationId: parentScope.conversationId || "default",
-    };
-  }
-
-  try {
-    return {
-      agentId: getCurrentAgentId(),
-      conversationId: getConversationId() ?? "default",
-    };
-  } catch {
-    return undefined;
-  }
-}
-
-/**
- * Wait briefly for a background subagent to publish its agent URL.
- * This keeps Task mostly non-blocking while allowing static transcript rows
- * to include an ADE link in the common case.
- */
-export async function waitForBackgroundSubagentLink(
-  subagentId: string,
-  timeoutMs: number | null = null,
-  signal?: AbortSignal,
-): Promise<void> {
-  const deadline =
-    timeoutMs !== null && timeoutMs > 0 ? Date.now() + timeoutMs : null;
-
-  while (true) {
-    if (signal?.aborted) {
-      return;
-    }
-
-    const agent = getSubagentSnapshot().agents.find((a) => a.id === subagentId);
-    if (!agent) {
-      return;
-    }
-    if (agent.agentURL) {
-      return;
-    }
-    if (agent.status === "error" || agent.status === "completed") {
-      return;
-    }
-    if (deadline !== null && Date.now() >= deadline) {
-      return;
-    }
-
-    await sleep(BACKGROUND_STARTUP_POLL_MS);
-  }
-}
-
-export async function waitForBackgroundSubagentAgentId(
-  subagentId: string,
-  timeoutMs: number | null = null,
-  signal?: AbortSignal,
-): Promise<string | null> {
-  const deadline =
-    timeoutMs !== null && timeoutMs > 0 ? Date.now() + timeoutMs : null;
-
-  while (true) {
-    if (signal?.aborted) {
-      return null;
-    }
-
-    const agent = getSubagentSnapshot().agents.find((a) => a.id === subagentId);
-    if (!agent) {
-      return null;
-    }
-    if (agent.agentId) {
-      return agent.agentId;
-    }
-    if (agent.status === "error" || agent.status === "completed") {
-      return agent.agentId ?? null;
-    }
-    if (deadline !== null && Date.now() >= deadline) {
-      return agent.agentId ?? null;
-    }
-
-    await sleep(BACKGROUND_STARTUP_POLL_MS);
-  }
-}
-
 /**
  * Spawn a background subagent task and return task metadata immediately.
  * Notification/hook behavior is identical to Task's background path.
@@ -314,32 +218,51 @@ export async function waitForBackgroundSubagentAgentId(
 export function spawnBackgroundSubagentTask(
   args: SpawnBackgroundSubagentTaskArgs,
 ): SpawnBackgroundSubagentTaskResult {
+  if (args.subagentType === "memory" && args.environment?.trim()) {
+    throw new Error(
+      "Memory workers must run on the current machine; omit computer.",
+    );
+  }
   assertBackgroundTaskCapacity();
 
   const {
     subagentType,
+    displayType,
     prompt,
     description,
     model,
+    systemPromptOverride,
     toolCallId,
     existingAgentId,
     existingConversationId,
     maxTurns,
     forkedContext,
     parentScope,
-    silentCompletion,
+    actingUserId: explicitActingUserId,
+    silentCompletion: requestedSilentCompletion,
     emitCompletionNotification,
     completionSummary,
     onComplete,
     transcriptPath,
+    memoryScope,
+    environment,
     deps,
   } = args;
+  const silentCompletion =
+    subagentType === "memory" || requestedSilentCompletion;
   const shouldEmitCompletionNotification =
-    emitCompletionNotification ?? !silentCompletion;
+    subagentType !== "memory" &&
+    (emitCompletionNotification ?? !silentCompletion);
 
-  const resolvedParentScope = resolveParentScope(parentScope);
+  const resolvedParentScope = resolveNotificationScope(parentScope);
+  const actingUserId =
+    explicitActingUserId === undefined
+      ? getRuntimeActingUserAttribution()
+      : explicitActingUserId;
 
   const spawnSubagentFn = deps?.spawnSubagentImpl ?? spawnSubagent;
+  const copyGitHubPullRequestTagsFn =
+    deps?.copyGitHubPullRequestTagsImpl ?? copyGitHubPullRequestTags;
   const addToMessageQueueFn = deps?.addToMessageQueueImpl ?? addToMessageQueue;
   const formatTaskNotificationFn =
     deps?.formatTaskNotificationImpl ?? formatTaskNotification;
@@ -355,7 +278,7 @@ export function spawnBackgroundSubagentTask(
   const subagentId = generateSubagentIdFn();
   registerSubagentFn(
     subagentId,
-    subagentType,
+    displayType ?? subagentType,
     description,
     toolCallId,
     true,
@@ -371,12 +294,15 @@ export function spawnBackgroundSubagentTask(
   const bgTask: BackgroundTask = {
     description,
     subagentType,
+    displayType,
     subagentId,
     status: "running",
-    output: [],
     startTime: new Date(),
     outputFile,
     abortController,
+    remote: Boolean(environment),
+    runtimeScope: resolvedParentScope,
+    actingUserId,
   };
   backgroundTasks.set(taskId, bgTask);
   writeTaskTranscriptStart(outputFile, description, subagentType);
@@ -391,21 +317,79 @@ export function spawnBackgroundSubagentTask(
   // is the authoritative value — the listener and App.tsx both derive it
   // from their own closure-captured agentId.
   const parentAgentIdForSpawn = resolvedParentScope?.agentId;
-  spawnSubagentFn(
-    subagentType,
-    prompt,
-    model,
-    subagentId,
-    abortController.signal,
-    existingAgentId,
-    existingConversationId,
-    maxTurns,
-    forkedContext,
-    parentAgentIdForSpawn,
-    transcriptPath,
-    resolvedParentScope?.conversationId,
-  )
+  const workerMemoryDir =
+    subagentType === "memory" && resolvedParentScope
+      ? (memoryScope?.primaryRoot ??
+        getScopedMemoryFilesystemRoot(resolvedParentScope.agentId))
+      : undefined;
+  const effectiveMemoryScope =
+    memoryScope ??
+    (workerMemoryDir
+      ? { primaryRoot: workerMemoryDir, writableRoots: [workerMemoryDir] }
+      : undefined);
+  const execute = (
+    assignment = prompt,
+    parentTranscript = transcriptPath,
+    scope = effectiveMemoryScope,
+  ) => {
+    return spawnSubagentFn(
+      subagentType,
+      assignment,
+      model,
+      subagentId,
+      abortController.signal,
+      existingAgentId,
+      existingConversationId,
+      maxTurns,
+      forkedContext,
+      parentAgentIdForSpawn,
+      parentTranscript,
+      resolvedParentScope?.conversationId,
+      scope,
+      systemPromptOverride,
+      environment,
+      actingUserId,
+      args.config,
+      args.clientMessageId,
+    );
+  };
+  const memoryTask =
+    subagentType === "memory" && resolvedParentScope && workerMemoryDir
+      ? runBackgroundMemoryTask({
+          ...resolvedParentScope,
+          memoryDir: workerMemoryDir,
+          assignment: prompt,
+          repairToken: args.memoryRepairToken,
+          signal: abortController.signal,
+          subagentId,
+          outputFile,
+          formatHeader: (identity) =>
+            buildTaskResultHeader(subagentType, subagentId, identity),
+          execute,
+          // Awaited by the worker so a one-shot drain sees the repair task.
+          repair: (result) =>
+            ensureMemoryRepair(
+              { ...resolvedParentScope, actingUserId, result },
+              spawnBackgroundSubagentTask,
+            ),
+          getSnapshot: getSubagentSnapshotFn,
+        })
+      : undefined;
+  const unsubscribe = memoryTask?.unsubscribe ?? (() => {});
+  const subagentExecution =
+    memoryTask?.execution ??
+    (subagentType === "memory"
+      ? Promise.reject(
+          new Error("Memory tasks require a parent conversation scope"),
+        )
+      : execute());
+  const taskLifecycle = subagentExecution
     .then(async (result) => {
+      await copyGitHubPullRequestTagsFn(
+        result.conversationId,
+        resolvedParentScope?.conversationId,
+      );
+
       bgTask.status = result.success ? "completed" : "failed";
       if (result.error) {
         bgTask.error = result.error;
@@ -417,10 +401,7 @@ export function spawnBackgroundSubagentTask(
         result,
         result.success ? "success" : "error",
       );
-      writeTaskTranscriptResult(outputFile, result, header);
-      if (result.success) {
-        setBackgroundTaskOutput(bgTask, result.report || "");
-      }
+      writeTaskTranscriptResult(outputFile, result, header, !!memoryTask);
       scheduleBackgroundTaskCleanup(taskId);
 
       completeSubagentFn(subagentId, {
@@ -435,6 +416,7 @@ export function spawnBackgroundSubagentTask(
           error: result.error,
           agentId: result.agentId,
           conversationId: result.conversationId,
+          model: result.model,
           stepCount: result.stepCount,
           durationMs: result.durationMs,
           report: result.report,
@@ -460,7 +442,7 @@ export function spawnBackgroundSubagentTask(
           fullResult,
           LIMITS.TASK_OUTPUT_CHARS,
           "Task",
-          { workingDirectory: userCwd, toolName: "Task" },
+          { workingDirectory: userCwd },
         );
 
         const defaultSummary = `Agent "${description}" ${result.success ? "completed" : "failed"}`;
@@ -490,6 +472,7 @@ export function spawnBackgroundSubagentTask(
           text: notificationXml,
           agentId: resolvedParentScope?.agentId,
           conversationId: resolvedParentScope?.conversationId,
+          actingUserId: bgTask.actingUserId,
         });
       }
 
@@ -509,7 +492,10 @@ export function spawnBackgroundSubagentTask(
         error instanceof Error ? error.message : String(error);
       bgTask.status = "failed";
       bgTask.error = errorMessage;
-      appendToOutputFile(outputFile, `[error] ${errorMessage}\n`);
+      appendToOutputFile(
+        outputFile,
+        `[error] ${errorMessage}\n\n[Task failed]\n`,
+      );
       scheduleBackgroundTaskCleanup(taskId);
       completeSubagentFn(subagentId, { success: false, error: errorMessage });
 
@@ -572,6 +558,7 @@ export function spawnBackgroundSubagentTask(
           text: notificationXml,
           agentId: resolvedParentScope?.agentId,
           conversationId: resolvedParentScope?.conversationId,
+          actingUserId: bgTask.actingUserId,
         });
       }
 
@@ -585,45 +572,58 @@ export function spawnBackgroundSubagentTask(
       ).catch(() => {
         // Silently ignore hook errors
       });
-    });
+    })
+    .finally(unsubscribe);
 
+  // Memory drains wait for the whole lifecycle (sync, cleanup), not just the child.
+  const swallow = () => undefined;
+  bgTask.completion =
+    subagentType === "memory"
+      ? taskLifecycle
+      : subagentExecution.then(swallow, swallow);
   return { taskId, outputFile, subagentId };
 }
 
-/**
- * Task tool - Launch a specialized subagent to handle complex tasks
- */
-export async function task(args: TaskArgs): Promise<string> {
-  const { command = "run", model, toolCallId, signal } = args;
-
-  // Handle refresh command - re-discover subagents from .letta/agents/ directories
-  if (command === "refresh") {
-    // Clear the cache to force re-discovery
-    clearSubagentConfigCache();
-
-    // Discover subagents from global and project directories
-    const { subagents, errors } = await discoverSubagents();
-
-    // Get all configs (builtins + discovered) to report accurate count
-    const allConfigs = await getAllSubagentConfigs();
-    const totalCount = Object.keys(allConfigs).length;
-    const customCount = subagents.length;
-
-    // Log any errors
-    if (errors.length > 0) {
-      for (const error of errors) {
-        console.warn(
-          `Subagent discovery error: ${error.path}: ${error.message}`,
-        );
-      }
-    }
-
-    const errorSuffix = errors.length > 0 ? `, ${errors.length} error(s)` : "";
-    return `Refreshed subagents list: found ${totalCount} total (${customCount} custom)${errorSuffix}`;
-  }
+/** Launch through the same task lifecycle for tools and App Server commands. */
+export async function launchSubagent(
+  args: TaskArgs,
+): Promise<SubagentLaunchResult> {
+  const { model, toolCallId, signal } = args;
+  if (
+    args.client_message_id !== undefined &&
+    (typeof args.client_message_id !== "string" ||
+      !args.client_message_id.trim())
+  )
+    return {
+      success: false,
+      error: "client_message_id must be a non-empty string",
+    };
+  const resolvedParentScope = resolveNotificationScope(args.parentScope);
+  signal?.throwIfAborted();
 
   // Determine if deploying an existing agent
   const isDeployingExisting = Boolean(args.agent_id || args.conversation_id);
+  const requestedType = args.subagent_type;
+  const externalCodingAgentType =
+    typeof requestedType === "string" &&
+    isExternalCodingAgentType(requestedType)
+      ? requestedType
+      : null;
+  const isExternalCodingAgent = externalCodingAgentType !== null;
+  if (isExternalCodingAgent && isDeployingExisting) {
+    return {
+      success: false,
+      error: `${requestedType} does not accept agent_id or conversation_id at launch; use SendAgentMessage with the synthetic agent ID for follow-up work`,
+    };
+  }
+  if (args.mcp && !isExternalCodingAgent) {
+    return {
+      success: false,
+      error: "mcp is only supported for claude-code and codex subagents",
+    };
+  }
+  const mcpValidationError = validateExternalCodingAgentMcpOptions(args.mcp);
+  if (mcpValidationError) return { success: false, error: mcpValidationError };
 
   // Validate required parameters based on mode
   if (isDeployingExisting) {
@@ -647,210 +647,303 @@ export async function task(args: TaskArgs): Promise<string> {
     ? args.subagent_type || "general-purpose"
     : (args.subagent_type as string);
 
-  // Get all available subagent configs (built-in + custom)
-  const allConfigs = await getAllSubagentConfigs();
-
-  // Validate subagent type
-  if (!(subagent_type in allConfigs)) {
-    const available = Object.keys(allConfigs).join(", ");
-    return `Error: Invalid subagent type "${subagent_type}". Available types: ${available}`;
-  }
-
-  // For existing agents, only allow general-purpose
-  if (isDeployingExisting && !VALID_DEPLOY_TYPES.has(subagent_type)) {
-    return `Error: When deploying an existing agent, subagent_type must be "general-purpose". Got: "${subagent_type}"`;
-  }
-
-  // If subagent config requires forked context, fork the parent conversation
-  const config = allConfigs[subagent_type];
+  const prepared = subagent_type === "custom" && isDeployingExisting;
+  const allConfigs =
+    prepared || isExternalCodingAgent
+      ? {}
+      : await getAllSubagentConfigs(getCurrentWorkingDirectory());
+  const config: SubagentConfig | undefined = isExternalCodingAgent
+    ? createExternalCodingAgentConfig(externalCodingAgentType)
+    : prepared
+      ? {
+          name: "custom",
+          description: "Prepared conversation",
+          systemPrompt: "",
+          allowedTools: "all",
+          recommendedModel: "inherit",
+          skills: [],
+          fork: false,
+          launchProfile: "default",
+        }
+      : allConfigs[subagent_type];
   if (!config) {
-    return `Error: Invalid subagent type "${subagent_type}"`;
+    return {
+      success: false,
+      error: `Invalid subagent type "${subagent_type}". Available types: ${Object.keys(allConfigs).join(", ")}`,
+    };
   }
+  if (
+    !prepared &&
+    isDeployingExisting &&
+    !VALID_DEPLOY_TYPES.has(subagent_type)
+  ) {
+    return {
+      success: false,
+      error: `When deploying an existing agent, subagent_type must be "general-purpose". Got: "${subagent_type}"`,
+    };
+  }
+  if (
+    prepared &&
+    (!args.conversation_id ||
+      args.conversation_id === "default" ||
+      args.model !== undefined)
+  ) {
+    return {
+      success: false,
+      error:
+        "custom requires a prepared conversation_id; configure its model before launching.",
+    };
+  }
+  if (
+    args.max_turns !== undefined &&
+    (!Number.isSafeInteger(args.max_turns) || args.max_turns <= 0)
+  ) {
+    return { success: false, error: "max_turns must be a positive integer" };
+  }
+  if (typeof args.computer === "string" && args.computer.trim()) {
+    if (subagent_type === "memory") {
+      return {
+        success: false,
+        error: "Memory workers must run on the current machine; omit computer.",
+      };
+    }
+    let environmentRouting = false;
+    try {
+      environmentRouting = getBackend().capabilities.environmentRouting;
+    } catch {
+      environmentRouting = false;
+    }
+    if (!environmentRouting) {
+      return {
+        success: false,
+        error:
+          "The computer option requires a Letta Cloud backend. This backend has no connected computers; omit the computer field to run the subagent on the current machine.",
+      };
+    }
+  }
+
   let effectiveAgentId = args.agent_id;
   let effectiveConversationId = args.conversation_id;
 
-  if (config.fork) {
+  if (isExternalCodingAgent) {
+    if (typeof args.computer === "string" && args.computer.trim()) {
+      return {
+        success: false,
+        error: `${subagent_type} runs in the current working directory and does not support computer routing`,
+      };
+    }
+    const parentAgentId = resolvedParentScope?.agentId ?? getCurrentAgentId();
+    if (!parentAgentId) {
+      return {
+        success: false,
+        error: `${subagent_type} requires a parent agent identity`,
+      };
+    }
+    let mcpReminder: string | undefined;
+    try {
+      mcpReminder = await resolveExternalCodingAgentMcpReminder(
+        parentAgentId,
+        args.mcp,
+      );
+    } catch (error) {
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    const { taskId, outputFile, subagentId } = spawnBackgroundSubagentTask({
+      subagentType: subagent_type,
+      config,
+      prompt: inputPrompt,
+      description,
+      model,
+      toolCallId,
+      parentScope: resolvedParentScope,
+      deps: {
+        spawnSubagentImpl: async (
+          _type,
+          prompt,
+          model,
+          _subagentId,
+          childSignal,
+        ) =>
+          runExternalCodingAgent({
+            type: externalCodingAgentType,
+            prompt,
+            model,
+            parentAgentId,
+            parentConversationId: resolvedParentScope?.conversationId,
+            actingUserId: resolvedParentScope?.actingUserId,
+            cwd: getCurrentWorkingDirectory(),
+            mcpReminder,
+            signal: childSignal,
+            onStarted: (agentId) =>
+              updateSubagent(subagentId, { agentId, status: "running" }),
+          }),
+      },
+    });
+    let agentId: string | null = null;
+    if (isExternalCodingAgent) {
+      const abortStartup = () =>
+        backgroundTasks.get(taskId)?.abortController?.abort(signal?.reason);
+      signal?.addEventListener("abort", abortStartup, { once: true });
+      try {
+        if (signal?.aborted) abortStartup();
+        agentId = await waitForBackgroundSubagentAgentId(
+          subagentId,
+          null,
+          signal,
+        );
+        signal?.throwIfAborted();
+      } finally {
+        signal?.removeEventListener("abort", abortStartup);
+      }
+    }
+    return {
+      success: true,
+      task_id: taskId,
+      output_file: outputFile,
+      agent_id: agentId,
+      conversation_id: null,
+    };
+  }
+
+  if (prepared && effectiveConversationId) {
+    if (effectiveConversationId === resolvedParentScope?.conversationId) {
+      return {
+        success: false,
+        error: "A subagent cannot run in its parent conversation",
+      };
+    }
+    const child = await getBackend().retrieveConversation(
+      effectiveConversationId,
+      { signal },
+    );
+    if (args.agent_id && child.agent_id !== args.agent_id) {
+      return {
+        success: false,
+        error: "agent_id does not own the child conversation",
+      };
+    }
+    effectiveAgentId = child.agent_id ?? undefined;
+  }
+
+  if (config.fork && subagent_type !== "memory") {
     if (args.agent_id || args.conversation_id) {
-      return "Error: Subagent type with fork: true cannot be combined with agent_id or conversation_id";
+      return {
+        success: false,
+        error:
+          "Subagent type with fork: true cannot be combined with agent_id or conversation_id",
+      };
     }
     try {
-      const parentAgentId = getCurrentAgentId();
-      const parentConvId = getConversationId() ?? "default";
-      // Mark the forked conversation as hidden so it doesn't clutter the
-      // parent agent's conversation list in the ADE. The subagent still
-      // reads/writes this conversation normally — only archive status is
-      // affected. The forked conversation remains retrievable by id, so a
-      // direct link still opens it.
-      const forkedConv = await getBackend().forkConversation(parentConvId, {
-        ...(parentConvId === "default" ? { agentId: parentAgentId } : {}),
-        hidden: true,
+      const parentAgentId = resolvedParentScope?.agentId ?? getCurrentAgentId();
+      const parentConvId =
+        resolvedParentScope?.conversationId ?? getConversationId() ?? "default";
+      const forkedConv = await forkParentConversation({
+        backend: getBackend(),
+        parentAgentId,
+        parentConversationId: parentConvId,
+        config,
+        model,
+        signal,
       });
       effectiveAgentId = parentAgentId;
       effectiveConversationId = forkedConv.id;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
-      return `Error: Failed to fork parent conversation: ${errorMessage}`;
+      return {
+        success: false,
+        error: `Failed to fork parent conversation: ${errorMessage}`,
+      };
     }
   }
 
   const prompt = inputPrompt;
+  signal?.throwIfAborted();
 
-  const isBackground = args.run_in_background ?? config.background;
-  const resolvedParentScope = resolveParentScope(args.parentScope);
-
-  // Handle background execution
-  if (isBackground) {
-    const { taskId, outputFile, subagentId } = spawnBackgroundSubagentTask({
-      subagentType: subagent_type,
-      prompt,
-      description,
-      model,
-      toolCallId,
-      existingAgentId: effectiveAgentId,
-      existingConversationId: effectiveConversationId,
-      maxTurns: args.max_turns,
-      forkedContext: config.fork,
-      parentScope: resolvedParentScope,
-    });
-
-    await waitForBackgroundSubagentLink(subagentId, null, signal);
-
-    // Extract Letta agent ID from subagent state (available after link resolves)
-    const linkedAgent = getSubagentSnapshot().agents.find(
-      (a) => a.id === subagentId,
-    );
-    const agentId = linkedAgent?.agentId ?? null;
-    const agentIdLine = agentId ? `\nAgent ID: ${agentId}` : "";
-
-    return `Task running in background with task ID: ${taskId}${agentIdLine}\nOutput file: ${outputFile}\n\nYou will be notified automatically when this task completes — a <task-notification> message will be delivered with the result. No need to poll, sleep-wait, or check the output file. Just continue with your current work.`;
-  }
-
-  // Register subagent with state store for UI display (foreground path)
-  const subagentId = generateSubagentId();
-  registerSubagent(
-    subagentId,
-    subagent_type,
-    description,
-    toolCallId,
-    false,
-    false,
-    resolvedParentScope,
+  const { taskId, outputFile, subagentId } = spawnBackgroundSubagentTask({
+    subagentType: subagent_type,
+    config,
     prompt,
-  );
+    description,
+    model,
+    toolCallId,
+    existingAgentId: effectiveAgentId,
+    existingConversationId: effectiveConversationId,
+    maxTurns: args.max_turns,
+    clientMessageId: args.client_message_id,
+    forkedContext: subagent_type !== "memory" && config.fork,
+    parentScope: resolvedParentScope,
+    environment:
+      typeof args.computer === "string" && args.computer.trim()
+        ? args.computer.trim()
+        : undefined,
+  });
 
-  // Foreground tasks now also write transcripts so users can inspect full output
-  // even when inline content is truncated.
-  const foregroundTaskId = getNextTaskId();
-  const outputFile = createBackgroundOutputFile(foregroundTaskId);
-  writeTaskTranscriptStart(outputFile, description, subagent_type);
-
-  try {
-    // See spawnBackgroundSubagentTask for rationale: capture parentAgentId
-    // synchronously here to avoid the async-drift race inside spawnSubagent.
-    const parentAgentIdForSpawn = resolvedParentScope?.agentId;
-    const result = await spawnSubagent(
-      subagent_type,
-      prompt,
-      model,
-      subagentId,
-      signal,
-      effectiveAgentId,
-      effectiveConversationId,
-      args.max_turns,
-      config.fork,
-      parentAgentIdForSpawn,
-      undefined,
-      resolvedParentScope?.conversationId,
-    );
-
-    // Mark subagent as completed in state store
-    completeSubagent(subagentId, {
-      success: result.success,
-      error: result.error,
-      totalTokens: result.totalTokens,
-    });
-
-    // Run SubagentStop hooks (fire-and-forget)
-    runSubagentStopHooks(
-      subagent_type,
-      subagentId,
-      result.success,
-      result.error,
-      result.agentId,
-      result.conversationId,
-    ).catch(() => {
-      // Silently ignore hook errors
-    });
-
-    if (!result.success) {
-      const errorMessage = result.error || "Subagent execution failed";
-      const failedResult: TaskRunResult = {
-        ...result,
-        error: errorMessage,
-      };
-      const header = buildTaskResultHeader(
-        subagent_type,
-        subagentId,
-        failedResult,
-        "error",
-      );
-      writeTaskTranscriptResult(outputFile, failedResult, header);
-      return `${header}\n\nError: ${errorMessage}\nOutput file: ${outputFile}`;
-    }
-
-    // Include stable subagent metadata so orchestrators can attribute results.
-    // Keep the tool return type as a string for compatibility.
-    const header = buildTaskResultHeader(
-      subagent_type,
-      subagentId,
-      result,
-      "success",
-    );
-
-    const fullOutput = `${header}\n\n${result.report}`;
-    writeTaskTranscriptResult(outputFile, result, header);
-
-    const userCwd = getCurrentWorkingDirectory();
-
-    // Apply truncation to prevent excessive token usage (same pattern as Bash tool)
-    const { content: truncatedOutput } = truncateByChars(
-      fullOutput,
-      LIMITS.TASK_OUTPUT_CHARS,
-      "Task",
-      { workingDirectory: userCwd, toolName: "Task" },
-    );
-
-    return `${truncatedOutput}\nOutput file: ${outputFile}`;
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    const header = buildTaskResultHeader(
-      subagent_type,
-      subagentId,
-      {
-        agentId: effectiveAgentId ?? "",
-        conversationId: effectiveConversationId,
-      },
-      "error",
-    );
-    completeSubagent(subagentId, { success: false, error: errorMessage });
-
-    // Run SubagentStop hooks for error case (fire-and-forget)
-    runSubagentStopHooks(
-      subagent_type,
-      subagentId,
-      false,
-      errorMessage,
-      effectiveAgentId,
-      effectiveConversationId,
-    ).catch(() => {
-      // Silently ignore hook errors
-    });
-
-    appendToOutputFile(
-      outputFile,
-      `${header}\n\n[error] ${errorMessage}\n\n[Task failed]\n`,
-    );
-    return `${header}\n\nError: ${errorMessage}\nOutput file: ${outputFile}`;
+  if (subagent_type === "memory") {
+    return {
+      success: true,
+      task_id: taskId,
+      output_file: outputFile,
+      agent_id: null,
+      conversation_id: null,
+    };
   }
+
+  const abortStartup = () =>
+    backgroundTasks.get(taskId)?.abortController?.abort(signal?.reason);
+  signal?.addEventListener("abort", abortStartup, { once: true });
+  try {
+    if (signal?.aborted) abortStartup();
+    await waitForBackgroundSubagentLink(subagentId, null, signal);
+    signal?.throwIfAborted();
+  } finally {
+    signal?.removeEventListener("abort", abortStartup);
+  }
+
+  // Extract Letta agent ID from subagent state (available after link resolves)
+  const linkedAgent = getSubagentSnapshot().agents.find(
+    (a) => a.id === subagentId,
+  );
+  if (linkedAgent?.status === "error") {
+    return {
+      success: false,
+      error: backgroundTasks.get(taskId)?.error ?? "Subagent launch failed",
+    };
+  }
+  return {
+    success: true,
+    task_id: taskId,
+    output_file: outputFile,
+    agent_id: linkedAgent?.agentId ?? effectiveAgentId ?? null,
+    conversation_id:
+      linkedAgent?.conversationId ?? effectiveConversationId ?? null,
+  };
+}
+
+/** Agent's text adapter; App Server callers consume launchSubagent directly. */
+export async function task(args: TaskArgs): Promise<string> {
+  if (args.command === "refresh") {
+    clearSubagentConfigCache();
+    const { subagents, errors } = await discoverSubagents();
+    const allConfigs = await getAllSubagentConfigs();
+    for (const error of errors) {
+      console.warn(`Subagent discovery error: ${error.path}: ${error.message}`);
+    }
+    const errorSuffix = errors.length > 0 ? `, ${errors.length} error(s)` : "";
+    return `Refreshed subagents list: found ${Object.keys(allConfigs).length} total (${subagents.length} custom)${errorSuffix}`;
+  }
+  const result = await launchSubagent(args);
+  if (!result.success) return `Error: ${result.error}`;
+  if (args.subagent_type === "memory") {
+    return `Memory task running in background (${result.task_id}). No completion notification will be sent. Output file: ${result.output_file}`;
+  }
+  const agentIdLine = result.agent_id ? `\nAgent ID: ${result.agent_id}` : "";
+  const conversationIdLine = result.conversation_id
+    ? `\nConversation ID: ${result.conversation_id}`
+    : "";
+  return `Task running in background with task ID: ${result.task_id}${agentIdLine}${conversationIdLine}\nOutput file: ${result.output_file}\n\nYou will be notified automatically when this task completes — a <task-notification> message will be delivered with the result. No need to poll, sleep-wait, or check the output file. Just continue with your current work.`;
 }

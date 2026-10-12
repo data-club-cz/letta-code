@@ -480,6 +480,21 @@ describe("channel service", () => {
     );
   });
 
+  test("updateChannelRouteLive rejects a labeled Telegram Chat ID", () => {
+    expect(() =>
+      updateChannelRouteLive(
+        "telegram",
+        "Chat ID: 7945451305",
+        "agent-telegram",
+        "default",
+        "telegram-bot",
+      ),
+    ).toThrow("Paste only the numeric Telegram Chat ID");
+    expect(getRoute("telegram", "Chat ID: 7945451305", "telegram-bot")).toBe(
+      null,
+    );
+  });
+
   test("updateChannelAccountLive updates Telegram allowlist users", () => {
     createChannelAccountLive(
       "telegram",
@@ -676,6 +691,36 @@ describe("channel service", () => {
     expect(snapshot?.channelId).toBe("slack");
     if (snapshot?.channelId === "slack") {
       expect(snapshot.defaultPermissionMode).toBe("unrestricted");
+      expect(snapshot.allowBots).toBe(false);
+      expect(snapshot.config.allow_bots).toBe(false);
+    }
+  });
+
+  test("loaded Slack accounts normalize persisted allow_bots settings", () => {
+    clearChannelAccountStores();
+    __testOverrideLoadChannelAccounts(() => [
+      {
+        channel: "slack",
+        accountId: "legacy-slack",
+        enabled: false,
+        mode: "socket",
+        botToken: "xoxb-test-token",
+        appToken: "xapp-test-token",
+        dmPolicy: "pairing",
+        allowedUsers: [],
+        agentId: null,
+        defaultPermissionMode: "standard",
+        allow_bots: "mentions",
+        createdAt: "2026-04-11T00:00:00.000Z",
+        updatedAt: "2026-04-11T00:00:00.000Z",
+      } as unknown as SlackChannelAccount,
+    ]);
+
+    const snapshot = getChannelAccountSnapshot("slack", "legacy-slack");
+    expect(snapshot?.channelId).toBe("slack");
+    if (snapshot?.channelId === "slack") {
+      expect(snapshot.allowBots).toBe("mentions");
+      expect(snapshot.config.allow_bots).toBe("mentions");
     }
   });
 
@@ -749,7 +794,7 @@ describe("channel service", () => {
 
     bindChannelPairing(
       "telegram",
-      createPairingCode("telegram", "sender-1", "chat-1", "C P", "bot-one"),
+      createPairingCode("telegram", "sender-1", "7945451305", "C P", "bot-one"),
       "agent-telegram",
       "conv-telegram",
     );
@@ -832,7 +877,7 @@ describe("channel service", () => {
     );
   });
 
-  test("slack live account helpers preserve the transcribeVoice opt-in in snapshots", () => {
+  test("slack live account helpers preserve ingress settings in snapshots", () => {
     const created = createChannelAccountLive(
       "slack",
       {
@@ -845,8 +890,9 @@ describe("channel service", () => {
           mode: "socket",
           agent_id: null,
           transcribe_voice: true,
-          show_completed_reaction: false,
           listen_mode: true,
+          mention_only_channels: ["C123"],
+          allow_bots: "mentions",
         },
       },
       { accountId: "slack-voice" },
@@ -856,10 +902,14 @@ describe("channel service", () => {
       expect.objectContaining({
         accountId: "slack-voice",
         transcribeVoice: true,
+        listenMode: true,
+        mentionOnlyChannels: ["C123"],
+        allowBots: "mentions",
         config: expect.objectContaining({
           transcribe_voice: true,
-          show_completed_reaction: false,
           listen_mode: true,
+          mention_only_channels: ["C123"],
+          allow_bots: "mentions",
         }),
       }),
     );
@@ -867,8 +917,9 @@ describe("channel service", () => {
     const updated = updateChannelAccountLive("slack", "slack-voice", {
       config: {
         transcribe_voice: false,
-        show_completed_reaction: true,
         listen_mode: false,
+        mention_only_channels: ["C456"],
+        allow_bots: false,
       },
     });
 
@@ -876,10 +927,14 @@ describe("channel service", () => {
       expect.objectContaining({
         accountId: "slack-voice",
         transcribeVoice: false,
+        listenMode: false,
+        mentionOnlyChannels: ["C456"],
+        allowBots: false,
         config: expect.objectContaining({
           transcribe_voice: false,
-          show_completed_reaction: true,
           listen_mode: false,
+          mention_only_channels: ["C456"],
+          allow_bots: false,
         }),
       }),
     );
@@ -888,10 +943,14 @@ describe("channel service", () => {
       expect.objectContaining({
         accountId: "slack-voice",
         transcribeVoice: false,
+        listenMode: false,
+        mentionOnlyChannels: ["C456"],
+        allowBots: false,
         config: expect.objectContaining({
           transcribe_voice: false,
-          show_completed_reaction: true,
           listen_mode: false,
+          mention_only_channels: ["C456"],
+          allow_bots: false,
         }),
       }),
     );
@@ -922,7 +981,7 @@ describe("channel service", () => {
     const code = createPairingCode(
       "telegram",
       "user-1",
-      "chat-1",
+      "7945451305",
       "john",
       "bot-one",
     );
@@ -930,7 +989,7 @@ describe("channel service", () => {
     const result = bindChannelPairing("telegram", code, "agent-a", "conv-1");
     expect(result.route.accountId).toBe("bot-one");
 
-    const route = getRoute("telegram", "chat-1", "bot-one");
+    const route = getRoute("telegram", "7945451305", "bot-one");
     expect(route).not.toBeNull();
     expect(route?.agentId).toBe("agent-a");
   });

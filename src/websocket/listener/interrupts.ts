@@ -11,13 +11,16 @@ import { collectApprovalResultToolCallIds } from "./approval";
 import {
   createLifecycleMessageBase,
   emitCanonicalMessageDelta,
+  type OutboundMessageDelivery,
 } from "./protocol-outbound";
 import { clearRecoveredApprovalState } from "./runtime";
 import type { ListenerTransport } from "./transport";
+import type { TurnLease } from "./turn-lifecycle";
 import type {
   ConversationRuntime,
   InterruptPopulateInput,
   InterruptToolReturn,
+  ListenerMessageRouting,
   RecoveredApprovalState,
 } from "./types";
 
@@ -41,6 +44,12 @@ type StreamingToolOutputState = {
   dirty: boolean;
   lastEmittedAt: number;
   timer: ReturnType<typeof setTimeout> | null;
+};
+
+type ClientToolExecutionInfo = {
+  toolCallId: string;
+  toolName?: string;
+  toolArgs?: string;
 };
 
 function truncateInterruptToolReturn(text: string): string {
@@ -164,10 +173,14 @@ export function normalizeInterruptedApprovalsForQueue(
 
 export function normalizeExecutionResultsForInterruptParity(
   runtime: ConversationRuntime,
+  lease: TurnLease,
   executionResults: ApprovalResult[],
   executingToolCallIds: string[],
 ): ApprovalResult[] {
-  if (!runtime.cancelRequested || executionResults.length === 0) {
+  if (
+    runtime.turnLifecycle.getInterruptionCause(lease) !== "explicit_user" ||
+    executionResults.length === 0
+  ) {
     return executionResults;
   }
 
@@ -333,21 +346,25 @@ export function emitInterruptToolReturnMessage(
   approvals: ApprovalResult[] | null,
   runId?: string | null,
   uuidPrefix: string = "interrupt-tool-return",
-): void {
+  routing?: ListenerMessageRouting,
+): OutboundMessageDelivery[] {
   const toolReturns = extractInterruptToolReturns(approvals);
   if (toolReturns.length === 0) {
-    return;
+    return [];
   }
 
   const resolvedRunId = runId ?? runtime.activeRunId ?? undefined;
-  for (const toolReturn of toolReturns) {
+  return toolReturns.map((toolReturn) =>
     emitCanonicalMessageDelta(
       socket,
       runtime,
       {
         type: "message",
         message_type: "tool_return_message",
-        id: `message-${uuidPrefix}-${crypto.randomUUID()}`,
+        // No persisted tool_return_message exists yet. Use a synthetic id
+        // outside Core's `message-*` namespace; the real approval message id
+        // identifies the request, not this return row (LET-10608).
+        id: `synthetic-${uuidPrefix}-${crypto.randomUUID()}`,
         date: new Date().toISOString(),
         run_id: resolvedRunId,
         status: toolReturn.status,
@@ -364,27 +381,38 @@ export function emitInterruptToolReturnMessage(
         ],
       },
       {
-        agent_id: runtime.agentId ?? undefined,
+        agent_id: runtime.agentId,
         conversation_id: runtime.conversationId,
       },
-    );
-  }
+      routing,
+    ),
+  );
 }
 
 export function emitToolExecutionStartedEvents(
   socket: ListenerTransport,
   runtime: ConversationRuntime,
   params: {
-    toolCallIds: string[];
+    toolCallIds?: string[];
+    toolCalls?: ClientToolExecutionInfo[];
     runId?: string | null;
-    agentId?: string;
+    agentId?: string | null;
     conversationId?: string;
   },
 ): void {
-  for (const toolCallId of params.toolCallIds) {
+  const toolCalls: ClientToolExecutionInfo[] =
+    params.toolCalls ??
+    (params.toolCallIds ?? []).map((toolCallId) => ({ toolCallId }));
+  for (const toolCall of toolCalls) {
+    const messageId = runtime.approvalMessageIdByToolCallId.get(
+      toolCall.toolCallId,
+    );
     const delta: ClientToolStartMessage = {
       ...createLifecycleMessageBase("client_tool_start", params.runId),
-      tool_call_id: toolCallId,
+      ...(messageId ? { id: messageId } : {}),
+      tool_call_id: toolCall.toolCallId,
+      ...(toolCall.toolName ? { tool_name: toolCall.toolName } : {}),
+      ...(toolCall.toolArgs ? { tool_args: toolCall.toolArgs } : {}),
     };
     emitCanonicalMessageDelta(socket, runtime, delta, {
       agent_id: params.agentId,
@@ -399,22 +427,63 @@ export function emitToolExecutionFinishedEvents(
   params: {
     approvals: ApprovalResult[] | null;
     runId?: string | null;
-    agentId?: string;
+    agentId?: string | null;
     conversationId?: string;
   },
-): void {
+  routing?: ListenerMessageRouting,
+): OutboundMessageDelivery[] {
   const toolReturns = extractInterruptToolReturns(params.approvals);
-  for (const toolReturn of toolReturns) {
+  return toolReturns.map((toolReturn) => {
+    const messageId = runtime.approvalMessageIdByToolCallId.get(
+      toolReturn.tool_call_id,
+    );
     const delta: ClientToolEndMessage = {
       ...createLifecycleMessageBase("client_tool_end", params.runId),
+      ...(messageId ? { id: messageId } : {}),
       tool_call_id: toolReturn.tool_call_id,
       status: toolReturn.status,
     };
-    emitCanonicalMessageDelta(socket, runtime, delta, {
+    return emitCanonicalMessageDelta(
+      socket,
+      runtime,
+      delta,
+      {
+        agent_id: params.agentId,
+        conversation_id: params.conversationId,
+      },
+      routing,
+    );
+  });
+}
+
+/**
+ * Close out `client_tool_start` lifecycle events when execution throws
+ * before results exist. Without a matching `client_tool_end`, observer UIs
+ * that pair start/end events shimmer the orphaned tool call forever.
+ */
+export function emitToolExecutionAbortedEvents(
+  socket: ListenerTransport,
+  runtime: ConversationRuntime,
+  params: {
+    toolCallIds: string[];
+    runId?: string | null;
+    agentId?: string | null;
+    conversationId?: string;
+  },
+): OutboundMessageDelivery[] {
+  return params.toolCallIds.map((toolCallId) => {
+    const messageId = runtime.approvalMessageIdByToolCallId.get(toolCallId);
+    const delta: ClientToolEndMessage = {
+      ...createLifecycleMessageBase("client_tool_end", params.runId),
+      ...(messageId ? { id: messageId } : {}),
+      tool_call_id: toolCallId,
+      status: "error",
+    };
+    return emitCanonicalMessageDelta(socket, runtime, delta, {
       agent_id: params.agentId,
       conversation_id: params.conversationId,
     });
-  }
+  });
 }
 
 export function createToolExecutionOutputEmitter(
@@ -422,8 +491,9 @@ export function createToolExecutionOutputEmitter(
   runtime: ConversationRuntime,
   params: {
     runId?: string | null;
-    agentId?: string;
+    agentId?: string | null;
     conversationId?: string;
+    shouldEmit?: () => boolean;
   },
 ): ToolExecutionOutputEmitter {
   const outputByToolCallId = new Map<string, StreamingToolOutputState>();
@@ -432,7 +502,7 @@ export function createToolExecutionOutputEmitter(
     toolCallId: string,
     outputState: StreamingToolOutputState,
   ) => {
-    if (!outputState.dirty) {
+    if (!outputState.dirty || params.shouldEmit?.() === false) {
       return;
     }
 
@@ -455,7 +525,7 @@ export function createToolExecutionOutputEmitter(
         message_type: "tool_return_message",
         id: outputState.messageId,
         date: new Date().toISOString(),
-        run_id: params.runId ?? runtime.activeRunId ?? undefined,
+        run_id: params.runId ?? undefined,
         status: "success",
         tool_call_id: toolCallId,
         tool_return: toolReturn,
@@ -492,13 +562,15 @@ export function createToolExecutionOutputEmitter(
     chunk: string,
     isStderr: boolean = false,
   ) => {
-    if (!toolCallId || chunk.length === 0) {
+    if (!toolCallId || chunk.length === 0 || params.shouldEmit?.() === false) {
       return;
     }
 
     const existing = outputByToolCallId.get(toolCallId);
     const outputState = existing ?? {
-      messageId: `message-tool-return-stream-${toolCallId}`,
+      // Stable across snapshots for this tool call, but outside Core's
+      // `message-*` namespace because no persisted return row exists yet.
+      messageId: `synthetic-tool-return-stream-${toolCallId}`,
       stdout: "",
       stderr: "",
       dirty: false,
@@ -549,7 +621,7 @@ export function getInterruptApprovalsForEmission(
   runtime: ConversationRuntime,
   params: {
     lastExecutionResults: ApprovalResult[] | null;
-    agentId: string;
+    agentId: string | null;
     conversationId: string;
   },
 ): ApprovalResult[] | null {
@@ -594,6 +666,7 @@ export function populateInterruptQueue(
       agentId: input.agentId,
       conversationId: input.conversationId,
       continuationEpoch: runtime.continuationEpoch,
+      ...(input.requestOtid ? { requestOtid: input.requestOtid } : {}),
     };
     runtime.pendingInterruptedToolCallIds = [...input.lastExecutingToolCallIds];
     return true;
@@ -612,6 +685,7 @@ export function populateInterruptQueue(
       agentId: input.agentId,
       conversationId: input.conversationId,
       continuationEpoch: runtime.continuationEpoch,
+      ...(input.requestOtid ? { requestOtid: input.requestOtid } : {}),
     };
     runtime.pendingInterruptedToolCallIds = [...input.lastExecutingToolCallIds];
     return true;
@@ -634,6 +708,7 @@ export function populateInterruptQueue(
       agentId: input.agentId,
       conversationId: input.conversationId,
       continuationEpoch: runtime.continuationEpoch,
+      ...(input.requestOtid ? { requestOtid: input.requestOtid } : {}),
     };
     runtime.pendingInterruptedToolCallIds = null;
     return true;
@@ -652,7 +727,7 @@ export function populateInterruptQueue(
 
 export function consumeInterruptQueue(
   runtime: ConversationRuntime,
-  agentId: string,
+  agentId: string | null,
   conversationId: string,
 ): {
   approvalMessage: {
@@ -695,7 +770,7 @@ export function consumeInterruptQueue(
       approvalMessage: {
         type: "approval",
         approvals: runtime.pendingInterruptedResults,
-        otid: crypto.randomUUID(),
+        otid: ctx?.requestOtid ?? crypto.randomUUID(),
       },
       interruptedToolCallIds: runtime.pendingInterruptedToolCallIds
         ? [...runtime.pendingInterruptedToolCallIds]
@@ -721,9 +796,7 @@ export function stashRecoveredApprovalInterrupts(
   runtime: ConversationRuntime,
   recovered: RecoveredApprovalState,
 ): boolean {
-  const approvals =
-    recovered.allApprovals ??
-    [...recovered.approvalsByRequestId.values()].map((entry) => entry.approval);
+  const approvals = recovered.allApprovals ?? [];
   if (approvals.length === 0) {
     clearRecoveredApprovalState(runtime);
     return false;

@@ -1,10 +1,14 @@
 import { describe, expect, test } from "bun:test";
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
 import {
+  getReasoningCycleTierOptions,
   resolveReasoningCycleModelHandle,
   resolveReasoningCycleTierLookupHandle,
   serviceTierForReasoningCycle,
 } from "@/cli/app/use-reasoning-cycle";
+import { setupRuntimeModelCatalogFixture } from "@/test-utils/runtime-model-catalog";
+
+setupRuntimeModelCatalogFixture();
 
 describe("resolveReasoningCycleModelHandle", () => {
   test("preserves local model handles from llm_config", () => {
@@ -96,6 +100,14 @@ describe("resolveReasoningCycleTierLookupHandle", () => {
     ).toBe("anthropic/claude-opus-4-8");
   });
 
+  test("uses the provider type to find MiniMax BYOK tiers in the Cloud catalog", () => {
+    expect(
+      resolveReasoningCycleTierLookupHandle("lc-minimax/MiniMax-M3", {
+        provider_type: "minimax",
+      } as unknown as AgentState["model_settings"]),
+    ).toBe("minimax/MiniMax-M3");
+  });
+
   test("keeps canonical handles unchanged", () => {
     expect(
       resolveReasoningCycleTierLookupHandle("anthropic/claude-opus-4-8", {
@@ -136,6 +148,49 @@ describe("resolveReasoningCycleTierLookupHandle", () => {
         provider_type: "ollama_cloud",
       } as unknown as AgentState["model_settings"]),
     ).toBe("ollama-cloud/local-model");
+  });
+});
+
+describe("getReasoningCycleTierOptions", () => {
+  test("includes Default only for OpenAI-compatible proxies", () => {
+    expect(
+      getReasoningCycleTierOptions({
+        modelHandle: "proxy/claude-opus-4-6",
+        tierLookupHandle: "proxy/claude-opus-4-6",
+        openAICompatibleProxy: true,
+      }).map((option) => option.effort),
+    ).toEqual([
+      null,
+      "none",
+      "minimal",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+
+    expect(
+      getReasoningCycleTierOptions({
+        modelHandle: "openai/gpt-5.4",
+        tierLookupHandle: "openai/gpt-5.4",
+        openAICompatibleProxy: false,
+      }).map((option) => option.effort),
+    ).toEqual(["none", "low", "medium", "high", "xhigh"]);
+  });
+
+  test("uses reported proxy capabilities before the generic ladder", () => {
+    expect(
+      getReasoningCycleTierOptions({
+        modelHandle: "proxy/arbitrary-model",
+        tierLookupHandle: "proxy/arbitrary-model",
+        openAICompatibleProxy: true,
+        reasoningCapabilities: {
+          supported_efforts: ["minimal", "high"],
+          mandatory: false,
+        },
+      }).map((option) => option.effort),
+    ).toEqual([null, "minimal", "high"]);
   });
 });
 

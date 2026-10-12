@@ -15,24 +15,35 @@ import {
 } from "react";
 import stringWidth from "string-width";
 import type { ModelReasoningEffort } from "@/agent/model";
+import type { getSubagentLifecycleSnapshot } from "@/agent/subagent-state";
 import { LETTA_CLOUD_API_URL } from "@/auth/oauth";
-import { buildStatuslineRenderContext } from "@/cli/display/statusline/context";
+import { appendInputHistory } from "@/cli/components/input-history";
 import { shouldRenderDefaultStatuslineRenderer } from "@/cli/display/statusline/default-renderer-activation";
 import { truncateToWidth } from "@/cli/display/statusline/formatting";
 import {
-  DEFAULT_STATUSLINE_RENDERER_ID,
-  getBuiltinStatuslineRenderer,
-} from "@/cli/display/statusline/registry";
-import { buildDefaultStatuslineParts } from "@/cli/display/statusline/renderers/Default";
-import { bytesToTokens, formatCompact } from "@/cli/helpers/format";
+  buildDefaultStatuslineParts,
+  renderDefaultStatusline,
+} from "@/cli/display/statusline/renderers/Default";
+import type { StatuslineUiContext } from "@/cli/display/statusline/types";
+import { createDraftPlaceholderDiscards } from "@/cli/helpers/draft-placeholder-discards";
+import {
+  bytesToTokens,
+  formatCompact,
+  formatElapsedLabel,
+  formatModeLabel,
+} from "@/cli/helpers/format";
 import { CLI_GLYPHS } from "@/cli/helpers/glyphs";
-import { formatGoalStatusIndicator } from "@/cli/helpers/goal-command";
 import {
   type ExecutionPhase,
   getPhaseVisual,
 } from "@/cli/helpers/phase-visuals";
-import type { StatusLinePayload } from "@/cli/helpers/status-line-payload";
+import {
+  findCursorLine,
+  getVisualLines,
+  truncateEnd,
+} from "@/cli/helpers/text-layout";
 import { getRandomThinkingTip } from "@/cli/helpers/thinking-messages";
+import { useProductStatusPanels } from "@/cli/hooks/use-product-status-panels";
 import { useShimmerAnimation } from "@/cli/hooks/use-shimmer-animation";
 import { useTokenSmoothing } from "@/cli/hooks/use-token-smoothing";
 import type { ModContext } from "@/cli/mods/types";
@@ -50,7 +61,6 @@ import { colors } from "./colors";
 import { InputAssist } from "./InputAssist";
 import { ModPanelRow, renderModPanelLines } from "./ModPanelRow";
 import { PasteAwareTextInput } from "./PasteAwareTextInput";
-import { ProductStatusRow } from "./ProductStatusRow";
 import { QueuedMessages } from "./QueuedMessages";
 import { ShimmerText } from "./ShimmerText";
 import {
@@ -59,6 +69,7 @@ import {
 } from "./spinners/animations.js";
 import { StreamingStatusSpinner } from "./spinners/StreamingStatusSpinner.js";
 import { Text } from "./Text";
+import { handleTranscriptDisplayShortcut } from "./transcript-display-state";
 
 // Window for double-escape to clear input
 const ESC_CLEAR_WINDOW_MS = 2500;
@@ -72,84 +83,6 @@ const EMPTY_COMPOSER_PROMPT_HINTS = [
   'Try "explain what this function does"',
   'Try "review this pull request"',
 ];
-
-function truncateEnd(value: string, maxChars: number): string {
-  if (maxChars <= 0) return "";
-  if (value.length <= maxChars) return value;
-  if (maxChars <= 3) return value.slice(0, maxChars);
-  return `${value.slice(0, maxChars - 3)}...`;
-}
-
-/**
- * Represents a visual line segment in the text.
- * A visual line ends at either a newline character or when it reaches lineWidth.
- */
-interface VisualLine {
-  start: number; // Start index in text
-  end: number; // End index (exclusive, not including \n)
-}
-
-/**
- * Computes visual lines from text, accounting for both hard breaks (\n)
- * and soft wrapping at lineWidth.
- */
-function getVisualLines(text: string, lineWidth: number): VisualLine[] {
-  const lines: VisualLine[] = [];
-  let lineStart = 0;
-
-  for (let i = 0; i <= text.length; i++) {
-    const char = text[i];
-    const lineLength = i - lineStart;
-
-    if (char === "\n" || i === text.length) {
-      // Hard break or end of text
-      lines.push({ start: lineStart, end: i });
-      lineStart = i + 1;
-    } else if (lineLength >= lineWidth && lineWidth > 0) {
-      // Soft wrap - line is full
-      lines.push({ start: lineStart, end: i });
-      lineStart = i;
-    }
-  }
-
-  // Ensure at least one line for empty text
-  if (lines.length === 0) {
-    lines.push({ start: 0, end: 0 });
-  }
-
-  return lines;
-}
-
-/**
- * Finds which visual line the cursor is on and the column within that line.
- */
-function findCursorLine(
-  cursorPos: number,
-  visualLines: VisualLine[],
-): { lineIndex: number; column: number } {
-  for (let i = 0; i < visualLines.length; i++) {
-    const line = visualLines[i];
-    if (line && cursorPos >= line.start && cursorPos <= line.end) {
-      return { lineIndex: i, column: cursorPos - line.start };
-    }
-  }
-  // Fallback to last line
-  const lastLine = visualLines[visualLines.length - 1];
-  return {
-    lineIndex: visualLines.length - 1,
-    column: Math.max(0, cursorPos - (lastLine?.start ?? 0)),
-  };
-}
-
-function formatModeLabel(modeName: string, modeGlyph?: string | null): string {
-  if (modeGlyph === "") {
-    return modeName;
-  }
-  if (modeGlyph === "⚡︎") {
-    return `${modeGlyph}${modeName}`;
-  }
-  return `${modeGlyph ?? "⏵⏵"} ${modeName}`;
-}
 
 function getPermissionModeTransientHintInfo(mode: PermissionMode): {
   name: string;
@@ -170,6 +103,12 @@ function getPermissionModeTransientHintInfo(mode: PermissionMode): {
         name: "unrestricted mode",
         color: colors.status.success,
         glyph: "⚡︎",
+      };
+    case "strict":
+      return {
+        name: "strict (all tools require approval)",
+        color: colors.status.error,
+        glyph: "🔒",
       };
   }
 }
@@ -448,14 +387,14 @@ const StatuslineSlot = memo(function StatuslineSlot({
   modeColor,
   modeGlyph,
   showExitHint,
-  currentModelProvider,
   isOpenAICodexProvider,
   isByokProvider,
-  isLocalBackend = false,
   hasTemporaryModelOverride,
   hideFooter,
   rightColumnWidth,
-  statusLinePayload,
+  modContext,
+  subagentLifecycleSnapshot: _subagentLifecycleSnapshot,
+  subagentLifecycleTick: _subagentLifecycleTick,
   modAdapter,
   transientHint,
 }: {
@@ -466,14 +405,14 @@ const StatuslineSlot = memo(function StatuslineSlot({
   modeColor: string | null;
   modeGlyph?: string | null;
   showExitHint: boolean;
-  currentModelProvider?: string | null;
   isOpenAICodexProvider: boolean;
   isByokProvider: boolean;
-  isLocalBackend?: boolean;
   hasTemporaryModelOverride?: boolean;
   hideFooter: boolean;
   rightColumnWidth: number;
-  statusLinePayload: StatusLinePayload;
+  modContext: ModContext;
+  subagentLifecycleSnapshot: ReturnType<typeof getSubagentLifecycleSnapshot>;
+  subagentLifecycleTick: number;
   modAdapter: LocalModAdapter;
   transientHint?: StatuslineTransientHint | null;
 }) {
@@ -484,22 +423,12 @@ const StatuslineSlot = memo(function StatuslineSlot({
     escapePressed,
   });
 
-  const statuslineContext = buildStatuslineRenderContext({
-    payload: statusLinePayload,
-    ui: {
-      currentModelProvider: currentModelProvider ?? null,
-      goalStatusText: null,
-      hasTemporaryModelOverride: Boolean(hasTemporaryModelOverride),
-      isByokProvider,
-      isLocalBackend,
-      isOpenAICodexProvider,
-      rightColumnWidth,
-    },
-  });
-
-  const builtInStatuslineRenderer = getBuiltinStatuslineRenderer(
-    DEFAULT_STATUSLINE_RENDERER_ID,
-  );
+  const statuslineUi: StatuslineUiContext = {
+    hasTemporaryModelOverride: Boolean(hasTemporaryModelOverride),
+    isByokProvider,
+    isOpenAICodexProvider,
+    rightColumnWidth,
+  };
 
   // The order-0 "primary" panel overrides the built-in agent · model line.
   const panels = modAdapter.registry?.ui.panels ?? {};
@@ -513,12 +442,8 @@ const StatuslineSlot = memo(function StatuslineSlot({
   const idleSlotAvailable = !hideFooterContent && !preemption && !transientHint;
 
   if (idleSlotAvailable && primaryPanel) {
-    const rowWidth = Math.max(0, (statuslineContext.terminalWidth ?? 0) - 1);
-    const lines = renderModPanelLines(
-      primaryPanel,
-      rowWidth,
-      statuslineContext,
-    );
+    const rowWidth = Math.max(0, (modContext.terminalWidth ?? 0) - 1);
+    const lines = renderModPanelLines(primaryPanel, rowWidth, modContext);
     if (lines.length > 0) {
       return (
         <Box flexDirection="column">
@@ -536,7 +461,8 @@ const StatuslineSlot = memo(function StatuslineSlot({
   }
 
   const defaultStatuslineParts = buildDefaultStatuslineParts(
-    statuslineContext,
+    modContext,
+    statuslineUi,
     rightColumnWidth,
   );
   const rightLabel = defaultStatuslineParts.right;
@@ -572,7 +498,7 @@ const StatuslineSlot = memo(function StatuslineSlot({
   });
 
   if (shouldRenderDefaultStatusline) {
-    return builtInStatuslineRenderer.render(statuslineContext);
+    return renderDefaultStatusline(modContext, statuslineUi);
   }
 
   return (
@@ -906,7 +832,6 @@ export function Input({
   agentName,
   currentModel,
   currentModelProvider,
-  isLocalBackend = false,
   hasTemporaryModelOverride = false,
   currentReasoningEffort,
   fileAutocompleteFdPath,
@@ -915,8 +840,6 @@ export function Input({
   onEscapeCancel,
   onEscapeCommandCancel,
   inputDisabled = false,
-  goalLoopActive = false,
-  onGoalLoopExit,
   conversationId,
   onPasteError,
   restoredInput,
@@ -925,7 +848,7 @@ export function Input({
   executionPhase = null,
   terminalWidth,
   shouldAnimate = true,
-  statusLinePayload,
+  modContext,
   modAdapter,
   statusLinePrompt,
   onCycleReasoningEffort,
@@ -959,7 +882,6 @@ export function Input({
   agentName?: string | null;
   currentModel?: string | null;
   currentModelProvider?: string | null;
-  isLocalBackend?: boolean;
   hasTemporaryModelOverride?: boolean;
   currentReasoningEffort?: ModelReasoningEffort | null;
   fileAutocompleteFdPath?: string | null;
@@ -968,8 +890,6 @@ export function Input({
   onEscapeCancel?: () => void;
   onEscapeCommandCancel?: () => boolean;
   inputDisabled?: boolean;
-  goalLoopActive?: boolean;
-  onGoalLoopExit?: () => void;
   conversationId?: string;
   onPasteError?: (message: string) => void;
   restoredInput?: string | null;
@@ -978,7 +898,7 @@ export function Input({
   executionPhase?: ExecutionPhase;
   terminalWidth: number;
   shouldAnimate?: boolean;
-  statusLinePayload: StatusLinePayload;
+  modContext: ModContext;
   modAdapter: LocalModAdapter;
   statusLinePrompt?: string;
   onCycleReasoningEffort?: () => void;
@@ -1153,16 +1073,64 @@ export function Input({
   // Track preferred column for vertical navigation (sticky column behavior)
   const [preferredColumn, setPreferredColumn] = useState<number | null>(null);
 
+  // Display text currently owned by the submit handler; its registry entries
+  // must survive until the handler resolves or restores them.
+  const inFlightSubmitTextRef = useRef<string | null>(null);
+  const [draftDiscards] = useState(createDraftPlaceholderDiscards);
+  // Live holders: a drop site zeroes one, then releases in the same tick.
+  const temporaryInputRef = useRef(temporaryInput);
+  temporaryInputRef.current = temporaryInput;
+  const restoredInputRef = useRef(restoredInput);
+  restoredInputRef.current = restoredInput;
+
+  // Free registry entries dropped from the draft (input cleared, placeholder
+  // edited out, draft replaced) unless a live holder still references them:
+  // the parked history draft, queued messages, a pending restored input, or
+  // the in-flight submission. History is excluded on purpose - after a
+  // successful submit the handler frees its entries, so recalled history
+  // placeholders already degrade to literal text.
+  const releaseDiscardedDraftPlaceholders = useCallback(
+    (discarded: string, next: string) => {
+      draftDiscards.release(discarded, [
+        next,
+        temporaryInputRef.current,
+        restoredInputRef.current,
+        inFlightSubmitTextRef.current,
+        ...(messageQueue?.map((m) => m.text) ?? []),
+      ]);
+    },
+    [messageQueue, draftDiscards],
+  );
+
+  // Drop the parked history draft and release it against `next`, the draft
+  // replacing it. Down-restore omits `next`: the parked draft is live again.
+  const clearParkedDraft = useCallback(
+    (next?: string) => {
+      const parked = temporaryInputRef.current;
+      temporaryInputRef.current = "";
+      setTemporaryInput("");
+      if (next !== undefined) releaseDiscardedDraftPlaceholders(parked, next);
+    },
+    [releaseDiscardedDraftPlaceholders],
+  );
+
   // Restore input from error (only if current value is empty)
   useEffect(() => {
     if (restoredInput && value === "") {
       setValue(restoredInput);
       onRestoredInputConsumed?.();
     } else if (restoredInput && value !== "") {
-      // Input has content, don't clobber - just consume the restored value
+      // Input has content, don't clobber - drop the restored value instead
+      restoredInputRef.current = null;
+      releaseDiscardedDraftPlaceholders(restoredInput, value);
       onRestoredInputConsumed?.();
     }
-  }, [restoredInput, value, onRestoredInputConsumed]);
+  }, [
+    restoredInput,
+    value,
+    onRestoredInputConsumed,
+    releaseDiscardedDraftPlaceholders,
+  ]);
 
   useEffect(() => {
     if (!showInspirationalPromptHints || value !== "") {
@@ -1354,7 +1322,8 @@ export function Input({
       // When input is non-empty, use double-escape to clear
       if (value) {
         if (escapePressed) {
-          // Second escape - clear input
+          // Second escape - clear input (discard: release dropped placeholders)
+          releaseDiscardedDraftPlaceholders(value, "");
           setValue("");
           setEscapePressed(false);
           if (escapeTimerRef.current) clearTimeout(escapeTimerRef.current);
@@ -1384,12 +1353,11 @@ export function Input({
 
     if (!interactionEnabled) return;
 
-    // Handle CTRL-O to expand/collapse the last tool call output
     if (input === "o" && key.ctrl) {
       if (onCtrlO) onCtrlO();
       return;
     }
-
+    if (handleTranscriptDisplayShortcut(input, key)) return;
     // Handle CTRL-C for double-ctrl-c-to-exit
     // In bash mode, CTRL-C wipes input but doesn't exit bash mode
     if (input === "c" && key.ctrl) {
@@ -1405,6 +1373,8 @@ export function Input({
       } else {
         // First CTRL-C - wipe input and start 1-second timer
         // Note: In bash mode, this clears input but keeps bash mode active
+        // Discard: release placeholders dropped with the wiped input
+        releaseDiscardedDraftPlaceholders(value, "");
         setValue("");
         setBashExitArmed(false);
         setCtrlCPressed(true);
@@ -1419,7 +1389,7 @@ export function Input({
   // Note: bash mode entry/exit is implemented inside PasteAwareTextInput so we can
   // consume the keystroke before it renders (no flicker).
 
-  // Handle Shift+Tab for permission mode cycling (or goal loop exit)
+  // Handle Shift+Tab for permission mode cycling
   useInput((_input, key) => {
     if (!interactionEnabled) return;
 
@@ -1445,12 +1415,6 @@ export function Input({
     }
 
     if (key.shift && key.tab) {
-      // If a goal loop is active, pause it before cycling permission mode.
-      if (goalLoopActive && onGoalLoopExit) {
-        onGoalLoopExit();
-        return;
-      }
-
       // Cycle through permission modes
       const modes: PermissionMode[] = [
         "unrestricted",
@@ -1532,6 +1496,9 @@ export function Input({
           setAtStartBoundary(false);
           const combined = onQueueEdit();
           if (combined) {
+            // The current draft is replaced by the queued texts: release
+            // placeholders only the discarded draft still referenced.
+            releaseDiscardedDraftPlaceholders(value, combined);
             setValue(combined);
             setCursorPos(combined.length);
           }
@@ -1603,6 +1570,7 @@ export function Input({
           setHistoryIndex(-1);
           setValue(temporaryInput);
           setCursorPos(temporaryInput.length); // Cursor at end for user's draft
+          clearParkedDraft();
         }
       }
     }
@@ -1630,9 +1598,9 @@ export function Input({
     // Exit history mode but keep the modified text
     if (historyIndex !== -1 && value !== history[historyIndex]) {
       setHistoryIndex(-1);
-      setTemporaryInput("");
+      clearParkedDraft(value);
     }
-  }, [value, historyIndex, history]);
+  }, [value, historyIndex, history, clearParkedDraft]);
 
   // Clean up timers on unmount
   useEffect(() => {
@@ -1661,15 +1629,14 @@ export function Input({
       if (bashRunning) return;
 
       // Add to history if not empty and not a duplicate of the last entry
-      setHistory((prev) => {
-        if (previousValue.trim() === prev[prev.length - 1]) return prev;
-        return [...prev, previousValue];
-      });
+      setHistory((prev) => appendInputHistory(prev, previousValue));
 
-      // Reset history navigation
       setHistoryIndex(-1);
-      setTemporaryInput("");
+      clearParkedDraft("");
 
+      // Bash runs the display text verbatim and never resolves placeholders,
+      // so the submitted text's registry entries are dead from here on.
+      releaseDiscardedDraftPlaceholders(previousValue, "");
       setValue(""); // Clear immediately for responsiveness
       // Stay in bash mode - user exits with backspace on empty input
       if (onBashSubmit) {
@@ -1680,21 +1647,26 @@ export function Input({
 
     // Add to history if not empty and not a duplicate of the last entry
     if (previousValue.trim()) {
-      setHistory((prev) => {
-        if (previousValue === prev[prev.length - 1]) return prev;
-        return [...prev, previousValue];
-      });
+      setHistory((prev) => appendInputHistory(prev, previousValue));
     }
 
-    // Reset history navigation
     setHistoryIndex(-1);
-    setTemporaryInput("");
+    clearParkedDraft(previousValue);
 
     setValue(""); // Clear immediately for responsiveness
-    const result = await onSubmit(previousValue);
-    // If message was NOT submitted (e.g. pending approval), restore it
-    if (!result.submitted) {
-      setValue(previousValue);
+    // Keep the submission's placeholder entries alive while the handler owns
+    // the text (queuing, content-part build, or failure restore).
+    inFlightSubmitTextRef.current = previousValue;
+    try {
+      const result = await onSubmit(previousValue);
+      // If message was NOT submitted (e.g. pending approval), restore it
+      if (!result.submitted) {
+        setValue(previousValue);
+      }
+    } finally {
+      if (inFlightSubmitTextRef.current === previousValue) {
+        inFlightSubmitTextRef.current = null;
+      }
     }
   }, [
     isAutocompleteActive,
@@ -1703,6 +1675,8 @@ export function Input({
     bashRunning,
     onBashSubmit,
     onSubmit,
+    releaseDiscardedDraftPlaceholders,
+    clearParkedDraft,
   ]);
 
   const handleFileAutocompleteApply = useCallback(
@@ -1722,29 +1696,43 @@ export function Input({
 
       // Add to history if not a duplicate of the last entry
       if (commandToSubmit) {
-        setHistory((prev) => {
-          if (commandToSubmit === prev[prev.length - 1]) return prev;
-          return [...prev, commandToSubmit];
-        });
+        setHistory((prev) => appendInputHistory(prev, commandToSubmit));
       }
 
-      // Reset history navigation
       setHistoryIndex(-1);
-      setTemporaryInput("");
+      clearParkedDraft(commandToSubmit);
 
+      // The selected command replaces the current draft
+      releaseDiscardedDraftPlaceholders(value, commandToSubmit);
       setValue(""); // Clear immediately for responsiveness
       await onSubmit(commandToSubmit);
     },
-    [onSubmit],
+    [onSubmit, value, releaseDiscardedDraftPlaceholders, clearParkedDraft],
   );
 
   // Handle slash command autocomplete (Tab key - fill text only)
-  const handleCommandAutocomplete = useCallback((selectedCommand: string) => {
-    // Just fill in the command text without executing
-    // User can then press Enter to execute or continue typing arguments
-    setValue(selectedCommand);
-    setCursorPos(selectedCommand.length);
-  }, []);
+  const handleCommandAutocomplete = useCallback(
+    (selectedCommand: string) => {
+      // Just fill in the command text without executing
+      // User can then press Enter to execute or continue typing arguments
+      // The filled command replaces the current draft
+      releaseDiscardedDraftPlaceholders(value, selectedCommand);
+      setValue(selectedCommand);
+      setCursorPos(selectedCommand.length);
+    },
+    [value, releaseDiscardedDraftPlaceholders],
+  );
+
+  // Edits only note placeholders that left the draft: a kill-buffer yank or a
+  // retyped bracket can restore them, so the release boundaries above free
+  // them later, once no live holder references them.
+  const handleDraftChange = useCallback(
+    (nextValue: string) => {
+      draftDiscards.noteEdit(value, nextValue);
+      setValue(nextValue);
+    },
+    [value, draftDiscards],
+  );
 
   // Get display name and color for permission mode
   // Memoized to prevent unnecessary footer re-renders
@@ -1785,51 +1773,9 @@ export function Input({
       modeName: hintInfo.name,
       modeColor: hintInfo.color,
       modeGlyph: hintInfo.glyph,
-      showExitHint: goalLoopActive,
+      showExitHint: false,
     });
-  }, [currentMode, goalLoopActive, showStatuslineTransientHint]);
-
-  // Goal product status text. Stored in state (rather than recomputed every
-  // render) so we only trigger a re-render when the displayed string actually
-  // changes. The previous implementation used setGoalFooterTick + setInterval
-  // which forced a full Input re-render every second while a goal was active,
-  // matching the flicker pattern documented in review-knowledge.md.
-  const currentGoal = conversationId
-    ? settingsManager.getConversationGoal(conversationId)
-    : null;
-  const goalStatus = currentGoal?.status ?? null;
-  const goalActiveStartedAt = currentGoal?.activeStartedAt ?? null;
-  const goalIsActive = goalStatus === "active";
-
-  const [goalStatusText, setGoalStatusText] = useState<string | null>(() =>
-    currentGoal ? formatGoalStatusIndicator(currentGoal) : null,
-  );
-
-  // Sync on prop-driven changes (status transitions, clear, pause, complete).
-  // goalStatus and goalActiveStartedAt are intentional triggers — they detect
-  // transitions even though the effect body re-reads via getConversationGoal.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: deps are change triggers, not values used in the effect body
-  useEffect(() => {
-    const goal = conversationId
-      ? settingsManager.getConversationGoal(conversationId)
-      : null;
-    const nextText = goal ? formatGoalStatusIndicator(goal) : null;
-    setGoalStatusText((prev) => (prev === nextText ? prev : nextText));
-  }, [conversationId, goalStatus, goalActiveStartedAt]);
-
-  // While the goal is active, re-check the formatted string each second but
-  // only re-render when it actually changes. Combined with the fixed-width
-  // format from formatGoalElapsedSeconds, the string changes at most once per
-  // second and the change is always same-width, so no product row flicker.
-  useEffect(() => {
-    if (!goalIsActive || !conversationId) return;
-    const timer = setInterval(() => {
-      const goal = settingsManager.getConversationGoal(conversationId);
-      const nextText = goal ? formatGoalStatusIndicator(goal) : null;
-      setGoalStatusText((prev) => (prev === nextText ? prev : nextText));
-    }, 1000);
-    return () => clearInterval(timer);
-  }, [goalIsActive, conversationId]);
+  }, [currentMode, showStatuslineTransientHint]);
 
   // Create a horizontal line using box-drawing characters.
   const horizontalLine = useMemo(
@@ -1914,68 +1860,57 @@ export function Input({
     previousFooterNotificationRef.current = footerNotification ?? null;
   }, [footerNotification, showStatuslineTransientHint]);
 
+  const {
+    panelsWithDefaultProductStatus,
+    panelModContext,
+    subagentLifecycleSnapshot,
+    subagentLifecycleTick,
+  } = useProductStatusPanels({ modContext, modAdapter, shouldAnimate });
+
   // Decoupled from input churn (value/cursorPos) so panel content only
   // re-renders when the panels themselves change, mirroring how BtwPane
   // stays flash-free. Folding this into lowerPane would rebuild it on every
   // keystroke.
-  const panelLiveContext = useMemo<ModContext>(
-    () =>
-      buildStatuslineRenderContext({
-        payload: statusLinePayload,
-        ui: {
-          currentModelProvider: currentModelProvider ?? null,
-          goalStatusText: null,
-          hasTemporaryModelOverride: Boolean(hasTemporaryModelOverride),
-          isByokProvider:
-            currentModelProvider?.startsWith("lc-") ||
-            currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
-          isLocalBackend,
-          isOpenAICodexProvider:
-            currentModelProvider === OPENAI_CODEX_PROVIDER_NAME,
-          rightColumnWidth: footerRightColumnWidth,
-        },
-      }),
-    [
-      currentModelProvider,
-      footerRightColumnWidth,
-      hasTemporaryModelOverride,
-      isLocalBackend,
-      statusLinePayload,
-    ],
-  );
-
   const modPanelRow = useMemo(() => {
+    void subagentLifecycleSnapshot;
+    void subagentLifecycleTick;
     if (suppressDividers) return null;
     return (
       <ModPanelRow
-        panels={modAdapter.registry?.ui.panels}
+        panels={panelsWithDefaultProductStatus}
         terminalWidth={terminalWidth}
         placement="above"
-        context={panelLiveContext}
+        context={panelModContext}
       />
     );
   }, [
     suppressDividers,
-    modAdapter.registry?.ui.panels,
+    panelsWithDefaultProductStatus,
     terminalWidth,
-    panelLiveContext,
+    panelModContext,
+    subagentLifecycleSnapshot,
+    subagentLifecycleTick,
   ]);
 
   const modPanelRowBelow = useMemo(() => {
+    void subagentLifecycleSnapshot;
+    void subagentLifecycleTick;
     if (suppressDividers) return null;
     return (
       <ModPanelRow
-        panels={modAdapter.registry?.ui.panels}
+        panels={panelsWithDefaultProductStatus}
         terminalWidth={terminalWidth}
         placement="below"
-        context={panelLiveContext}
+        context={panelModContext}
       />
     );
   }, [
     suppressDividers,
-    modAdapter.registry?.ui.panels,
+    panelsWithDefaultProductStatus,
     terminalWidth,
-    panelLiveContext,
+    panelModContext,
+    subagentLifecycleSnapshot,
+    subagentLifecycleTick,
   ]);
 
   const lowerPane = useMemo(() => {
@@ -1989,13 +1924,6 @@ export function Input({
         {interactionEnabled ? (
           <Box flexDirection="column">
             {modPanelRow}
-
-            {!suppressDividers && (
-              <ProductStatusRow
-                goalStatusText={goalStatusText}
-                terminalWidth={terminalWidth}
-              />
-            )}
 
             {/* Top horizontal divider */}
             {!suppressDividers && (
@@ -2020,7 +1948,7 @@ export function Input({
               <Box flexGrow={1} width={contentWidth}>
                 <PasteAwareTextInput
                   value={value}
-                  onChange={setValue}
+                  onChange={handleDraftChange}
                   onSubmit={handleSubmit}
                   placeholder={
                     showInspirationalPlaceholder
@@ -2080,8 +2008,7 @@ export function Input({
                 modeName={modeInfo?.name ?? null}
                 modeColor={modeInfo?.color ?? null}
                 modeGlyph={modeInfo?.glyph ?? null}
-                showExitHint={modeInfo?.showExitHint ?? goalLoopActive}
-                currentModelProvider={currentModelProvider}
+                showExitHint={modeInfo?.showExitHint ?? false}
                 isOpenAICodexProvider={
                   currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
                 }
@@ -2089,11 +2016,12 @@ export function Input({
                   currentModelProvider?.startsWith("lc-") ||
                   currentModelProvider === OPENAI_CODEX_PROVIDER_NAME
                 }
-                isLocalBackend={isLocalBackend}
                 hasTemporaryModelOverride={hasTemporaryModelOverride}
                 hideFooter={hideFooter}
                 rightColumnWidth={footerRightColumnWidth}
-                statusLinePayload={statusLinePayload}
+                modContext={panelModContext}
+                subagentLifecycleSnapshot={subagentLifecycleSnapshot}
+                subagentLifecycleTick={subagentLifecycleTick}
                 modAdapter={modAdapter}
                 transientHint={statuslineTransientHint}
               />
@@ -2116,6 +2044,7 @@ export function Input({
     contentWidth,
     value,
     handleSubmit,
+    handleDraftChange,
     showInspirationalPlaceholder,
     cursorPos,
     onEscapeCancel,
@@ -2136,7 +2065,6 @@ export function Input({
     modeInfo?.color,
     modeInfo?.glyph,
     modeInfo?.showExitHint,
-    goalLoopActive,
     currentModel,
     currentReasoningEffort,
     fileAutocompleteFdPath,
@@ -2146,17 +2074,16 @@ export function Input({
     footerRightColumnWidth,
     reserveInputSpace,
     inputChromeHeight,
-    statusLinePayload,
+    panelModContext,
+    subagentLifecycleSnapshot,
+    subagentLifecycleTick,
     modAdapter,
 
-    goalStatusText,
     promptChar,
     promptVisualWidth,
     suppressDividers,
     queueMode,
-    isLocalBackend,
     inspirationalPlaceholder,
-    terminalWidth,
     statuslineTransientHint,
   ]);
 
@@ -2186,22 +2113,4 @@ export function Input({
       {lowerPane}
     </Box>
   );
-}
-
-function formatElapsedLabel(ms: number): string {
-  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
-  const seconds = totalSeconds % 60;
-  const totalMinutes = Math.floor(totalSeconds / 60);
-  if (totalMinutes === 0) {
-    return `${seconds}s`;
-  }
-  const minutes = totalMinutes % 60;
-  const hours = Math.floor(totalMinutes / 60);
-  if (hours > 0) {
-    const parts: string[] = [`${hours}hr`];
-    if (minutes > 0) parts.push(`${minutes}m`);
-    if (seconds > 0) parts.push(`${seconds}s`);
-    return parts.join(" ");
-  }
-  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }

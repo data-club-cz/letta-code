@@ -1,7 +1,5 @@
-// src/cli/app/useSubmitHandler.ts
-
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type {
@@ -31,11 +29,11 @@ import {
   isActiveMemfsEnabled,
   isLocalMemfsActive,
 } from "@/agent/memory-runtime";
+import { buildReflectionMemoryScope } from "@/agent/memory-worktree";
 import { sendMessageStreamWithBackend } from "@/agent/message";
-import {
-  detectPersonalityFromPersonaFile,
-  type PersonalityId,
-} from "@/agent/personality";
+import { detectPersonalityFromPersonaFile } from "@/agent/personality";
+import type { PersonalityId } from "@/agent/personality-presets";
+import { requestCloudReflectionRun } from "@/agent/reflection-runs";
 import { recordSessionEnd } from "@/agent/session-history";
 import type { SessionStats } from "@/agent/stats";
 import { getBackend } from "@/backend";
@@ -57,42 +55,48 @@ import {
 import type { ContextTracker } from "@/cli/helpers/context-tracker";
 import { resetContextHistory } from "@/cli/helpers/context-tracker";
 import type { ConversationSwitchContext } from "@/cli/helpers/conversation-switch-alert";
+import { buildDoctorMessage } from "@/cli/helpers/doctor-command";
 import { formatErrorDetails } from "@/cli/helpers/error-formatter";
 import {
-  buildGoalReminder,
-  formatGoalSummary,
-  GOAL_USAGE,
-  GOAL_USAGE_HINT,
-  goalStatusLabel,
-  parseGoalArgs,
-  validateGoalObjective,
-} from "@/cli/helpers/goal-command";
-import {
-  buildDoctorMessage,
   buildInitMessage,
   gatherInitGitContext,
 } from "@/cli/helpers/init-command";
 import { buildLogoutSuccessMessage } from "@/cli/helpers/logout-message";
 import { getReflectionSettings } from "@/cli/helpers/memory-reminder";
-import { handleMemorySubagentCompletion } from "@/cli/helpers/memory-subagent-completion";
 import {
   buildMessageContentFromDisplay,
   clearPlaceholdersInText,
 } from "@/cli/helpers/paste-registry";
 import { resolveReasoningTabToggleCommand } from "@/cli/helpers/reasoning-tab-toggle";
+import { parseReflectCommandArgs } from "@/cli/helpers/reflect-command";
+import {
+  buildReflectionArenaChoiceQuestions,
+  finalizeReflectionArenaChoice,
+  formatReflectionArenaAwaitingChoice,
+  loadReflectionArenaRun,
+  REFLECTION_ARENA_MODEL_A_DEFAULT,
+  type ReflectionArenaChoice,
+  type ReflectionArenaChoiceQuestion,
+  sampleReflectionArenaComparisonModel,
+  startReflectionArenaRun,
+} from "@/cli/helpers/reflection-arena";
+import { launchReflectionArena } from "@/cli/helpers/reflection-arena-launcher";
+import { finalizeMultiReflectionCompletion } from "@/cli/helpers/reflection-completion";
 import {
   AUTO_REFLECTION_DESCRIPTION,
+  finalizeReflectionMemoryWorktreeLaunch,
+  getReflectionLaunchSkippedMessage,
+  getReflectionMergeLaunchOptions,
   launchReflectionSubagent,
+  prepareReflectionMemoryWorktreeLaunch,
   releaseReflectionLaunch,
   tryReserveReflectionLaunch,
 } from "@/cli/helpers/reflection-launcher";
 import {
+  buildAutoReflectionPayload,
   buildMultiReflectionPayload,
-  buildParentMemorySnapshot,
   buildReflectionAutoPayload,
   buildReflectionSelectorPrompt,
-  buildReflectionSubagentPrompt,
-  finalizeMultiReflectionPayload,
   readReflectionAutoSelection,
 } from "@/cli/helpers/reflection-transcript";
 import type { ApprovalRequest } from "@/cli/helpers/stream";
@@ -101,6 +105,7 @@ import {
   setSystemPromptDoctorState,
 } from "@/cli/helpers/system-prompt-warning.ts";
 import { getRandomThinkingVerb } from "@/cli/helpers/thinking-messages";
+import { tuiSubmitClientPreferences } from "@/cli/helpers/tui-client-preferences";
 import {
   buildModCommandPrompt,
   parseModCommandArgv,
@@ -118,15 +123,12 @@ import {
   SYSTEM_REMINDER_OPEN,
 } from "@/constants";
 import { experimentManager } from "@/experiments/manager";
-import { goalLoopMode } from "@/goal-loop-mode";
 import {
   runPreCompactHooks,
   runSessionStartHooks,
   runUserPromptSubmitHooks,
 } from "@/hooks";
 import { createModConversationHandle } from "@/mods/conversation-handle";
-import type { PermissionMode } from "@/permissions/mode";
-import { permissionMode } from "@/permissions/mode";
 import type { QueueRuntime } from "@/queue/queue-runtime";
 import {
   buildSharedReminderParts,
@@ -135,6 +137,7 @@ import {
 import { runPostTurnMemorySync } from "@/reminders/memory-git-sync";
 import {
   enqueueMemoryGitSyncReminder,
+  markPostCompactionContextRemindersPending,
   markSecretsInfoReminderPending,
   type SharedReminderState,
 } from "@/reminders/state";
@@ -146,15 +149,18 @@ import { detectShellContext } from "@/utils/shell-context";
 import { extractTaskNotificationsForDisplay } from "@/utils/task-notifications";
 import { switchCurrentRuntimeWorkingDirectory } from "@/websocket/listener/cwd-change";
 
-import { shouldSlashCommandBypassQueue } from "./command-routing";
+import {
+  aliasBareExitCommand,
+  shouldSlashCommandBypassQueue,
+} from "./command-routing";
 import { buildTextParts } from "./content-parts";
-import { buildGoalPrompt } from "./goal-loop";
 import { appendOptimisticUserLine, createClientOtid, uid } from "./ids";
-import { saveLastSessionBeforeExit } from "./session";
+import { prepareSessionExit } from "./session";
 import { handleConnectionCommand } from "./submit-connection-commands";
 import { handleDiagnosticsCommand } from "./submit-diagnostics-commands";
 import { handleNavigationCommand } from "./submit-navigation-commands";
 import { handleProfileCommand } from "./submit-profile-commands";
+import { bindTuiClientPreferences, buildTuiTurnInput } from "./turn-input";
 import type {
   ActiveOverlay,
   AppCommandRunner,
@@ -305,6 +311,12 @@ type SubmitHandlerContext = {
   setProfileConfirmPending: Dispatch<
     SetStateAction<ProfileConfirmPending | null>
   >;
+  setReflectionArenaChoicePending: Dispatch<
+    SetStateAction<{
+      questions: ReflectionArenaChoiceQuestion[];
+      runId: string;
+    } | null>
+  >;
   setWorktreeDiffSelectorPending: Dispatch<
     SetStateAction<WorktreeDiffSelectorPending | null>
   >;
@@ -316,8 +328,6 @@ type SubmitHandlerContext = {
   setThinkingMessage: Dispatch<SetStateAction<string>>;
   setTokenStreamingEnabled: Dispatch<SetStateAction<boolean>>;
   setTrajectoryTokenBase: Dispatch<SetStateAction<number>>;
-  setUiPermissionMode: (mode: PermissionMode) => void;
-  setUiGoalLoopActive: Dispatch<SetStateAction<boolean>>;
   sharedReminderStateRef: MutableRefObject<SharedReminderState>;
   shouldAutoGenerateConversationTitleRef: MutableRefObject<boolean>;
 
@@ -342,66 +352,100 @@ type SubmitHandlerContext = {
   onReload?: () => Promise<void>;
 };
 
-type ReflectCommandArgs =
-  | { instruction?: string; kind: "single" }
-  | { instruction?: string; kind: "recent"; limit: number }
-  | { conversationIds: string[]; instruction?: string; kind: "conversations" }
-  | { instruction?: string; kind: "auto" };
+type ReflectArenaCommandArgs =
+  | {
+      instruction?: string;
+      kind: "launch";
+      modelA?: string;
+      modelB?: string;
+    }
+  | {
+      choice: ReflectionArenaChoice;
+      kind: "choose";
+      notes?: string;
+      runId: string;
+    }
+  | { kind: "resume"; runId: string };
 
-function isReflectCommandFlag(value: string): boolean {
-  return (
-    value === "--" ||
-    value === "--auto" ||
-    value === "--conversation" ||
-    value === "--instruction" ||
-    value === "--instructions" ||
-    value === "--recent" ||
-    value === "-i" ||
-    value.startsWith("--instruction=")
-  );
-}
-
-function parseReflectCommandArgs(input: string): ReflectCommandArgs {
+function parseReflectArenaCommandArgs(input: string): ReflectArenaCommandArgs {
   const trimmed = input.trim();
-  const command = trimmed.split(/\s+/, 1)[0] ?? "/reflect";
+  const command = trimmed.split(/\s+/, 1)[0] ?? "/reflect-arena";
   const parts = parseModCommandArgv(trimmed.slice(command.length).trim());
-  if (parts.length === 0) {
-    return { kind: "single" };
+  if (parts[0] === "choose") {
+    const runId = parts[1];
+    const rawChoice = parts[2];
+    if (!runId || !rawChoice) {
+      throw new Error(
+        "Usage: /reflect-arena choose <run-id> <1|2|tie> [notes]",
+      );
+    }
+    if (rawChoice !== "1" && rawChoice !== "2" && rawChoice !== "tie") {
+      throw new Error(
+        "Usage: /reflect-arena choose <run-id> <1|2|tie> [notes]",
+      );
+    }
+    return {
+      kind: "choose",
+      runId,
+      choice: rawChoice,
+      notes: parts.slice(3).join(" ").trim() || undefined,
+    };
+  }
+  if (parts[0] === "resume") {
+    const runId = parts[1];
+    if (!runId) {
+      throw new Error("Usage: /reflect-arena resume <run-id>");
+    }
+    return { kind: "resume", runId };
   }
 
-  let recentLimit: number | null = null;
-  const conversationIds: string[] = [];
+  let modelA: string | undefined;
+  let modelB: string | undefined;
   const instructions: string[] = [];
-  let auto = false;
   for (let index = 0; index < parts.length; index += 1) {
     const part = parts[index];
     if (!part) continue;
+    if (part === "--model-a") {
+      modelA = parts[index + 1];
+      if (!modelA) throw new Error("Usage: /reflect-arena --model-a <model>");
+      index += 1;
+      continue;
+    }
+    if (part.startsWith("--model-a=")) {
+      modelA = part.slice("--model-a=".length).trim();
+      if (!modelA) throw new Error("Usage: /reflect-arena --model-a <model>");
+      continue;
+    }
+    if (part === "--model-b") {
+      modelB = parts[index + 1];
+      if (!modelB) throw new Error("Usage: /reflect-arena --model-b <model>");
+      index += 1;
+      continue;
+    }
+    if (part.startsWith("--model-b=")) {
+      modelB = part.slice("--model-b=".length).trim();
+      if (!modelB) throw new Error("Usage: /reflect-arena --model-b <model>");
+      continue;
+    }
     if (
       part === "--instruction" ||
       part === "--instructions" ||
       part === "-i"
     ) {
-      let instructionEnd = index + 1;
-      while (instructionEnd < parts.length) {
-        const instructionPart = parts[instructionEnd];
-        if (!instructionPart || isReflectCommandFlag(instructionPart)) break;
-        instructionEnd += 1;
-      }
       const instruction = parts
-        .slice(index + 1, instructionEnd)
+        .slice(index + 1)
         .join(" ")
         .trim();
       if (!instruction) {
-        throw new Error("Usage: /reflect --instruction <instruction>");
+        throw new Error("Usage: /reflect-arena --instruction <instruction>");
       }
       instructions.push(instruction);
-      index = instructionEnd - 1;
-      continue;
+      break;
     }
     if (part.startsWith("--instruction=")) {
       const instruction = part.slice("--instruction=".length).trim();
       if (!instruction) {
-        throw new Error("Usage: /reflect --instruction <instruction>");
+        throw new Error("Usage: /reflect-arena --instruction <instruction>");
       }
       instructions.push(instruction);
       continue;
@@ -412,61 +456,22 @@ function parseReflectCommandArgs(input: string): ReflectCommandArgs {
         .join(" ")
         .trim();
       if (!instruction) {
-        throw new Error("Usage: /reflect -- <instruction>");
+        throw new Error("Usage: /reflect-arena -- <instruction>");
       }
       instructions.push(instruction);
       break;
     }
-    if (part === "--auto") {
-      auto = true;
-      continue;
-    }
-    if (part === "--recent") {
-      const raw = parts[index + 1];
-      const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        throw new Error("Usage: /reflect --recent <positive integer>");
-      }
-      recentLimit = parsed;
-      index += 1;
-      continue;
-    }
-    if (part === "--conversation") {
-      const conversationId = parts[index + 1];
-      if (!conversationId) {
-        throw new Error("Usage: /reflect --conversation <conversation-id>");
-      }
-      conversationIds.push(conversationId);
-      index += 1;
-      continue;
-    }
     throw new Error(
-      "Usage: /reflect [--recent N | --conversation <id> ... | --auto] [--instruction <instruction>]",
+      "Usage: /reflect-arena [--model-a <model>] [--model-b <model>] [--instruction <instruction>]",
     );
   }
 
-  const instruction = instructions.join("\n").trim() || undefined;
-  const modes = [recentLimit !== null, conversationIds.length > 0, auto].filter(
-    Boolean,
-  ).length;
-  if (modes > 1) {
-    throw new Error("Use only one of --recent, --conversation, or --auto.");
-  }
-  if (auto) {
-    return { instruction, kind: "auto" };
-  }
-  if (recentLimit !== null) {
-    return { instruction, kind: "recent", limit: recentLimit };
-  }
-  if (conversationIds.length > 0) {
-    return { conversationIds, instruction, kind: "conversations" };
-  }
-  return { instruction, kind: "single" };
-}
-
-function aliasBareExitCommand(input: string): string {
-  if (input === "exit" || input === "quit") return "/exit";
-  return input;
+  return {
+    kind: "launch",
+    modelA,
+    modelB,
+    instruction: instructions.join("\n").trim() || undefined,
+  };
 }
 
 export function useSubmitHandler(ctx: SubmitHandlerContext) {
@@ -516,7 +521,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
     pendingConversationSwitchRef,
     pendingGitReminderRef,
     processConversation,
-    processConversationWithQueuedApprovals,
     profileConfirmPending,
     projectDirectory,
     queuedApprovalResults,
@@ -551,6 +555,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
     setModelSelectorOptions,
     setNeedsEagerApprovalCheck,
     setProfileConfirmPending,
+    setReflectionArenaChoicePending,
     setWorktreeDiffSelectorPending,
     setReasoningTabCycleEnabled,
     setSearchQuery,
@@ -560,8 +565,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
     setThinkingMessage,
     setTokenStreamingEnabled,
     setTrajectoryTokenBase,
-    setUiPermissionMode,
-    setUiGoalLoopActive,
     sharedReminderStateRef,
     shouldAutoGenerateConversationTitleRef,
 
@@ -580,7 +583,14 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: moved from AppCoordinator; dependencies are preserved from the original callback.
   const onSubmit = useCallback(
-    async (message?: string): Promise<{ submitted: boolean }> => {
+    async (
+      message?: string,
+      submitOptions?: { userInitiated: boolean },
+    ): Promise<{ submitted: boolean }> => {
+      const commandScope = {
+        agentId: agentIdRef.current,
+        conversationId: conversationIdRef.current,
+      };
       const msg = message?.trim() ?? "";
       const overrideContentParts = overrideContentPartsRef.current;
       const hasOverrideContent = overrideContentParts !== null;
@@ -593,6 +603,14 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
       const routedUserText = aliasBareExitCommand(userTextForInput);
       const isSystemOnly =
         taskNotifications.length > 0 && userTextForInput.length === 0;
+      const clientPreferences = tuiSubmitClientPreferences(
+        isSystemOnly,
+        submitOptions,
+      );
+      const processConversationWithQueuedApprovals = bindTuiClientPreferences(
+        ctx.processConversationWithQueuedApprovals,
+        clientPreferences,
+      );
 
       // Handle profile load confirmation (Enter to continue)
       if (profileConfirmPending && !msg && !hasOverrideContent) {
@@ -617,21 +635,14 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
         // Continue processing the new message
       }
 
-      if (!msg && !hasOverrideContent) return { submitted: false };
-
-      // Auto-dismiss completed/budget-limited goals on the next user turn
-      const existingGoal = conversationIdRef.current
-        ? settingsManager.getConversationGoal(conversationIdRef.current)
-        : null;
-      if (
-        existingGoal &&
-        (existingGoal.status === "complete" ||
-          existingGoal.status === "budget_limited")
-      ) {
-        settingsManager.clearConversationGoal(
-          conversationIdRef.current,
-          process.cwd(),
-        );
+      if (!msg && !hasOverrideContent) {
+        // Enter on an empty input resumes a queue parked by Esc (no new message).
+        const paused = tuiQueueRef.current?.pausedCount ?? 0;
+        if (paused === 0) return { submitted: false };
+        tuiQueueRef.current?.resume();
+        userCancelledRef.current = false;
+        setDequeueEpoch((e: number) => e + 1);
+        return { submitted: true };
       }
 
       // If the user just cycled reasoning tiers, flush the final choice before
@@ -696,30 +707,13 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           .slice(0, 100);
       }
 
-      // Block submission if waiting for explicit user action (approvals)
-      // In this case, input is hidden anyway, so this shouldn't happen
+      // Block submission while approvals are pending (input is hidden anyway).
       if (pendingApprovals.length > 0) {
         return { submitted: false };
       }
 
-      // Queue message if agent is busy (streaming, executing tool, or running command)
-      // This allows messages to queue up while agent is working
-
-      // Reset cancellation flag before queue check - this ensures queued messages
-      // can be dequeued even if the user just cancelled. The dequeue effect checks
-      // userCancelledRef.current, so we must clear it here to prevent blocking.
+      // Release cancellation, but wake dequeue only after the new input is queued.
       userCancelledRef.current = false;
-
-      // If there are queued messages and agent is not busy, bump epoch to trigger
-      // dequeue effect. Without this, the effect won't re-run because refs aren't
-      // in its deps array (only state values are).
-      if (!isAgentBusy() && (tuiQueueRef.current?.length ?? 0) > 0) {
-        debugLog(
-          "queue",
-          `Bumping dequeueEpoch: userCancelledRef was reset, ${tuiQueueRef.current?.length ?? 0} message(s) queued, agent not busy`,
-        );
-        setDequeueEpoch((e: number) => e + 1);
-      }
 
       const isSlashCommand = routedUserText.startsWith("/");
       const parsedModCommand = isSlashCommand
@@ -749,19 +743,21 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
         return { submitted: true }; // Clears input
       }
 
-      if (isAgentBusy() && !shouldBypassQueue) {
+      if (
+        !shouldBypassQueue &&
+        (isAgentBusy() ||
+          (!hasOverrideContent && (tuiQueueRef.current?.length ?? 0) > 0))
+      ) {
         // Enqueue via QueueRuntime — onEnqueued callback updates queueDisplay.
         tuiQueueRef.current?.enqueue({
           kind: "message",
           source: "user",
           content: msg,
         } as Parameters<typeof tuiQueueRef.current.enqueue>[0]);
+        if (!hasOverrideContent && !isSystemOnly) tuiQueueRef.current?.resume();
         setDequeueEpoch((e: number) => e + 1);
         return { submitted: true }; // Clears input
       }
-
-      // Note: userCancelledRef.current was already reset above before the queue check
-      // to ensure the dequeue effect isn't blocked by a stale cancellation flag.
 
       const aliasedMsg = routedUserText;
 
@@ -802,12 +798,12 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
           try {
             // Mark command as finished BEFORE sending to agent
-            // (matches /remember pattern - command succeeded in triggering agent)
+            // (command succeeded in triggering agent)
             cmd.finish("Running custom command...", true);
 
             // Send prompt to agent
-            // NOTE: Unlike /remember, we DON'T append args separately because
-            // they're already substituted into the prompt via $ARGUMENTS
+            // NOTE: We DON'T append args separately because they're already
+            // substituted into the prompt via $ARGUMENTS
             await processConversationWithQueuedApprovals([
               {
                 type: "message",
@@ -959,7 +955,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               "generating-mod-envs",
               {
                 agentId,
-                args,
                 allowDisabledModelInvocation: true,
               },
             );
@@ -1450,7 +1445,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               "customizing-statusline",
               {
                 agentId,
-                args,
                 allowDisabledModelInvocation: true,
               },
             );
@@ -1552,7 +1546,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /login command - sign in to Letta Constellation
+        // Special handling for /login command - sign in with Letta
         if (trimmed === "/login") {
           openOverlay("login", "/login", "Opening login...", "Login dismissed");
           return { submitted: true };
@@ -1585,7 +1579,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
             if (!hasEnvApiKey && !hasStoredCloudAuth) {
               cmd.finish(
-                "Already logged out. Run /login to sign into Constellation.",
+                "Already logged out. Run /login to sign in with Letta.",
                 true,
               );
               return { submitted: true };
@@ -1621,7 +1615,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
             cmd.finish(buildLogoutSuccessMessage(hasEnvApiKey), true);
 
-            saveLastSessionBeforeExit(currentConversationId);
+            await prepareSessionExit(currentConversationId);
 
             // Track session end explicitly (before exit) with stats
             const stats = sessionStatsRef.current.getSnapshot();
@@ -1768,17 +1762,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           resetPendingReasoningCycle();
           setCommandRunning(true);
 
-          // Pause any active goal for the current conversation before switching
           const prevConversationId = conversationIdRef.current;
-          const prevGoal = prevConversationId
-            ? settingsManager.getConversationGoal(prevConversationId)
-            : null;
-          if (prevGoal?.status === "active") {
-            settingsManager.updateConversationGoalStatus(
-              prevConversationId,
-              "paused",
-            );
-          }
 
           // Run SessionEnd hooks for current session before starting new one
           await runEndHooks("new");
@@ -1869,17 +1853,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           resetPendingReasoningCycle();
           setCommandRunning(true);
 
-          // Pause any active goal for the current conversation before forking
           const forkPrevConversationId = conversationIdRef.current;
-          const forkPrevGoal = forkPrevConversationId
-            ? settingsManager.getConversationGoal(forkPrevConversationId)
-            : null;
-          if (forkPrevGoal?.status === "active") {
-            settingsManager.updateConversationGoalStatus(
-              forkPrevConversationId,
-              "paused",
-            );
-          }
 
           await runEndHooks("fork");
 
@@ -1969,42 +1943,38 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /clear command - reset all agent messages (destructive)
-        if (msg.trim() === "/clear") {
+        const resetAllAgentMessages = trimmed === "/clear-messages";
+
+        if (trimmed === "/clear" || resetAllAgentMessages) {
           const cmd = commandRunner.start(
-            msg.trim(),
-            "Clearing in-context messages...",
+            trimmed,
+            resetAllAgentMessages
+              ? "Resetting agent messages..."
+              : "Clearing in-context messages...",
           );
 
-          // Clearing conversation state should also clear pending reasoning-tier debounce.
           resetPendingReasoningCycle();
           setCommandRunning(true);
 
-          // Pause any active goal for the current conversation before clearing
           const clearPrevConversationId = conversationIdRef.current;
-          const clearPrevGoal = clearPrevConversationId
-            ? settingsManager.getConversationGoal(clearPrevConversationId)
-            : null;
-          if (clearPrevGoal?.status === "active") {
-            settingsManager.updateConversationGoalStatus(
-              clearPrevConversationId,
-              "paused",
-            );
-          }
-
-          // Run SessionEnd hooks for current session before clearing
-          await runEndHooks("new");
 
           try {
             const backend = getBackend();
-
-            // Reset all messages on the agent only when in the default API conversation.
-            // Local/headless backends model /clear by switching to a fresh conversation.
-            // For named conversations, clearing just means starting a new conversation —
-            // there is no reason to wipe the agent's entire message history.
             if (
-              conversationIdRef.current === "default" &&
-              !backend.capabilities.localModelCatalog
+              resetAllAgentMessages &&
+              backend.capabilities.localModelCatalog
+            ) {
+              throw new Error(
+                "/clear-messages is unsupported by local backend.",
+              );
+            }
+            await runEndHooks("new");
+
+            // /clear-messages always resets the API agent's message history.
+            // /clear only resets when leaving the default API conversation.
+            if (
+              !backend.capabilities.localModelCatalog &&
+              (resetAllAgentMessages || conversationIdRef.current === "default")
             ) {
               const client = await getClient();
               await client.agents.messages.reset(agentId, {
@@ -2012,7 +1982,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               });
             }
 
-            // Create a new conversation
             const conversation = await backend.createConversation({
               agent_id: agentId,
             });
@@ -2020,7 +1989,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             setConversationAutoTitleEligibility(true);
             await maybeCarryOverActiveConversationModel(conversation.id);
             setConversationIdAndRef(conversation.id);
-
             pendingConversationSwitchRef.current = {
               origin: "clear",
               conversationId: conversation.id,
@@ -2028,14 +1996,8 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             };
 
             settingsManager.persistSession(agentId, conversation.id);
-
-            // Reset context tokens for new conversation
             resetContextHistory(contextTrackerRef.current);
-
-            // Ensure bootstrap reminders are re-injected for the new conversation.
             resetBootstrapReminderState(true);
-
-            // Re-run SessionStart hooks for new conversation
             sessionHooksRanRef.current = false;
             runSessionStartHooks(
               true, // isNewSession
@@ -2062,9 +2024,10 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               modAdapter.context,
             );
 
-            // Update command with success
             cmd.finish(
-              "Agent's in-context messages cleared & moved to conversation history",
+              resetAllAgentMessages
+                ? "All agent messages reset"
+                : "Agent's in-context messages cleared & moved to conversation history",
               true,
             );
           } catch (error) {
@@ -2073,174 +2036,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           } finally {
             setCommandRunning(false);
           }
-          return { submitted: true };
-        }
-
-        if (trimmed === "/goal" || trimmed.startsWith("/goal ")) {
-          const objective = trimmed.slice("/goal".length).trim();
-          const cmd = commandRunner.start(trimmed, "Managing goal...");
-          const currentConversationId = conversationIdRef.current;
-
-          if (!currentConversationId) {
-            cmd.fail("No active conversation.");
-            return { submitted: true };
-          }
-
-          const lowerGoalArg = objective.toLowerCase();
-          if (
-            !objective ||
-            lowerGoalArg === "show" ||
-            lowerGoalArg === "status"
-          ) {
-            const goal = settingsManager.getConversationGoal(
-              currentConversationId,
-            );
-            if (!goal) {
-              cmd.finish(
-                `${GOAL_USAGE}\n${GOAL_USAGE_HINT}\nNo goal is currently set.`,
-                true,
-              );
-              return { submitted: true };
-            }
-            cmd.finish(
-              `Goal ${goalStatusLabel(goal.status)}\n${formatGoalSummary(goal)}`,
-              true,
-            );
-            return { submitted: true };
-          }
-
-          if (lowerGoalArg === "clear" || lowerGoalArg === "disable") {
-            const cleared = settingsManager.clearConversationGoal(
-              currentConversationId,
-            );
-            settingsManager.setConversationGoalToolsEnabled(
-              currentConversationId,
-              false,
-            );
-            if (goalLoopMode.getState().isActive) {
-              goalLoopMode.deactivate();
-              setUiGoalLoopActive(false);
-              permissionMode.setMode("standard");
-              setUiPermissionMode("standard");
-            }
-            cmd.finish(
-              cleared || lowerGoalArg === "disable"
-                ? lowerGoalArg === "disable"
-                  ? "Goal disabled; goal tools removed for this conversation."
-                  : "Goal cleared"
-                : "No goal to clear. This conversation does not currently have a goal.",
-              true,
-            );
-            return { submitted: true };
-          }
-
-          if (
-            lowerGoalArg === "pause" ||
-            lowerGoalArg === "resume" ||
-            lowerGoalArg === "complete"
-          ) {
-            const status = lowerGoalArg === "resume" ? "active" : lowerGoalArg;
-            const goal = settingsManager.updateConversationGoalStatus(
-              currentConversationId,
-              status as "active" | "paused" | "complete",
-            );
-            if (!goal) {
-              cmd.fail(
-                `${GOAL_USAGE}\nThe session must have a goal before you can ${lowerGoalArg} it.`,
-              );
-              return { submitted: true };
-            }
-            if (lowerGoalArg === "pause" || lowerGoalArg === "complete") {
-              if (goalLoopMode.getState().isActive) {
-                goalLoopMode.deactivate();
-                setUiGoalLoopActive(false);
-                permissionMode.setMode("standard");
-                setUiPermissionMode("standard");
-              }
-            } else if (lowerGoalArg === "resume") {
-              settingsManager.setConversationGoalToolsEnabled(
-                currentConversationId,
-                true,
-              );
-              goalLoopMode.activateGoal(goal.objective, goal.tokenBudget);
-              setUiGoalLoopActive(true);
-              permissionMode.setMode("unrestricted");
-              setUiPermissionMode("unrestricted");
-              const goalState = goalLoopMode.getState();
-              const systemMsg = buildGoalPrompt(
-                goalState,
-                currentConversationId,
-              );
-              processConversationWithQueuedApprovals([
-                {
-                  type: "message",
-                  role: "user",
-                  content: buildTextParts(systemMsg),
-                  otid: randomUUID(),
-                },
-              ]);
-            }
-            cmd.finish(
-              `Goal ${goalStatusLabel(goal.status)}\n${formatGoalSummary(goal)}`,
-              true,
-            );
-            return { submitted: true };
-          }
-
-          const parsedGoal = parseGoalArgs(objective);
-          if (parsedGoal.error) {
-            cmd.fail(`${parsedGoal.error}\n${GOAL_USAGE}\n${GOAL_USAGE_HINT}`);
-            return { submitted: true };
-          }
-
-          const validationError = validateGoalObjective(parsedGoal.objective);
-          if (validationError) {
-            cmd.fail(`${validationError}\n${GOAL_USAGE}\n${GOAL_USAGE_HINT}`);
-            return { submitted: true };
-          }
-
-          const previousGoal = settingsManager.getConversationGoal(
-            currentConversationId,
-          );
-          if (previousGoal && !parsedGoal.replace) {
-            cmd.fail(
-              `A goal already exists. Run /goal --replace ${parsedGoal.objective} to replace it, or /goal clear first.`,
-            );
-            return { submitted: true };
-          }
-          settingsManager.setConversationGoalToolsEnabled(
-            currentConversationId,
-            true,
-          );
-          const goal = settingsManager.setConversationGoal(
-            currentConversationId,
-            parsedGoal.objective,
-            process.cwd(),
-            parsedGoal.tokenBudget,
-            true,
-          );
-          goalLoopMode.activateGoal(
-            parsedGoal.objective,
-            parsedGoal.tokenBudget,
-          );
-          setUiGoalLoopActive(true);
-          permissionMode.setMode("unrestricted");
-          setUiPermissionMode("unrestricted");
-          const replaced = previousGoal ? " replaced" : " active";
-          cmd.finish(
-            `Goal${replaced} (iter 1/∞)\n${formatGoalSummary(goal)}`,
-            true,
-          );
-          const goalState = goalLoopMode.getState();
-          const systemMsg = buildGoalPrompt(goalState, currentConversationId);
-          processConversationWithQueuedApprovals([
-            {
-              type: "message",
-              role: "user",
-              content: buildTextParts(systemMsg),
-              otid: randomUUID(),
-            },
-          ]);
           return { submitted: true };
         }
 
@@ -2319,8 +2114,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               return { submitted: true };
             }
 
-            // Build compaction settings if mode was specified
-            // On server side, if mode changed, summarize function will use corresponding default prompt for new mode
+            // If mode changed, server compaction uses that mode's default prompt.
             const compactParams = modeArg
               ? {
                   compaction_settings: {
@@ -2344,47 +2138,78 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               compactConversationId,
               compactBody,
             );
-
-            // Format success message with before/after counts and summary
+            markPostCompactionContextRemindersPending(
+              sharedReminderStateRef.current,
+            );
             const outputLines = [
               `Compaction completed${modeDisplay}. Message buffer length reduced from ${result.num_messages_before} to ${result.num_messages_after}.`,
               "",
               `Summary: ${result.summary}`,
             ];
-
-            // Update command with success
             cmd.finish(outputLines.join("\n"), true);
 
             // Manual /compact bypasses stream compaction events, so launch
-            // post-compaction reflection directly instead of waiting for the
-            // next turn's post-turn trigger evaluation. Best-effort — never
-            // fail the /compact itself.
+            // reflection directly instead of waiting for post-turn evaluation.
+            // Best-effort — never fail the /compact itself.
             try {
               if (
                 getReflectionSettings(agentId).trigger === "compaction-event" &&
                 isActiveMemfsEnabled(agentId)
               ) {
-                void launchReflectionSubagent({
-                  agentId,
-                  conversationId: compactConversationId,
-                  memfsEnabled: isActiveMemfsEnabled(agentId),
-                  triggerSource: "compaction-event",
-                  description: AUTO_REFLECTION_DESCRIPTION,
-                  completionConversationId: () => conversationIdRef.current,
-                  recompileByConversation:
-                    systemPromptRecompileByConversationRef.current,
-                  recompileQueuedByConversation:
-                    queuedSystemPromptRecompileByConversationRef.current,
-                  onCompletionMessage: (completionMessage) => {
-                    appendTaskNotificationEvents([completionMessage]);
-                  },
-                  feedbackContext: {
-                    parentAgentName: agentName,
-                    parentAgentDescription: agentDescription,
-                    surface: "letta_code_tui",
-                    model: currentModelId,
-                  },
-                });
+                if (experimentManager.isEnabled("reflection_arena")) {
+                  void launchReflectionArena({
+                    agentId,
+                    conversationId: compactConversationId,
+                    triggerSource: "compaction-event",
+                    models: [
+                      REFLECTION_ARENA_MODEL_A_DEFAULT,
+                      sampleReflectionArenaComparisonModel(),
+                    ],
+                    feedbackContext: {
+                      parentAgentName: agentName,
+                      parentAgentDescription: agentDescription,
+                      surface: "letta_code_tui",
+                    },
+                    onReady: (message, readyRun) => {
+                      appendTaskNotificationEvents([message]);
+                      setReflectionArenaChoicePending({
+                        runId: readyRun.runId,
+                        questions: buildReflectionArenaChoiceQuestions(
+                          readyRun.runId,
+                        ),
+                      });
+                    },
+                  }).catch((reflectionError) => {
+                    debugLog(
+                      "memory",
+                      "Skipping post-compaction reflection arena:",
+                      reflectionError instanceof Error
+                        ? reflectionError.message
+                        : String(reflectionError),
+                    );
+                  });
+                } else {
+                  void launchReflectionSubagent({
+                    agentId,
+                    conversationId: compactConversationId,
+                    memfsEnabled: isActiveMemfsEnabled(agentId),
+                    triggerSource: "compaction-event",
+                    description: AUTO_REFLECTION_DESCRIPTION,
+                    completionConversationId: () => conversationIdRef.current,
+                    recompileByConversation:
+                      systemPromptRecompileByConversationRef.current,
+                    recompileQueuedByConversation:
+                      queuedSystemPromptRecompileByConversationRef.current,
+                    onCompletionMessage: (completionMessage) => {
+                      appendTaskNotificationEvents([completionMessage]);
+                    },
+                    feedbackContext: {
+                      parentAgentName: agentName,
+                      parentAgentDescription: agentDescription,
+                      surface: "letta_code_tui",
+                    },
+                  });
+                }
               }
             } catch (reflectionError) {
               debugLog(
@@ -2662,75 +2487,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /export command (also accepts legacy /download)
-        if (msg.trim() === "/export" || msg.trim() === "/download") {
-          const cmd = commandRunner.start(
-            msg.trim(),
-            "Exporting agent file...",
-          );
-
-          if (!getBackend().capabilities.agentFileImportExport) {
-            cmd.fail(
-              "AgentFile export is not supported by the local backend yet.",
-            );
-            return { submitted: true };
-          }
-
-          setCommandRunning(true);
-
-          try {
-            const client = await getClient();
-
-            // Build export parameters (include conversation_id if in specific conversation)
-            const exportParams: { conversation_id?: string } = {};
-            if (conversationId !== "default" && conversationId !== agentId) {
-              exportParams.conversation_id = conversationId;
-            }
-
-            // Package skills from agent/project/global directories
-            const { packageSkills } = await import("@/agent/export");
-            const skills = await packageSkills(agentId);
-
-            // Export agent via SDK (GET endpoint), then embed skills client-side
-            const baseContent = await client.agents.exportFile(
-              agentId,
-              exportParams,
-            );
-
-            // Parse if returned as a string, otherwise use as-is
-            const fileContent: Record<string, unknown> =
-              typeof baseContent === "string"
-                ? JSON.parse(baseContent)
-                : (baseContent as Record<string, unknown>);
-
-            // Embed skills into the .af JSON (client-side, no server support needed)
-            if (skills.length > 0) {
-              fileContent.skills = skills;
-            }
-
-            // Generate filename
-            const fileName = exportParams.conversation_id
-              ? `${exportParams.conversation_id}.af`
-              : `${agentId}.af`;
-
-            writeFileSync(fileName, JSON.stringify(fileContent, null, 2));
-
-            // Build success message
-            let summary = `AgentFile exported to ${fileName}`;
-            if (skills.length > 0) {
-              summary += `\n📦 Included ${skills.length} skill(s): ${skills.map((s) => s.name).join(", ")}`;
-            }
-
-            cmd.finish(summary, true);
-          } catch (error) {
-            const errorDetails = formatErrorDetails(error, agentId);
-            cmd.fail(`Failed: ${errorDetails}`);
-          } finally {
-            setCommandRunning(false);
-          }
-          return { submitted: true };
-        }
-
         // Special handling for /memfs command - manage filesystem-backed memory
         if (trimmed.startsWith("/memfs")) {
           const [, subcommand] = trimmed.split(/\s+/);
@@ -2749,7 +2505,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               "USAGE",
               "  /memfs status    — show status",
               "  /memfs enable    — enable filesystem-backed memory",
-              "  /memfs disable   — disable filesystem-backed memory",
               "  /memfs sync      — sync blocks and files now",
               "  /memfs reset     — move local memfs to /tmp and recreate dirs",
               "  /memfs help      — show this help",
@@ -2787,7 +2542,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               const { applyMemfsFlags } = await import(
                 "@/agent/memory-filesystem"
               );
-              const result = await applyMemfsFlags(agentId, true, false);
+              const result = await applyMemfsFlags(agentId, true);
               updateMemorySyncCommand(
                 cmdId,
                 `Memory filesystem enabled (git-backed).\nPath: ${result.memoryDir}`,
@@ -2934,76 +2689,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             return { submitted: true };
           }
 
-          if (subcommand === "disable") {
-            if (getBackend().capabilities.localMemfs) {
-              cmd.fail(
-                "Disabling MemFS is not supported by the local backend.",
-              );
-              return { submitted: true };
-            }
-
-            updateMemorySyncCommand(
-              cmdId,
-              "Disabling memory filesystem...",
-              true,
-              msg,
-              true,
-            );
-            setCommandRunning(true);
-
-            try {
-              // 1. Re-attach memory tool
-              const { reattachMemoryTool } = await import("@/tools/toolset");
-              const modelId = currentModelId || "anthropic/claude-sonnet-4";
-              await reattachMemoryTool(agentId, modelId);
-
-              // 2. Update system prompt to remove memfs section
-              const { updateAgentSystemPromptMemfs } = await import(
-                "@/agent/modify"
-              );
-              await updateAgentSystemPromptMemfs(agentId, false);
-
-              // 3. Update settings
-              settingsManager.setMemfsEnabled(agentId, false);
-
-              // 4. Remove git-memory-enabled tag from agent
-              const { removeGitMemoryTag } = await import("@/agent/memory-git");
-              await removeGitMemoryTag(agentId);
-
-              // 5. Move local memory dir to /tmp (backup, not delete)
-              let backupInfo = "";
-              const memoryDir = getScopedMemoryFilesystemRoot(agentId);
-              if (existsSync(memoryDir)) {
-                const backupDir = join(
-                  tmpdir(),
-                  `letta-memfs-disable-${agentId}-${Date.now()}`,
-                );
-                renameSync(memoryDir, backupDir);
-                backupInfo = `\nLocal files backed up to ${backupDir}`;
-              }
-
-              updateMemorySyncCommand(
-                cmdId,
-                `Memory filesystem disabled. Memory tool re-attached.${backupInfo}`,
-                true,
-                msg,
-              );
-            } catch (error) {
-              const errorText =
-                error instanceof Error ? error.message : String(error);
-              updateMemorySyncCommand(
-                cmdId,
-                `Failed to disable memfs: ${errorText}`,
-                false,
-                msg,
-              );
-            } finally {
-              setCommandRunning(false);
-            }
-
-            return { submitted: true };
-          }
-
           // Unknown subcommand
           cmd.fail(
             `Unknown subcommand: "${subcommand}". Run /memfs help for usage.`,
@@ -3085,80 +2770,118 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /remember command - remember something from conversation
-        if (trimmed.startsWith("/remember")) {
-          // Extract optional description after `/remember`
-          const [, ...rest] = trimmed.split(/\s+/);
-          const userText = rest.join(" ").trim();
+        // Experimental reflection arena - blind A/B reflection model comparison
+        if (
+          trimmed === "/reflect-arena" ||
+          trimmed.startsWith("/reflect-arena ")
+        ) {
+          const cmd = commandRunner.start(msg, "Preparing reflection arena...");
 
-          const initialOutput = userText
-            ? "Storing to memory..."
-            : "Processing memory request...";
-
-          const cmd = commandRunner.start(msg, initialOutput);
-
-          // Check for pending approvals before sending (mirrors regular message flow)
-          const approvalCheck = await checkPendingApprovalsForSlashCommand();
-          if (approvalCheck.blocked) {
+          if (!experimentManager.isEnabled("reflection_arena")) {
             cmd.fail(
-              "Pending approval(s). Resolve approvals before running /remember.",
+              "Reflection arena is experimental. Enable it with /experiments or LETTA_REFLECTION_ARENA=1.",
             );
-            return { submitted: false }; // Keep /remember in input box, user handles approval first
+            return { submitted: true };
           }
 
-          setCommandRunning(true);
+          if (!isActiveMemfsEnabled(agentId)) {
+            cmd.fail(
+              "Memory filesystem is not enabled. Reflection arena requires MemFS.",
+            );
+            return { submitted: true };
+          }
 
           try {
-            // Import the remember prompt
-            const { REMEMBER_PROMPT } = await import(
-              "@/agent/prompt-assets.js"
+            const arenaArgs = parseReflectArenaCommandArgs(trimmed);
+            if (arenaArgs.kind === "choose") {
+              const { message } = await finalizeReflectionArenaChoice({
+                runId: arenaArgs.runId,
+                choice: arenaArgs.choice,
+                notes: arenaArgs.notes,
+                onHfUploadComplete: (message) => {
+                  appendTaskNotificationEvents([message]);
+                },
+                recompileByConversation:
+                  systemPromptRecompileByConversationRef.current,
+                recompileQueuedByConversation:
+                  queuedSystemPromptRecompileByConversationRef.current,
+              });
+              cmd.finish(message, true);
+              return { submitted: true };
+            }
+            if (arenaArgs.kind === "resume") {
+              const run = await loadReflectionArenaRun(arenaArgs.runId);
+              if (run.status !== "awaiting_choice") {
+                cmd.fail(
+                  `Reflection arena run ${arenaArgs.runId} is ${run.status}; expected awaiting_choice.`,
+                );
+                return { submitted: true };
+              }
+              setReflectionArenaChoicePending({
+                runId: run.runId,
+                questions: buildReflectionArenaChoiceQuestions(run.runId),
+              });
+              cmd.finish(
+                `${formatReflectionArenaAwaitingChoice(run)}\n\nResumed reflection arena choice prompt for run ${run.runId}.`,
+                true,
+              );
+              return { submitted: true };
+            }
+
+            const reflectionConversationId =
+              conversationIdRef.current ?? "default";
+            const payload = await buildAutoReflectionPayload(
+              agentId,
+              reflectionConversationId,
             );
+            if (!payload) {
+              cmd.fail("No new transcript content to reflect on.");
+              return { submitted: true };
+            }
 
-            // Build system-reminder content for memory request
-            const rememberReminder = userText
-              ? `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n${SYSTEM_REMINDER_CLOSE}`
-              : `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n\nThe user did not specify what to remember. Look at the recent conversation context to identify what they likely want you to remember, or ask them to clarify.\n${SYSTEM_REMINDER_CLOSE}`;
-            const rememberParts = userText
-              ? buildTextParts(rememberReminder, userText)
-              : buildTextParts(rememberReminder);
+            const modelA = arenaArgs.modelA ?? REFLECTION_ARENA_MODEL_A_DEFAULT;
+            const modelB =
+              arenaArgs.modelB ?? sampleReflectionArenaComparisonModel();
 
-            // Mark command as finished before sending message
+            const run = await startReflectionArenaRun({
+              agentId,
+              conversationId: reflectionConversationId,
+              triggerSource: "manual",
+              instruction: arenaArgs.instruction,
+              models: [modelA, modelB],
+              payload,
+              feedbackContext: {
+                parentAgentName: agentName,
+                parentAgentDescription: agentDescription,
+                surface: "letta_code_tui",
+              },
+              onReady: (message, readyRun) => {
+                appendTaskNotificationEvents([message]);
+                setReflectionArenaChoicePending({
+                  runId: readyRun.runId,
+                  questions: buildReflectionArenaChoiceQuestions(
+                    readyRun.runId,
+                  ),
+                });
+              },
+            });
             cmd.finish(
-              userText
-                ? "Storing to memory..."
-                : "Processing memory request from conversation context...",
+              `Started reflection arena run ${run.runId}. View the transcript payload here: ${run.payloadPath}`,
               true,
             );
-
-            // Process conversation with the remember prompt
-            await processConversationWithQueuedApprovals([
-              {
-                type: "message",
-                role: "user",
-                content: rememberParts,
-                otid: randomUUID(),
-              },
-            ]);
           } catch (error) {
             const errorDetails = formatErrorDetails(error, agentId);
-            cmd.fail(`Failed: ${errorDetails}`);
-          } finally {
-            setCommandRunning(false);
+            cmd.fail(`Failed to start reflection arena: ${errorDetails}`);
           }
 
           return { submitted: true };
         }
-
-        // Special handling for /reflect command - manually launch reflection subagent
-        if (trimmed === "/reflect" || trimmed.startsWith("/reflect ")) {
-          const cmd = commandRunner.start(msg, "Launching reflection agent...");
-
-          if (!isActiveMemfsEnabled(agentId)) {
-            cmd.fail(
-              "Memory filesystem is not enabled. Use /remember instead.",
-            );
-            return { submitted: true };
-          }
+        // All manual aliases resolve ownership before entering any legacy mode.
+        if (/^\/(dream|reflect|reflection)(?:\s|$)/.test(trimmed)) {
+          const agentId = commandScope.agentId;
+          const cmd = commandRunner.start(msg, "Starting reflection...");
+          const reflectionConversationId =
+            commandScope.conversationId ?? "default";
 
           let reflectionReserved = false;
           let reflectionReservationDelegated = false;
@@ -3169,45 +2892,91 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           };
 
           try {
+            const output = await requestCloudReflectionRun(
+              commandScope,
+              trimmed.replace(/^\/\S+/, "").trim(),
+            );
+            if (output !== null) {
+              cmd.finish(output, true);
+              return { submitted: true };
+            }
+            if (!isActiveMemfsEnabled(commandScope.agentId)) {
+              cmd.fail("Memory filesystem is not enabled.");
+              return { submitted: true };
+            }
             const reflectArgs = parseReflectCommandArgs(trimmed);
-            const reflectionConversationId =
-              conversationIdRef.current ?? "default";
 
             if (reflectArgs.kind === "single") {
-              const result = await launchReflectionSubagent({
-                agentId,
-                conversationId: reflectionConversationId,
-                memfsEnabled: isActiveMemfsEnabled(agentId),
-                triggerSource: "manual",
-                description: AUTO_REFLECTION_DESCRIPTION,
-                instruction: reflectArgs.instruction,
-                completionConversationId: () => conversationIdRef.current,
-                recompileByConversation:
-                  systemPromptRecompileByConversationRef.current,
-                recompileQueuedByConversation:
-                  queuedSystemPromptRecompileByConversationRef.current,
-                onCompletionMessage: (completionMessage) => {
-                  appendTaskNotificationEvents([completionMessage]);
+              if (experimentManager.isEnabled("reflection_arena")) {
+                const arenaResult = await launchReflectionArena({
+                  agentId,
+                  conversationId: reflectionConversationId,
+                  triggerSource: "manual",
+                  instruction: reflectArgs.instruction,
+                  models: [
+                    REFLECTION_ARENA_MODEL_A_DEFAULT,
+                    sampleReflectionArenaComparisonModel(),
+                  ],
+                  feedbackContext: {
+                    parentAgentName: agentName,
+                    parentAgentDescription: agentDescription,
+                    surface: "letta_code_tui",
+                  },
+                  onReady: (message, readyRun) => {
+                    appendTaskNotificationEvents([message]);
+                    setReflectionArenaChoicePending({
+                      runId: readyRun.runId,
+                      questions: buildReflectionArenaChoiceQuestions(
+                        readyRun.runId,
+                      ),
+                    });
+                  },
+                });
+                if (!arenaResult.launched) {
+                  cmd.fail(
+                    getReflectionLaunchSkippedMessage(arenaResult.reason) ??
+                      "Failed to start reflection arena.",
+                  );
+                  return { submitted: true };
+                }
+                cmd.finish(
+                  `Started reflection arena run ${arenaResult.run.runId}. View the transcript payload here: ${arenaResult.payloadPath}`,
+                  true,
+                );
+                return { submitted: true };
+              }
+
+              const result = await launchReflectionSubagent(
+                {
+                  agentId,
+                  conversationId: reflectionConversationId,
+                  memfsEnabled: isActiveMemfsEnabled(agentId),
+                  triggerSource: "manual",
+                  description: AUTO_REFLECTION_DESCRIPTION,
+                  instruction: reflectArgs.instruction,
+                  completionConversationId: () => conversationIdRef.current,
+                  recompileByConversation:
+                    systemPromptRecompileByConversationRef.current,
+                  recompileQueuedByConversation:
+                    queuedSystemPromptRecompileByConversationRef.current,
+                  onCompletionMessage: (completionMessage) => {
+                    appendTaskNotificationEvents([completionMessage]);
+                  },
+                  feedbackContext: {
+                    parentAgentName: agentName,
+                    parentAgentDescription: agentDescription,
+                    surface: "letta_code_tui",
+                  },
                 },
-                feedbackContext: {
-                  parentAgentName: agentName,
-                  parentAgentDescription: agentDescription,
-                  surface: "letta_code_tui",
-                  model: currentModelId,
-                },
-              });
+                { isCutover: async () => false },
+              ); // Use the captured ownership decision.
 
               if (!result.launched) {
-                if (result.reason === "already_active") {
-                  cmd.fail(
-                    "A reflection agent is already running in the background.",
-                  );
-                } else if (result.reason === "no_payload") {
-                  cmd.fail("No new transcript content to reflect on.");
-                } else if (result.reason === "memfs_disabled") {
-                  cmd.fail(
-                    "Memory filesystem is not enabled. Use /remember instead.",
-                  );
+                const skippedMessage = getReflectionLaunchSkippedMessage(
+                  result.reason,
+                );
+                if (skippedMessage) {
+                  cmd.fail(skippedMessage);
                 } else {
                   const errorDetails = formatErrorDetails(
                     result.error ?? "Unknown error",
@@ -3232,17 +3001,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               return { submitted: true };
             }
             reflectionReserved = true;
-
-            // Fetch the agent's system prompt so multi-transcript reflection
-            // payloads include the core behavioural instructions (filtered to
-            // strip dynamic content).
-            let systemPrompt: string | undefined;
-            try {
-              const agent = await getBackend().retrieveAgent(agentId);
-              systemPrompt = agent.system ?? undefined;
-            } catch {
-              // Non-fatal — the reflection payload will just omit the system prompt.
-            }
 
             if (reflectArgs.kind === "auto") {
               const autoPayload = await buildReflectionAutoPayload({
@@ -3305,7 +3063,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                             candidatesPath: autoPayload.candidatesPath,
                           },
                           instruction: reflectArgs.instruction,
-                          systemPrompt,
                         });
                       if (!autoReflectionPayload) {
                         releaseReflectionReservation();
@@ -3315,14 +3072,11 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                         return;
                       }
 
-                      const memoryDir = getScopedMemoryFilesystemRoot(agentId);
-                      const parentMemory =
-                        await buildParentMemorySnapshot(memoryDir);
-                      const reflectionPrompt = buildReflectionSubagentPrompt({
-                        instruction: reflectArgs.instruction,
-                        memoryDir,
-                        parentMemory,
-                      });
+                      const { worktree, reflectionPrompt } =
+                        await prepareReflectionMemoryWorktreeLaunch({
+                          agentId,
+                          instruction: reflectArgs.instruction,
+                        });
 
                       spawnBackgroundSubagentTask({
                         subagentType: "reflection",
@@ -3330,6 +3084,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                         description: "Reflecting on auto-selected transcripts",
                         silentCompletion: true,
                         transcriptPath: autoReflectionPayload.payloadPath,
+                        memoryScope: buildReflectionMemoryScope(worktree),
                         parentScope: {
                           agentId,
                           conversationId: reflectionConversationId,
@@ -3338,6 +3093,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                           success: reflectionSuccess,
                           error: reflectionError,
                           agentId: reflectionAgentId,
+                          model: reflectionModel,
                         }) => {
                           try {
                             telemetry.trackReflectionEnd(
@@ -3347,32 +3103,33 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                                 subagentId: reflectionAgentId ?? undefined,
                                 conversationId: reflectionConversationId,
                                 error: reflectionError,
+                                model: reflectionModel,
                               },
                             );
-                            await finalizeMultiReflectionPayload(
-                              agentId,
-                              autoReflectionPayload.manifest,
-                              reflectionSuccess,
-                            );
-                            const msg = await handleMemorySubagentCompletion(
-                              {
+                            const { completionSuccess, completionMessage } =
+                              await finalizeReflectionMemoryWorktreeLaunch({
+                                worktree,
+                                subagentSuccess: reflectionSuccess,
+                                subagentError: reflectionError,
                                 agentId,
                                 conversationId: conversationIdRef.current,
-                                subagentType: "reflection",
-                                success: reflectionSuccess,
-                                error: reflectionError,
                                 subagentAgentId: reflectionAgentId ?? undefined,
-                              },
-                              {
+                                model: reflectionModel,
+                                ...getReflectionMergeLaunchOptions(agentId),
+                                telemetryContext: { triggerSource: "manual" },
                                 recompileByConversation:
                                   systemPromptRecompileByConversationRef.current,
                                 recompileQueuedByConversation:
                                   queuedSystemPromptRecompileByConversationRef.current,
                                 logRecompileFailure: (message) =>
                                   debugWarn("memory", message),
-                              },
+                              });
+                            await finalizeMultiReflectionCompletion(
+                              agentId,
+                              autoReflectionPayload.manifest,
+                              completionSuccess,
                             );
-                            appendTaskNotificationEvents([msg]);
+                            appendTaskNotificationEvents([completionMessage]);
                           } finally {
                             releaseReflectionReservation();
                           }
@@ -3380,7 +3137,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                       });
                       reflectionReservationDelegated = true;
                       finalReflectionSpawned = true;
-
                       telemetry.trackReflectionStart("manual", {
                         conversationId: reflectionConversationId,
                         startMessageId: autoReflectionPayload.startMessageId,
@@ -3426,7 +3182,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                       conversationIds: reflectArgs.conversationIds,
                     },
               instruction: reflectArgs.instruction,
-              systemPrompt,
             });
 
             if (!reflectionPayload) {
@@ -3437,14 +3192,11 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               return { submitted: true };
             }
 
-            const memoryDir = getScopedMemoryFilesystemRoot(agentId);
-            const parentMemory = await buildParentMemorySnapshot(memoryDir);
-            const reflectionPrompt = buildReflectionSubagentPrompt({
-              instruction: reflectArgs.instruction,
-              memoryDir,
-              parentMemory,
-            });
-
+            const { worktree, reflectionPrompt } =
+              await prepareReflectionMemoryWorktreeLaunch({
+                agentId,
+                instruction: reflectArgs.instruction,
+              });
             const {
               spawnBackgroundSubagentTask,
               waitForBackgroundSubagentAgentId,
@@ -3455,6 +3207,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               description: "Reflecting on conversation",
               silentCompletion: true,
               transcriptPath: reflectionPayload.payloadPath,
+              memoryScope: buildReflectionMemoryScope(worktree),
               parentScope: {
                 agentId,
                 conversationId: reflectionConversationId,
@@ -3463,38 +3216,39 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                 success,
                 error,
                 agentId: reflectionAgentId,
+                model: reflectionModel,
               }) => {
                 try {
                   telemetry.trackReflectionEnd("manual", success, {
                     subagentId: reflectionAgentId ?? undefined,
                     conversationId: reflectionConversationId,
                     error,
+                    model: reflectionModel,
                   });
-                  await finalizeMultiReflectionPayload(
-                    agentId,
-                    reflectionPayload.manifest,
-                    success,
-                  );
-
-                  const msg = await handleMemorySubagentCompletion(
-                    {
+                  const { completionSuccess, completionMessage } =
+                    await finalizeReflectionMemoryWorktreeLaunch({
+                      worktree,
+                      subagentSuccess: success,
+                      subagentError: error,
                       agentId,
                       conversationId: conversationIdRef.current,
-                      subagentType: "reflection",
-                      success,
-                      error,
                       subagentAgentId: reflectionAgentId ?? undefined,
-                    },
-                    {
+                      model: reflectionModel,
+                      ...getReflectionMergeLaunchOptions(agentId),
+                      telemetryContext: { triggerSource: "manual" },
                       recompileByConversation:
                         systemPromptRecompileByConversationRef.current,
                       recompileQueuedByConversation:
                         queuedSystemPromptRecompileByConversationRef.current,
                       logRecompileFailure: (message) =>
                         debugWarn("memory", message),
-                    },
+                    });
+                  await finalizeMultiReflectionCompletion(
+                    agentId,
+                    reflectionPayload.manifest,
+                    completionSuccess,
                   );
-                  appendTaskNotificationEvents([msg]);
+                  appendTaskNotificationEvents([completionMessage]);
                 } finally {
                   releaseReflectionReservation();
                 }
@@ -3511,7 +3265,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               startMessageId: reflectionPayload.startMessageId,
               endMessageId: reflectionPayload.endMessageId,
             });
-
             cmd.finish(
               `Reflecting on ${reflectionPayload.manifest.transcripts.length} transcript(s). View the payload here: ${reflectionPayload.payloadPath}`,
               true,
@@ -3573,10 +3326,8 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /doctor command
-        if (trimmed === "/doctor") {
-          const cmd = commandRunner.start(msg, "Gathering project context...");
-
+        if (trimmed === "/doctor" || trimmed.startsWith("/doctor ")) {
+          const cmd = commandRunner.start(msg, "Starting doctor...");
           const approvalCheck = await checkPendingApprovalsForSlashCommand();
           if (approvalCheck.blocked) {
             cmd.fail(
@@ -3584,32 +3335,26 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             );
             return { submitted: false };
           }
-
           setCommandRunning(true);
           try {
-            cmd.finish(
-              "Running memory doctor... I'll ask a few questions to refine memory structure.",
-              true,
-            );
-
-            const { context: gitContext } = gatherInitGitContext();
-            const memoryDir = getActiveMemoryDirectory(agentId);
-
             const doctorMessage = buildDoctorMessage({
-              gitContext,
-              memoryDir,
+              agentId,
+              conversationId: conversationIdRef.current,
+              memoryDir: getActiveMemoryDirectory(agentId),
+              local: getBackend().capabilities.localMemfs,
+              symptom: trimmed.slice("/doctor".length).trim(),
             });
-
+            cmd.finish("", true);
             await processConversationWithQueuedApprovals([
               {
                 type: "message",
                 role: "user",
                 content: buildTextParts(doctorMessage),
+                otid: randomUUID(),
               },
             ]);
           } catch (error) {
-            const errorDetails = formatErrorDetails(error, agentId);
-            cmd.fail(`Failed: ${errorDetails}`);
+            cmd.fail(`Doctor failed: ${formatErrorDetails(error, agentId)}`);
           } finally {
             setCommandRunning(false);
           }
@@ -3724,7 +3469,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
         const registryCmd = isRegistryCommand
           ? commandRunner.start(msg, `Running ${registryCommandName}...`)
           : null;
-        const result = await executeCommand(aliasedMsg);
+        const result = await executeCommand(aliasedMsg, commandScope);
 
         // If command not found, try user-invocable skills before falling through.
         if (result.notFound) {
@@ -3761,16 +3506,17 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               return { submitted: false };
             }
 
-            const args = trimmed.slice(`/${matchedSkill.id}`.length).trim();
+            const userRequest = trimmed
+              .slice(`/${matchedSkill.id}`.length)
+              .trim();
             setCommandRunning(true);
             try {
-              const { loadRenderedSkillContent, wrapSkillContent } =
+              const { loadRenderedSkillContent, wrapSkillPrompt } =
                 await import("@/tools/impl/skill");
               const skillContent = await loadRenderedSkillContent(
                 matchedSkill.id,
                 {
                   agentId,
-                  args,
                   allowDisabledModelInvocation: true,
                 },
               );
@@ -3780,7 +3526,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                   type: "message",
                   role: "user",
                   content: buildTextParts(
-                    wrapSkillContent(matchedSkill.id, skillContent),
+                    wrapSkillPrompt(matchedSkill.id, skillContent, userRequest),
                   ),
                   otid: randomUUID(),
                 },
@@ -3833,17 +3579,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
       setStreaming(true);
       openTrajectorySegment();
       refreshDerived();
-
-      // If a goal loop is active and the user sends an interstitial message,
-      // keep the loop context attached to the turn.
-      let goalLoopReminder = "";
-      if (goalLoopMode.getState().isActive) {
-        goalLoopMode.incrementIteration();
-        const goalState = goalLoopMode.getState();
-        goalLoopReminder = `${buildGoalPrompt(goalState, conversationIdRef.current)}
-
-`;
-      }
 
       // Inject SessionStart hook feedback (stdout on exit 2) into first message only
       let sessionStartHookFeedback = "";
@@ -3936,16 +3671,9 @@ ${SYSTEM_REMINDER_CLOSE}
 
       pushReminder(sessionStartHookFeedback);
       pushReminder(conversationSwitchAlert);
-      pushReminder(goalLoopReminder);
       pushReminder(bashCommandPrefix);
       pushReminder(userPromptSubmitHookFeedback);
       pushReminder(memoryGitReminder);
-      const currentGoal = settingsManager.getConversationGoal(
-        conversationIdRef.current,
-      );
-      if (currentGoal) {
-        pushReminder(buildGoalReminder(currentGoal));
-      }
       const messageContent = prependReminderPartsToContent(
         contentParts as MessageCreate["content"],
         reminderParts,
@@ -4002,38 +3730,23 @@ ${SYSTEM_REMINDER_CLOSE}
 
       // Start the conversation loop. If we have queued approval results from an interrupted
       // client-side execution, send them first before the new user message.
-      const initialInput: Array<MessageCreate | ApprovalCreate> = [];
-
-      if (eagerRecoveryDenials && eagerRecoveryDenials.length > 0) {
-        initialInput.push({
-          type: "approval",
-          approvals: eagerRecoveryDenials,
-          otid: randomUUID(),
-        });
-      }
-
-      const queuedApprovalInput =
-        consumeQueuedApprovalInputForCurrentConversation();
-      if (queuedApprovalInput) {
-        initialInput.push(queuedApprovalInput);
-      }
-
-      initialInput.push({
-        type: "message",
-        role: "user",
+      const initialInput = buildTuiTurnInput({
+        approvals: eagerRecoveryDenials,
+        queuedApproval: consumeQueuedApprovalInputForCurrentConversation(),
         content: messageContent as unknown as MessageCreate["content"],
         otid: userOtid,
       });
 
       await processConversation(initialInput, {
+        clientPreferences,
         submissionGeneration,
         transcriptStartLineIndex,
       });
 
       await runPostTurnMemorySync({
+        conversationId,
         agentId,
         isEnabled: isActiveMemfsEnabled,
-        debugLabel: "Post-turn memory sync",
         enqueueReminder: (text) => {
           enqueueMemoryGitSyncReminder(sharedReminderStateRef.current, {
             text,
@@ -4077,6 +3790,7 @@ ${SYSTEM_REMINDER_CLOSE}
       resetTrajectoryBases,
       systemInfoReminderEnabled,
       appendTaskNotificationEvents,
+      setReflectionArenaChoicePending,
       maybeCarryOverActiveConversationModel,
       setConversationAutoTitleEligibility,
       setConversationIdAndRef,

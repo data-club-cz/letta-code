@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { OAuthSelectPrompt } from "@earendil-works/pi-ai/oauth";
-import { __testSetBackend, type Backend } from "@/backend";
+import { __testSetBackend, type Backend, getBackend } from "@/backend";
 import type { LocalOAuthConnectCallbacks } from "@/cli/commands/connect-local-oauth";
 import { runConnectSubcommand } from "@/cli/subcommands/connect";
 
@@ -10,7 +10,6 @@ function setProviderTarget(target: "api" | "local") {
       remoteMemfs: target === "api",
       serverSideToolManagement: target === "api",
       serverSecrets: target === "api",
-      agentFileImportExport: target === "api",
       promptRecompile: target === "api",
       byokProviderRefresh: target === "api",
       localModelCatalog: target === "local",
@@ -37,6 +36,12 @@ function createIoDeps() {
       isChatGPTOAuthConnected: mock(() => Promise.resolve(false)),
       runChatGPTOAuthConnectFlow: mock(() =>
         Promise.resolve({ providerName: "chatgpt-plus-pro" }),
+      ),
+      runCloudOAuthConnectFlow: mock(() =>
+        Promise.resolve({ providerName: "openrouter-oauth" }),
+      ),
+      runCloudXaiOAuthConnectFlow: mock(() =>
+        Promise.resolve({ providerName: "lc-xai" }),
       ),
       providerStorageTargetLabel: () => "test storage",
     },
@@ -71,12 +76,43 @@ async function withEnv<T>(
 }
 
 describe("connect subcommand", () => {
+  let previousBackend: Backend;
+
   beforeEach(() => {
+    previousBackend = getBackend();
     setProviderTarget("api");
   });
 
   afterEach(() => {
-    setProviderTarget("api");
+    __testSetBackend(previousBackend);
+  });
+
+  test("suggests --backend local for local-only providers on the API backend", async () => {
+    const { stderr, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(
+      ["ollama", "--base-url", "http://192.168.1.50:11434/v1"],
+      deps,
+    );
+
+    expect(exitCode).toBe(1);
+    const output = stderr.join("\n");
+    expect(output).toContain(
+      'Provider "ollama" is only available with the local backend.',
+    );
+    expect(output).toContain(
+      "letta --backend local connect ollama --base-url http://192.168.1.50:11434/v1",
+    );
+    expect(deps.checkProviderApiKey).not.toHaveBeenCalled();
+  });
+
+  test("still reports unknown providers that exist on no backend", async () => {
+    const { stderr, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(["not-a-provider"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("Unknown provider: not-a-provider.");
   });
 
   test("runs OAuth flow for codex alias", async () => {
@@ -106,6 +142,61 @@ describe("connect subcommand", () => {
       expect.objectContaining({ providerName: "chatgpt-work" }),
     );
     expect(stdout.join("\n")).toContain("Provider 'chatgpt-work' saved.");
+  });
+
+  test("connects OpenRouter OAuth to the cloud provider store", async () => {
+    const { stdout, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(["openrouter-oauth"], deps);
+
+    expect(exitCode).toBe(0);
+    expect(deps.ensureSettingsReady).toHaveBeenCalledTimes(1);
+    expect(deps.runCloudOAuthConnectFlow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "openrouter-oauth",
+        providerType: "openrouter",
+        providerName: "openrouter-oauth",
+        oauthProviderId: "openrouter",
+      }),
+      expect.objectContaining({ onStatus: expect.any(Function) }),
+    );
+    expect(stdout.join("\n")).toContain(
+      "Successfully connected to OpenRouter OAuth.",
+    );
+  });
+
+  test("stores Pi xAI OAuth credentials for Cloud Grok connect", async () => {
+    const { stdout, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(["grok"], deps);
+
+    expect(exitCode).toBe(0);
+    expect(deps.ensureSettingsReady).toHaveBeenCalledTimes(1);
+    expect(deps.runCloudXaiOAuthConnectFlow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: "grok",
+        providerType: "xai",
+        providerName: "lc-xai",
+        oauthProviderId: "xai",
+      }),
+      expect.objectContaining({ onStatus: expect.any(Function) }),
+    );
+    expect(deps.runCloudOAuthConnectFlow).not.toHaveBeenCalled();
+    expect(stdout.join("\n")).toContain(
+      "Successfully connected to xAI (Grok/X subscription).",
+    );
+    expect(stdout.join("\n")).toContain("Provider 'lc-xai' saved.");
+  });
+
+  test("does not treat grok as a local-only provider on the Cloud backend", async () => {
+    const { stderr, deps } = createIoDeps();
+
+    const exitCode = await runConnectSubcommand(["grok"], deps);
+
+    expect(exitCode).toBe(0);
+    expect(stderr.join("\n")).not.toContain(
+      'Provider "grok" is only available with the local backend.',
+    );
   });
 
   test("connects API key provider from positional key", async () => {
@@ -243,6 +334,15 @@ describe("connect subcommand", () => {
     expect(deps.checkProviderApiKey).toHaveBeenCalledWith(
       "lmstudio_openai",
       "not-needed",
+      undefined,
+      undefined,
+      undefined,
+      {
+        connection: {
+          baseURL: "http://127.0.0.1:1234/v1",
+          timeout: 600_000,
+        },
+      },
     );
     expect(deps.createOrUpdateProvider).toHaveBeenCalledWith(
       "lmstudio_openai",
@@ -255,6 +355,78 @@ describe("connect subcommand", () => {
         baseURL: "http://127.0.0.1:1234/v1",
         timeout: 600_000,
       },
+    );
+  });
+
+  // Regression for #3381: the API key was validated against the provider's
+  // default endpoint because --base-url never reached checkProviderApiKey, so
+  // any third-party key failed with a 401 from api.openai.com.
+  test("validates the API key against the supplied base URL", async () => {
+    const { deps } = createIoDeps();
+    setProviderTarget("api");
+
+    const exitCode = await runConnectSubcommand(
+      [
+        "openai-compatible",
+        "--base-url",
+        "http://localhost:8080/v1",
+        "--api-key",
+        "third-party-key",
+      ],
+      deps,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(deps.checkProviderApiKey).toHaveBeenCalledWith(
+      "openai",
+      "third-party-key",
+      undefined,
+      undefined,
+      undefined,
+      { connection: { baseURL: "http://localhost:8080/v1" } },
+    );
+  });
+
+  test("requires a base URL for the local OpenAI-compatible provider", async () => {
+    const { stderr, deps } = createIoDeps();
+    setProviderTarget("local");
+
+    const exitCode = await runConnectSubcommand(["openai-compatible"], deps);
+
+    expect(exitCode).toBe(1);
+    expect(stderr.join("\n")).toContain("Missing base URL");
+    expect(deps.promptSecret).not.toHaveBeenCalled();
+    expect(deps.checkProviderApiKey).not.toHaveBeenCalled();
+    expect(deps.createOrUpdateProvider).not.toHaveBeenCalled();
+  });
+
+  test("connects a keyless local OpenAI-compatible provider", async () => {
+    const { deps } = createIoDeps();
+    setProviderTarget("local");
+
+    const exitCode = await runConnectSubcommand(
+      ["openai-compatible", "--base-url", "http://127.0.0.1:8000/v1/"],
+      deps,
+    );
+
+    expect(exitCode).toBe(0);
+    expect(deps.promptSecret).not.toHaveBeenCalled();
+    expect(deps.checkProviderApiKey).toHaveBeenCalledWith(
+      "openai-compatible",
+      "not-needed",
+      undefined,
+      undefined,
+      undefined,
+      { connection: { baseURL: "http://127.0.0.1:8000/v1/" } },
+    );
+    expect(deps.createOrUpdateProvider).toHaveBeenCalledWith(
+      "openai-compatible",
+      "openai-compatible",
+      "not-needed",
+      undefined,
+      undefined,
+      undefined,
+      { baseURL: "http://127.0.0.1:8000/v1/" },
     );
   });
 
@@ -296,6 +468,10 @@ describe("connect subcommand", () => {
     expect(deps.checkProviderApiKey).toHaveBeenCalledWith(
       "lmstudio_openai",
       "1234",
+      undefined,
+      undefined,
+      undefined,
+      { connection: { baseURL: "http://localhost:8000/v1" } },
     );
     expect(deps.createOrUpdateProvider).toHaveBeenCalledWith(
       "lmstudio_openai",
@@ -318,13 +494,21 @@ describe("connect subcommand", () => {
 
   function createLocalOAuthFlowMock() {
     const selections: (string | undefined)[] = [];
+    const connectionOptions: Array<{
+      baseURL?: string;
+      timeout?: number | false;
+    }> = [];
     const runLocalOAuthConnectFlow = mock(
       async (_provider: unknown, callbacks: LocalOAuthConnectCallbacks) => {
         selections.push(await callbacks.onSelect?.(CODEX_LOGIN_SELECT_PROMPT));
+        connectionOptions.push({
+          baseURL: callbacks.baseURL,
+          timeout: callbacks.timeout,
+        });
         return { providerName: "chatgpt-plus-pro" };
       },
     );
-    return { selections, runLocalOAuthConnectFlow };
+    return { selections, connectionOptions, runLocalOAuthConnectFlow };
   }
 
   test("local codex connect defaults to the first login method option", async () => {
@@ -343,6 +527,28 @@ describe("connect subcommand", () => {
     expect(stdout.join("\n")).toContain("Successfully connected");
   });
 
+  test("local grok still uses the local OAuth flow", async () => {
+    const { deps } = createIoDeps();
+    setProviderTarget("local");
+    const { runLocalOAuthConnectFlow } = createLocalOAuthFlowMock();
+
+    const exitCode = await runConnectSubcommand(["grok"], {
+      ...deps,
+      runLocalOAuthConnectFlow,
+    });
+
+    expect(exitCode).toBe(0);
+    expect(runLocalOAuthConnectFlow).toHaveBeenCalledWith(
+      expect.objectContaining({
+        oauthProviderId: "xai",
+        providerName: "xai",
+        isOAuth: true,
+      }),
+      expect.objectContaining({ onStatus: expect.any(Function) }),
+    );
+    expect(deps.runCloudXaiOAuthConnectFlow).not.toHaveBeenCalled();
+  });
+
   test("local codex connect honors --method device-code", async () => {
     const { deps } = createIoDeps();
     setProviderTarget("local");
@@ -357,6 +563,29 @@ describe("connect subcommand", () => {
     expect(selections).toEqual(["device_code"]);
   });
 
+  test("passes proxy connection options to local OAuth providers", async () => {
+    const { deps } = createIoDeps();
+    setProviderTarget("local");
+    const { connectionOptions, runLocalOAuthConnectFlow } =
+      createLocalOAuthFlowMock();
+
+    const exitCode = await runConnectSubcommand(
+      [
+        "anthropic-oauth",
+        "--base-url",
+        "http://proxy.example.test",
+        "--timeout",
+        "30s",
+      ],
+      { ...deps, runLocalOAuthConnectFlow },
+    );
+
+    expect(exitCode).toBe(0);
+    expect(connectionOptions).toEqual([
+      { baseURL: "http://proxy.example.test", timeout: 30_000 },
+    ]);
+  });
+
   test("local codex connect rejects unknown --method values", async () => {
     const { stderr, deps } = createIoDeps();
     setProviderTarget("local");
@@ -369,7 +598,7 @@ describe("connect subcommand", () => {
 
     expect(exitCode).toBe(1);
     expect(stderr.join("\n")).toContain(
-      "Unknown ChatGPT Plus/Pro (Codex Subscription) login method: carrier-pigeon",
+      "Unknown OpenAI (ChatGPT Plus/Pro) login method: carrier-pigeon",
     );
     expect(stderr.join("\n")).toContain("Available: browser, device_code");
   });

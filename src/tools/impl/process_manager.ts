@@ -3,10 +3,12 @@ import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scrubSecretsFromString } from "@/tools/secret-substitution";
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
@@ -14,40 +16,99 @@ export interface BackgroundProcessHandle {
   kill(signal?: string | number): unknown;
 }
 
+export interface BackgroundRuntimeScope {
+  agentId: string;
+  conversationId: string;
+}
+
 export interface BackgroundProcess {
   process: BackgroundProcessHandle;
   command: string;
-  stdout: string[];
-  stderr: string[];
+  /**
+   * Recent output lines that Bash replays in its completion notification.
+   * Other background work keeps its output only in the output file.
+   */
+  stdout?: string[];
+  stderr?: string[];
   status: "running" | "completed" | "failed";
   exitCode: number | null;
-  lastReadIndex: { stdout: number; stderr: number };
   startTime?: Date;
   outputFile?: string; // File path for persistent output
   totalStdoutLines?: number;
   totalStderrLines?: number;
   cleanupTimer?: TimerHandle;
+  runtimeScope?: BackgroundRuntimeScope;
+  /** Authenticated Cloud user responsible for launching this process. */
+  actingUserId?: string | null;
+  kind?: "monitor" | "workflow";
+  description?: string;
+  monitorSource?: "command" | "websocket" | "github_pull_request";
+  persistent?: boolean;
+  secrets?: Readonly<Record<string, string>>;
+  /**
+   * Set when the agent deliberately stops the shell (TaskStop) so the
+   * resulting "exit" event does not wake it with a failure notification for a
+   * process it just killed on purpose.
+   */
+  completionNotificationSuppressed?: boolean;
 }
 
 export interface BackgroundTask {
   description: string;
   subagentType: string;
+  displayType?: string;
   subagentId: string;
   status: "running" | "completed" | "failed";
-  output: string[];
   error?: string;
   startTime: Date;
   outputFile: string;
   abortController?: AbortController;
+  /** Resolves once the local subagent launcher and its process tree have stopped. */
+  completion?: Promise<void>;
+  /** Runs on another computer or in Cloud; stopping it must cancel Cloud. */
+  remote?: boolean;
   cleanupTimer?: TimerHandle;
+  runtimeScope?: BackgroundRuntimeScope;
+  /** Authenticated Cloud user responsible for launching this task. */
+  actingUserId?: string | null;
 }
 
 export const backgroundProcesses = new Map<string, BackgroundProcess>();
 export const backgroundTasks = new Map<string, BackgroundTask>();
+
+type BackgroundProcessStateListener = (scope?: BackgroundRuntimeScope) => void;
+
+const backgroundProcessStateListeners =
+  new Set<BackgroundProcessStateListener>();
+
+export function subscribeToBackgroundProcessState(
+  listener: BackgroundProcessStateListener,
+): () => void {
+  backgroundProcessStateListeners.add(listener);
+  return () => backgroundProcessStateListeners.delete(listener);
+}
+
+export function notifyBackgroundProcessStateChanged(
+  scope?: BackgroundRuntimeScope,
+): void {
+  for (const listener of backgroundProcessStateListeners) {
+    listener(scope);
+  }
+}
+
 let backgroundOutputDir: string | undefined;
 let bashIdCounter = 1;
 export function getNextBashId() {
   return `bash_${bashIdCounter++}`;
+}
+
+export function getNextMonitorId() {
+  return `monitor_${crypto.randomUUID()}`;
+}
+
+let workflowIdCounter = 1;
+export function getNextWorkflowId() {
+  return `workflow_${workflowIdCounter++}`;
 }
 
 let execSessionIdCounter = 1;
@@ -60,12 +121,15 @@ export function getNextTaskId() {
   return `task_${taskIdCounter++}`;
 }
 
+let downloadIdCounter = 1;
+export function getNextDownloadId() {
+  return `download_${downloadIdCounter++}`;
+}
+
 interface BackgroundRetentionConfig {
   completedEntryTtlMs: number;
   maxProcessLinesPerStream: number;
   maxProcessCharsPerStream: number;
-  maxTaskOutputChars: number;
-  maxOutputFileReadBytes: number;
   maxRunningProcesses: number;
   maxRunningTasks: number;
 }
@@ -74,8 +138,6 @@ const DEFAULT_BACKGROUND_RETENTION_CONFIG: BackgroundRetentionConfig = {
   completedEntryTtlMs: 5 * 60 * 1000,
   maxProcessLinesPerStream: 500,
   maxProcessCharsPerStream: 30_000,
-  maxTaskOutputChars: 30_000,
-  maxOutputFileReadBytes: 1_000_000,
   maxRunningProcesses: 32,
   maxRunningTasks: 32,
 };
@@ -150,18 +212,6 @@ function trimBufferedLines(lines: string[]): string[] {
   return retained;
 }
 
-function truncateTaskOutput(text: string): string {
-  const maxChars = backgroundRetentionConfig.maxTaskOutputChars;
-  if (text.length <= maxChars) {
-    return text;
-  }
-
-  const notice =
-    "\n\n[Background task output truncated in memory. See the task output file for the full transcript.]";
-  const headLength = Math.max(0, maxChars - notice.length);
-  return `${text.slice(0, headLength)}${notice}`;
-}
-
 export function __setBackgroundRetentionConfigForTests(
   overrides: Partial<BackgroundRetentionConfig>,
 ): void {
@@ -203,10 +253,6 @@ function countRunningEntries<
   return count;
 }
 
-export function getBackgroundOutputFileReadBytes(): number {
-  return backgroundRetentionConfig.maxOutputFileReadBytes;
-}
-
 export function assertBackgroundProcessCapacity(): void {
   const runningCount = countRunningEntries(backgroundProcesses);
   if (runningCount >= backgroundRetentionConfig.maxRunningProcesses) {
@@ -245,25 +291,22 @@ export function appendBackgroundProcessOutput(
 
   if (stream === "stdout") {
     processState.totalStdoutLines =
-      (processState.totalStdoutLines ?? processState.stdout.length) +
+      (processState.totalStdoutLines ?? processState.stdout?.length ?? 0) +
       lines.length;
-    processState.stdout.push(...lines);
-    processState.stdout = trimBufferedLines(processState.stdout);
+    processState.stdout = trimBufferedLines([
+      ...(processState.stdout ?? []),
+      ...lines,
+    ]);
     return;
   }
 
   processState.totalStderrLines =
-    (processState.totalStderrLines ?? processState.stderr.length) +
+    (processState.totalStderrLines ?? processState.stderr?.length ?? 0) +
     lines.length;
-  processState.stderr.push(...lines);
-  processState.stderr = trimBufferedLines(processState.stderr);
-}
-
-export function setBackgroundTaskOutput(
-  task: BackgroundTask,
-  output: string,
-): void {
-  task.output = output.length > 0 ? [truncateTaskOutput(output)] : [];
+  processState.stderr = trimBufferedLines([
+    ...(processState.stderr ?? []),
+    ...lines,
+  ]);
 }
 
 /**
@@ -313,7 +356,38 @@ export function createBackgroundOutputFile(id: string): string {
 
 /**
  * Append content to a background output file.
+ *
+ * Returns `true` on success, `false` on failure such as ENOSPC. The function
+ * never throws so that callers inside event callbacks (stdout/stderr data
+ * handlers) do not propagate the exception and crash the host process.
+ * Callers should check the return value and degrade the affected session or
+ * background process instead of pretending the write succeeded.
  */
-export function appendToOutputFile(filePath: string, content: string): void {
-  appendFileSync(filePath, content);
+export function appendToOutputFile(filePath: string, content: string): boolean {
+  try {
+    appendFileSync(filePath, content);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function scrubCompletedBackgroundOutput(
+  processState: BackgroundProcess,
+): boolean {
+  // Always scrub, even when the command referenced no secrets:
+  // scrubSecretsFromString covers the ambient runtime auth values (at minimum
+  // the effective LETTA_API_KEY) that every shell child inherits.
+  if (!processState.outputFile) return true;
+  try {
+    const content = readFileSync(processState.outputFile, "utf8");
+    writeFileSync(
+      processState.outputFile,
+      scrubSecretsFromString(content, processState.secrets ?? {}),
+      { mode: 0o600 },
+    );
+    return true;
+  } catch {
+    return false;
+  }
 }

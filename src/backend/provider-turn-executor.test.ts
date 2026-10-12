@@ -1,16 +1,22 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
 import type { HeadlessTurnExecutorInput } from "@/backend/dev/headless-turn-executor";
 import {
+  contextCompactionThreshold,
   type ProviderStreamAdapter,
   ProviderTurnExecutor,
   providerLocalMessage,
   providerStreamPart,
+  shouldCompactForContextPressure,
 } from "@/backend/dev/provider-turn-executor";
 import {
   emptyLocalUsage,
-  type LocalMessage,
+  type LocalAssistantMessage,
 } from "@/backend/local/local-message";
+import { LocalStore } from "@/backend/local/local-store";
 import {
   getAttachedLocalMessage,
   isLocalStateChunkOnly,
@@ -48,7 +54,7 @@ async function collect(
   return chunks;
 }
 
-function assistantMessage(usage = emptyLocalUsage()): LocalMessage {
+function assistantMessage(usage = emptyLocalUsage()): LocalAssistantMessage {
   return {
     id: "local-assistant-final",
     role: "assistant",
@@ -63,6 +69,29 @@ function assistantMessage(usage = emptyLocalUsage()): LocalMessage {
 }
 
 describe("ProviderTurnExecutor", () => {
+  test("reserves Pi's output headroom before the context window is full", () => {
+    expect(contextCompactionThreshold(100_000)).toBe(83_616);
+    expect(
+      shouldCompactForContextPressure({
+        contextTokens: 86_045,
+        contextWindow: 100_000,
+      }),
+    ).toBe(true);
+    expect(
+      shouldCompactForContextPressure({
+        contextTokens: 83_616,
+        contextWindow: 100_000,
+      }),
+    ).toBe(false);
+  });
+
+  test("caps the reserve for small local context windows", () => {
+    expect(contextCompactionThreshold(10_000)).toBe(8_000);
+    expect(contextCompactionThreshold(1_000)).toBe(800);
+    expect(contextCompactionThreshold(0)).toBeUndefined();
+    expect(contextCompactionThreshold(Number.NaN)).toBeUndefined();
+  });
+
   test("maps pi text, thinking, tool call, usage, and done events", async () => {
     const adapter: ProviderStreamAdapter = {
       async *stream() {
@@ -117,10 +146,20 @@ describe("ProviderTurnExecutor", () => {
     ).toBe("requires_approval");
   });
 
-  test("uses pi contentIndex to keep interleaved live blocks separate", async () => {
+  test("groups adjacent live blocks and preserves interleaved boundaries", async () => {
     const adapter: ProviderStreamAdapter = {
       async *stream() {
-        const message = assistantMessage();
+        const message = {
+          ...assistantMessage(),
+          content: [
+            { type: "text" as const, text: "first-a" },
+            { type: "text" as const, text: "first-b" },
+            { type: "thinking" as const, thinking: "think-a" },
+            { type: "thinking" as const, thinking: "think-b" },
+            { type: "text" as const, text: "second" },
+            { type: "thinking" as const, thinking: "think-c" },
+          ],
+        };
         yield providerStreamPart(
           part({
             type: "text_delta",
@@ -132,23 +171,23 @@ describe("ProviderTurnExecutor", () => {
         yield providerStreamPart(
           part({
             type: "text_delta",
-            contentIndex: 2,
-            delta: "second",
-            partial: message,
-          }),
-        );
-        yield providerStreamPart(
-          part({
-            type: "text_delta",
-            contentIndex: 0,
+            contentIndex: 1,
             delta: "first-b",
             partial: message,
           }),
         );
         yield providerStreamPart(
           part({
+            type: "text_delta",
+            contentIndex: 4,
+            delta: "second",
+            partial: message,
+          }),
+        );
+        yield providerStreamPart(
+          part({
             type: "thinking_delta",
-            contentIndex: 1,
+            contentIndex: 2,
             delta: "think-a",
             partial: message,
           }),
@@ -158,6 +197,14 @@ describe("ProviderTurnExecutor", () => {
             type: "thinking_delta",
             contentIndex: 3,
             delta: "think-b",
+            partial: message,
+          }),
+        );
+        yield providerStreamPart(
+          part({
+            type: "thinking_delta",
+            contentIndex: 5,
+            delta: "think-c",
             partial: message,
           }),
         );
@@ -173,13 +220,316 @@ describe("ProviderTurnExecutor", () => {
     const assistantOtids = chunks
       .filter((chunk) => chunk.message_type === "assistant_message")
       .map((chunk) => (chunk as { otid?: string }).otid);
-    expect(assistantOtids[0]).toBe(assistantOtids[2]);
-    expect(assistantOtids[0]).not.toBe(assistantOtids[1]);
+    expect(assistantOtids[0]).toBe(assistantOtids[1]);
+    expect(assistantOtids[0]).not.toBe(assistantOtids[2]);
 
     const reasoningOtids = chunks
       .filter((chunk) => chunk.message_type === "reasoning_message")
       .map((chunk) => (chunk as { otid?: string }).otid);
-    expect(reasoningOtids[0]).not.toBe(reasoningOtids[1]);
+    expect(reasoningOtids[0]).toBe(reasoningOtids[1]);
+    expect(reasoningOtids[0]).not.toBe(reasoningOtids[2]);
+  });
+
+  test("preserves new deltas after provider-supplied start content", async () => {
+    const message = {
+      ...assistantMessage(),
+      content: [{ type: "text" as const, text: "Initial text" }],
+    };
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({ type: "text_start", contentIndex: 0, partial: message }),
+        );
+        const content = message.content[0];
+        if (!content || content.type !== "text") {
+          throw new Error("Expected text content");
+        }
+        content.text += " plus delta";
+        yield providerStreamPart(
+          part({
+            type: "text_delta",
+            contentIndex: 0,
+            delta: " plus delta",
+            partial: message,
+          }),
+        );
+        yield providerLocalMessage(message);
+        yield providerStreamPart(
+          part({ type: "done", reason: "stop", message }),
+        );
+      },
+    };
+    const storageDir = await mkdtemp(join(tmpdir(), "letta-nonempty-start-"));
+
+    try {
+      const store = new LocalStore(input().agentId, { storageDir });
+      const chunks = await collect(
+        await new ProviderTurnExecutor(adapter).execute(input()),
+      );
+      const streamedText: string[] = [];
+      for (const chunk of chunks) {
+        store.appendStreamChunk(input().conversationId, input().agentId, chunk);
+        if (chunk.message_type !== "assistant_message") continue;
+        const content = "content" in chunk ? chunk.content : undefined;
+        if (!Array.isArray(content)) continue;
+        for (const block of content) {
+          if (
+            typeof block === "object" &&
+            block !== null &&
+            "type" in block &&
+            block.type === "text" &&
+            "text" in block &&
+            typeof block.text === "string"
+          ) {
+            streamedText.push(block.text);
+          }
+        }
+      }
+
+      expect(streamedText.join("")).toBe(" plus delta");
+      const history = new LocalStore(input().agentId, { storageDir })
+        .listConversationMessages(input().conversationId, {
+          agent_id: input().agentId,
+          order: "asc",
+        })
+        .find((row) => row.message_type === "assistant_message");
+      expect(history).toEqual(
+        expect.objectContaining({
+          content: [{ type: "text", text: "Initial text plus delta" }],
+        }),
+      );
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("matches history identity after start-only redacted reasoning", async () => {
+    const message = {
+      ...assistantMessage(),
+      content: [
+        { type: "thinking" as const, thinking: "[Reasoning redacted]" },
+        { type: "text" as const, text: "done" },
+      ],
+    };
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({ type: "thinking_start", contentIndex: 0, partial: message }),
+        );
+        yield providerStreamPart(
+          part({
+            type: "text_delta",
+            contentIndex: 1,
+            delta: "done",
+            partial: message,
+          }),
+        );
+        yield providerLocalMessage(message);
+        yield providerStreamPart(
+          part({ type: "done", reason: "stop", message }),
+        );
+      },
+    };
+    const storageDir = await mkdtemp(
+      join(tmpdir(), "letta-redacted-thinking-"),
+    );
+
+    try {
+      const store = new LocalStore(input().agentId, { storageDir });
+      const chunks = await collect(
+        await new ProviderTurnExecutor(adapter).execute(input()),
+      );
+      let liveAssistantId: string | undefined;
+      for (const chunk of chunks) {
+        const stored = store.appendStreamChunk(
+          input().conversationId,
+          input().agentId,
+          chunk,
+        );
+        if (chunk.message_type === "assistant_message" && "id" in stored) {
+          liveAssistantId = stored.id;
+        }
+      }
+
+      const history = new LocalStore(input().agentId, { storageDir })
+        .listConversationMessages(input().conversationId, {
+          agent_id: input().agentId,
+          order: "asc",
+        })
+        .filter(
+          (row) =>
+            row.message_type === "reasoning_message" ||
+            row.message_type === "assistant_message",
+        );
+      expect(history.map((row) => row.message_type)).toEqual([
+        "reasoning_message",
+        "assistant_message",
+      ]);
+      expect(liveAssistantId).toBe(history[1]?.id);
+      expect(liveAssistantId).toEndWith(":assistant:1");
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("uses the first nonempty reasoning block for live and history identity", async () => {
+    const message = {
+      ...assistantMessage(),
+      content: [
+        { type: "thinking" as const, thinking: "" },
+        { type: "thinking" as const, thinking: "actual " },
+        { type: "thinking" as const, thinking: "" },
+        { type: "thinking" as const, thinking: "reasoning" },
+        { type: "text" as const, text: "done" },
+      ],
+    };
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({
+            type: "thinking_delta",
+            contentIndex: 1,
+            delta: "actual ",
+            partial: message,
+          }),
+        );
+        yield providerStreamPart(
+          part({
+            type: "thinking_delta",
+            contentIndex: 3,
+            delta: "reasoning",
+            partial: message,
+          }),
+        );
+        yield providerStreamPart(
+          part({
+            type: "text_delta",
+            contentIndex: 4,
+            delta: "done",
+            partial: message,
+          }),
+        );
+        yield providerLocalMessage(message);
+        yield providerStreamPart(
+          part({ type: "done", reason: "stop", message }),
+        );
+      },
+    };
+    const storageDir = await mkdtemp(
+      join(tmpdir(), "letta-leading-empty-thinking-"),
+    );
+
+    try {
+      const store = new LocalStore(input().agentId, { storageDir });
+      const chunks = await collect(
+        await new ProviderTurnExecutor(adapter).execute(input()),
+      );
+      const liveReasoningIds: string[] = [];
+      for (const chunk of chunks) {
+        const stored = store.appendStreamChunk(
+          input().conversationId,
+          input().agentId,
+          chunk,
+        );
+        if (chunk.message_type === "reasoning_message" && "id" in stored) {
+          liveReasoningIds.push(stored.id);
+        }
+      }
+
+      const history = new LocalStore(input().agentId, { storageDir })
+        .listConversationMessages(input().conversationId, {
+          agent_id: input().agentId,
+          order: "asc",
+        })
+        .filter((row) => row.message_type === "reasoning_message");
+      expect(history).toHaveLength(1);
+      const canonicalReasoning = history[0];
+      if (!canonicalReasoning) throw new Error("Expected canonical reasoning");
+      expect(liveReasoningIds).toEqual([
+        canonicalReasoning.id,
+        canonicalReasoning.id,
+      ]);
+      expect(liveReasoningIds[0]).toEndWith(":reasoning:1");
+      expect(history[0]).toEqual(
+        expect.objectContaining({ reasoning: "actual reasoning" }),
+      );
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("persists start-only reasoning identity when the provider fails", async () => {
+    const message = {
+      ...assistantMessage(),
+      content: [
+        { type: "thinking" as const, thinking: "[Reasoning redacted]" },
+        { type: "text" as const, text: "partial answer" },
+      ],
+    };
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({ type: "thinking_start", contentIndex: 0, partial: message }),
+        );
+        yield providerStreamPart(
+          part({
+            type: "text_delta",
+            contentIndex: 1,
+            delta: "partial answer",
+            partial: message,
+          }),
+        );
+        yield providerLocalMessage(message);
+        yield { type: "error", error: new Error("provider interrupted") };
+      },
+    };
+    const storageDir = await mkdtemp(
+      join(tmpdir(), "letta-interrupted-start-only-thinking-"),
+    );
+
+    try {
+      const store = new LocalStore(input().agentId, { storageDir });
+      const chunks = await collect(
+        await new ProviderTurnExecutor(adapter).execute(input()),
+      );
+      let liveAssistantId: string | undefined;
+      for (const chunk of chunks) {
+        const stored = store.appendStreamChunk(
+          input().conversationId,
+          input().agentId,
+          chunk,
+        );
+        if (chunk.message_type === "assistant_message" && "id" in stored) {
+          liveAssistantId = stored.id;
+        }
+      }
+
+      const history = new LocalStore(input().agentId, { storageDir })
+        .listConversationMessages(input().conversationId, {
+          agent_id: input().agentId,
+          order: "asc",
+        })
+        .filter(
+          (row) =>
+            row.message_type === "reasoning_message" ||
+            row.message_type === "assistant_message",
+        );
+      expect(liveAssistantId).toBe(
+        history.find((row) => row.message_type === "assistant_message")?.id,
+      );
+      expect(history).toEqual([
+        expect.objectContaining({
+          message_type: "reasoning_message",
+          reasoning: "[Reasoning redacted]",
+        }),
+        expect.objectContaining({
+          message_type: "assistant_message",
+          content: [{ type: "text", text: "partial answer" }],
+        }),
+      ]);
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
   });
 
   test("emits final local assistant messages as state-only chunks before stop_reason", async () => {
@@ -204,6 +554,53 @@ describe("ProviderTurnExecutor", () => {
     expect(
       (chunks.at(-1) as { stop_reason?: string } | undefined)?.stop_reason,
     ).toBe("end_turn");
+  });
+
+  test("includes provider reasoning tokens in usage statistics", async () => {
+    const finalMessage = assistantMessage({
+      ...emptyLocalUsage(),
+      input: 100,
+      output: 40,
+      totalTokens: 140,
+      reasoning: 24,
+    });
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({ type: "done", reason: "stop", message: finalMessage }),
+        );
+      },
+    };
+
+    const chunks = await collect(
+      await new ProviderTurnExecutor(adapter).execute(input()),
+    );
+    const usage = chunks.find(
+      (chunk) => chunk.message_type === "usage_statistics",
+    ) as { reasoning_tokens?: number } | undefined;
+    expect(usage?.reasoning_tokens).toBe(24);
+  });
+
+  test("maps pi length completions to max_tokens_exceeded", async () => {
+    const finalMessage = {
+      ...assistantMessage(),
+      content: [],
+      stopReason: "length" as const,
+    };
+    const adapter: ProviderStreamAdapter = {
+      async *stream() {
+        yield providerStreamPart(
+          part({ type: "done", reason: "length", message: finalMessage }),
+        );
+      },
+    };
+
+    const chunks = await collect(
+      await new ProviderTurnExecutor(adapter).execute(input()),
+    );
+    expect(
+      (chunks.at(-1) as { stop_reason?: string } | undefined)?.stop_reason,
+    ).toBe("max_tokens_exceeded");
   });
 
   test("emits estimated context_tokens when provider usage is empty", async () => {

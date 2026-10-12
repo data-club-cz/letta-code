@@ -1,6 +1,8 @@
+import type { ChannelSendBindingInfo } from "./message-channel-bindings";
 import type {
   ChannelAccount,
   ChannelAdapter,
+  ChannelAllowBotsMode,
   ChannelChatType,
   ChannelDefaultPermissionMode,
   ChannelRoute,
@@ -12,6 +14,7 @@ import type {
   TelegramGroupMode,
   WhatsAppGroupMode,
 } from "./types";
+import type { WhatsAppWaitingBehavior } from "./whatsapp/waiting-behavior-config-types";
 
 export interface ChannelPluginMetadata {
   id: string;
@@ -167,10 +170,12 @@ export interface ChannelPluginAccountPatch {
   autoThreadOnMention?: boolean;
   threadPolicyByChannel?: Record<string, boolean>;
   acknowledgeMessageReaction?: boolean;
-  showCompletedReaction?: boolean;
   listenMode?: boolean;
+  mentionOnlyChannels?: string[];
+  allowBots?: ChannelAllowBotsMode;
   removeStaleRoutes?: boolean;
   inboundDebounceMs?: number;
+  messagePrefix?: string;
   selfChatMode?: boolean;
   allowedGroups?: string[];
   mentionPatterns?: string[];
@@ -181,6 +186,12 @@ export interface ChannelPluginAccountPatch {
   richDraftStreaming?: boolean;
   downloadMedia?: boolean;
   mediaMaxBytes?: number;
+  attachmentFilter?: boolean;
+  attachmentMimeTypes?: string[];
+  attachmentAllowedRecipients?: string[];
+  attachmentAllowedPaths?: string[];
+  attachmentPathRecursive?: boolean;
+  waitingBehavior?: WhatsAppWaitingBehavior;
 }
 
 export type ChannelAccountPatch = ChannelCommonAccountPatch &
@@ -213,6 +224,12 @@ export interface ChannelAccountConfigAdapter<TAccount extends ChannelAccount> {
 
 export type ChannelMessageActionName = string;
 
+export interface ChannelMessageActionResult {
+  messageId: string;
+  /** Optional persisted inbound binding, read independently by the host. */
+  bindingInfo?: ChannelSendBindingInfo;
+}
+
 export interface ChannelMessageToolSchemaContribution {
   properties: Record<string, unknown>;
   visibility?: "all-configured";
@@ -240,6 +257,7 @@ export interface ChannelMessageActionRequest {
   replyToMessageId?: string;
   threadId?: string | null;
   messageId?: string;
+  attachmentId?: string;
   emoji?: string;
   remove?: boolean;
   mediaPath?: string;
@@ -254,10 +272,31 @@ export interface ChannelResolvedMessageTarget {
   label?: string;
 }
 
+/** Minimal outbound surface consumed by channel-owned MessageChannel actions. */
+export type ChannelMessageActionTransport = Pick<
+  ChannelAdapter,
+  "downloadAttachment" | "listCustomEmojis"
+> & {
+  sendMessage(
+    message: OutboundChannelMessage,
+  ): Promise<ChannelMessageActionResult>;
+};
+
+/** Route identity required by MessageChannel action implementations. */
+export type ChannelMessageActionRoute = Pick<
+  ChannelRoute,
+  | "accountId"
+  | "chatId"
+  | "chatType"
+  | "threadId"
+  | "agentId"
+  | "conversationId"
+>;
+
 export interface ChannelMessageActionContext {
   request: ChannelMessageActionRequest;
-  route: ChannelRoute;
-  adapter: ChannelAdapter;
+  route: ChannelMessageActionRoute;
+  adapter: ChannelMessageActionTransport;
   /**
    * Format user-authored markdown/plain text for the target channel before the
    * plugin sends it. The shared MessageChannel tool owns cross-channel text
@@ -291,5 +330,8 @@ export interface ChannelPlugin {
     account: ChannelAccount,
   ): Promise<ChannelAdapter> | ChannelAdapter;
   runSetup?(): Promise<boolean>;
+  resolveAccountDisplayName?(
+    account: ChannelAccount,
+  ): Promise<string | undefined> | string | undefined;
   messageActions?: ChannelMessageActionAdapter;
 }

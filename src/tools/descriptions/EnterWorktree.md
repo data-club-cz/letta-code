@@ -15,6 +15,7 @@ Behavior:
 - If the current cwd is not inside a git repository, pass `repo_path` instead of falling back to manual `git worktree` commands.
 - Creates the worktree under `.letta/worktrees/` for the target repository.
 - Creates a new branch from the default base ref (with `--no-track`, so it does not adopt the base as an upstream) unless `branch_name` or `base_ref` is provided.
+- Disables repository-local and worktree-scoped git checkout filters, the `core.fsmonitor` command, and git hooks (such as `post-checkout`) while creating the worktree so commands written into the repository's `.git` directory cannot run. Creation fails when conditional includes or Git LFS transfer-program settings prevent those filters from being neutralized safely.
 - By default, switches the active conversation/session cwd to the new worktree.
 - Does not copy uncommitted changes from the current checkout.
 - Automatically provisions the new worktree so it is usable without a manual setup pass:
@@ -37,5 +38,5 @@ Cross-agent lock:
 After success:
 - Continue using the returned worktree path as the current workspace.
 - Confirm you are in the new worktree with `git status` before editing.
-- Read README, AGENTS.md, or other project setup docs before running commands.
-- Dependencies are not shared by default. If the project has dependencies, install them in the worktree with the repo's package manager — check the repo first: if it uses Bun, run `bun install`; if pnpm, yarn, or npm, use that manager instead. (If you created the worktree with `symlink_dependencies: true`, they are already present via a symlink to the primary checkout — do NOT run an install, as it would mutate the primary checkout's `node_modules`.)
+- Root `AGENTS.md` instructions are loaded into the successful tool result when present. Follow them before running setup, build, or validation commands; read README or other setup docs for anything they do not cover.
+- Dependencies are not shared by default. Follow the loaded project instructions for setup. If they define no setup command, use the repository's package manager. (If you created the worktree with `symlink_dependencies: true`, dependencies are already present via a symlink to the primary checkout — do NOT run an install, as it would mutate the primary checkout's `node_modules`.)

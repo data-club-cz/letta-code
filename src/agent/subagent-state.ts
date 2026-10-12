@@ -24,6 +24,12 @@ export interface SubagentState {
   status: "pending" | "running" | "completed" | "error";
   agentId?: string | null;
   agentURL: string | null;
+  // The subagent's own conversation id (from its init event). Needed by
+  // desktop dual-view routing: local agents have a bare-id agentURL with no
+  // ?conversation= param to parse, so this is the only conversation source.
+  conversationId?: string | null;
+  /** Exact accepted Super Run for a remotely executing child send. */
+  superRunId?: string;
   toolCalls: ToolCall[];
   // Monotonic counter to avoid transient regressions in rendered tool usage.
   maxToolCallsSeen: number;
@@ -34,9 +40,30 @@ export interface SubagentState {
   startTime: number;
   toolCallId?: string; // Links this subagent to its parent Task tool call
   isBackground?: boolean; // True if running in background (fire-and-forget)
+  /** False when the entry is presentation-only and must not retain the parent runtime. */
+  claimsParentRuntime?: boolean;
   silent?: boolean; // True if this subagent should be hidden from SubagentGroupDisplay
   parentAgentId?: string; // Parent runtime scope agent id (for listener-mode WS scoping)
   parentConversationId?: string; // Parent runtime scope conversation id
+}
+
+export type SubagentLifecycleStatus = SubagentState["status"];
+
+export interface SubagentLifecycleItem {
+  id: string;
+  type: string;
+  description: string;
+  status: SubagentLifecycleStatus;
+  agentId: string | null;
+  agentUrl: string | null;
+  startedAtMs: number;
+  elapsedMs: number;
+  isBackground: boolean;
+  visibleInTranscript: boolean;
+}
+
+export interface SubagentLifecycleContext {
+  list(): SubagentLifecycleItem[];
 }
 
 interface SubagentStore {
@@ -62,6 +89,7 @@ let cachedSnapshot: { agents: SubagentState[]; expanded: boolean } = {
   agents: [],
   expanded: false,
 };
+let cachedLifecycleItems: SubagentLifecycleItem[] = [];
 
 const DEFAULT_COMPLETED_SUBAGENT_RETENTION_MS = 30_000;
 let completedSubagentRetentionMs = DEFAULT_COMPLETED_SUBAGENT_RETENTION_MS;
@@ -72,10 +100,15 @@ const completedSubagentCleanupTimers = new Map<string, TimerHandle>();
 // ============================================================================
 
 function updateSnapshot(): void {
+  const agents = Array.from(store.agents.values());
+  const now = Date.now();
   cachedSnapshot = {
-    agents: Array.from(store.agents.values()),
+    agents,
     expanded: store.expanded,
   };
+  cachedLifecycleItems = agents.map((agent) =>
+    toSubagentLifecycleItem(agent, now),
+  );
 }
 
 function notifyListeners(): void {
@@ -173,6 +206,7 @@ export function registerSubagent(
     conversationId?: string | null;
   },
   prompt?: string,
+  claimsParentRuntime?: boolean,
 ): void {
   // Capitalize type for display (recall -> Recall)
   const displayType = type.charAt(0).toUpperCase() + type.slice(1);
@@ -192,6 +226,7 @@ export function registerSubagent(
     startTime: Date.now(),
     toolCallId,
     isBackground,
+    claimsParentRuntime,
     silent,
     parentAgentId: parentScope?.agentId ?? undefined,
     parentConversationId:
@@ -346,6 +381,48 @@ export function getActiveBackgroundAgents(): SubagentState[] {
   );
 }
 
+function toSubagentLifecycleItem(
+  agent: SubagentState,
+  now: number,
+): SubagentLifecycleItem {
+  return {
+    id: agent.id,
+    type: agent.type,
+    description: agent.description,
+    status: agent.status,
+    agentId: agent.agentId ?? null,
+    agentUrl: agent.agentURL,
+    startedAtMs: agent.startTime,
+    elapsedMs:
+      agent.status === "pending" || agent.status === "running"
+        ? Math.max(0, now - agent.startTime)
+        : agent.durationMs,
+    isBackground: agent.isBackground === true,
+    visibleInTranscript: agent.silent !== true,
+  };
+}
+
+export function getSubagentLifecycleItems(): SubagentLifecycleItem[] {
+  const now = Date.now();
+  return Array.from(store.agents.values()).map((agent) =>
+    toSubagentLifecycleItem(agent, now),
+  );
+}
+
+export function getSubagentLifecycleSnapshot(): SubagentLifecycleItem[] {
+  return cachedLifecycleItems;
+}
+
+export function getSubagentLifecycleContext(): SubagentLifecycleContext {
+  return {
+    list: getSubagentLifecycleItems,
+  };
+}
+
+export function subscribeToSubagentLifecycle(listener: () => void): () => void {
+  return subscribe(listener);
+}
+
 /**
  * Get subagents grouped by type
  */
@@ -466,19 +543,14 @@ export function getSnapshot(): {
 // Stream Event Forwarding
 // ============================================================================
 
-/**
- * A raw message-type event from the subagent's stdout (headless format).
- * Shape: { type: "message", message_type: string, ...LettaStreamingResponse fields }
- */
-export interface SubagentStreamEvent {
-  type: "message";
-  message_type: string;
-  [key: string]: unknown;
-}
+/** Worker output or a harness notification after its memory push completes. */
+export type SubagentStreamEvent =
+  | { type: "message"; message_type: string; [key: string]: unknown }
+  | { type: "memory_updated"; affected_paths: string[]; timestamp: number };
 
 /**
  * Callback for forwarding raw subagent stream events to the WS layer.
- * The event is the parsed JSON line from the subagent's stdout.
+ * Events include streamed output and harness-owned memory push notifications.
  */
 export type SubagentStreamEventListener = (
   subagentId: string,

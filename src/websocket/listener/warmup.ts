@@ -1,7 +1,10 @@
 import { getBackend } from "@/backend";
 import { debugWarn } from "@/utils/debug";
 import { ensureMemfsSyncedForAgent } from "./memfs-sync";
+import { ensureListenerAgentModAdapter } from "./mod-adapter";
+import { emitDeviceStatusUpdateIfChanged } from "./protocol-outbound";
 import { ensureSecretsHydratedForAgent } from "./secrets-sync";
+import { isListenerTransportOpen } from "./transport";
 import type { ListenerRuntime } from "./types";
 
 export type ListenerAgentMetadata = {
@@ -11,7 +14,7 @@ export type ListenerAgentMetadata = {
 };
 
 export type ListenerWarmupScope = {
-  agentId: string;
+  agentId: string | null;
   conversationId: string;
 };
 
@@ -87,11 +90,24 @@ export async function ensureListenerWarmStateForTurn(
   }
 
   try {
+    // Start primary memory in parallel. The mod loader below owns the only
+    // startup dependency; attached repositories must not be part of that wait.
+    void warmupDeps.ensureMemfsSyncedForAgent(listener, agentId);
     await Promise.all([
-      warmupDeps.ensureMemfsSyncedForAgent(listener, agentId),
       warmupDeps.ensureSecretsHydratedForAgent(listener, agentId),
       agentMetadataPromise,
     ]);
+    const agentModAdapter = await ensureListenerAgentModAdapter(
+      listener,
+      agentId,
+    );
+    const transport = listener.transport ?? listener.socket;
+    if (agentModAdapter && transport && isListenerTransportOpen(transport)) {
+      emitDeviceStatusUpdateIfChanged(transport, listener, {
+        agent_id: agentId,
+        conversation_id: scope.conversationId,
+      });
+    }
   } catch (error) {
     debugWarn(
       "listener-warmup",

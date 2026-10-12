@@ -10,42 +10,22 @@ import type {
   ModCommandContext,
   ModCommandResult,
 } from "@/mods/types";
-import type { ModCommandInfo } from "@/types/protocol_v2";
 import { getConversationWorkingDirectory } from "./cwd";
 import { createListenerModContext } from "./mod-adapter";
+
+export {
+  getListenerModCommand,
+  listListenerModCommands,
+} from "./mod-command-registry";
+
 import { getConversationPermissionModeState } from "./permission-mode";
-import type { ConversationRuntime, ListenerRuntime } from "./types";
-
-/**
- * Registered mod commands as advertisable facts. Clients read these to surface
- * mod commands in their palette by their own policy (separate from the built-in
- * `supported_commands` allowlist).
- */
-export function listListenerModCommands(
-  runtime: ListenerRuntime,
-): ModCommandInfo[] {
-  const registry = runtime.modAdapter?.getSnapshot().registry;
-  if (!registry) return [];
-  return Object.values(registry.commands).map((command) => ({
-    id: command.id,
-    description: command.description,
-    ...(command.args ? { args: command.args } : {}),
-  }));
-}
-
-/** Look up a registered mod command by id, if any. */
-export function getListenerModCommand(
-  runtime: ListenerRuntime,
-  commandId: string,
-): ModCommand | undefined {
-  return runtime.modAdapter?.getSnapshot().registry.commands[commandId];
-}
+import type { ConversationRuntime } from "./types";
 
 /**
  * Run a mod command in the listener and return its result. Builds a
  * ModCommandContext that mirrors the TUI command path (createModConversationHandle
  * with the shared sendMessageStreamWithBackend so fork/send/updateLlmConfig work
- * across local and Constellation backends).
+ * across local and Letta Cloud backends).
  */
 export async function runListenerModCommand(
   conversationRuntime: ConversationRuntime,

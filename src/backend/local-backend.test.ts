@@ -19,7 +19,7 @@ import type {
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
-import { getModel } from "@earendil-works/pi-ai";
+import { getBuiltinModel as getModel } from "@earendil-works/pi-ai/providers/all";
 import type { Stream } from "@letta-ai/letta-client/core/streaming";
 import type { LettaStreamingResponse } from "@letta-ai/letta-client/resources/agents/messages";
 import type { ConversationMessageCreateBody } from "@/backend";
@@ -34,11 +34,11 @@ import { LocalBackend } from "@/backend/local/local-backend";
 import { emptyLocalUsage } from "@/backend/local/local-message";
 import { LOCAL_REPAIRED_TOOL_RESULT_TEXT_MAX_CHARS } from "@/backend/local/local-message-projection";
 import { listLocalModels } from "@/backend/local/local-model-config";
+import { LocalStore } from "@/backend/local/local-store";
 import {
-  LocalStore,
   LocalTranscriptMigrationRequiredError,
   LocalTranscriptRepairRequiredError,
-} from "@/backend/local/local-store";
+} from "@/backend/local/local-transcript";
 import { LOCAL_BACKEND_DIR_ENV } from "@/backend/local/paths";
 import { migrateLocalBackendTranscripts } from "@/backend/local/transcript-migration";
 import { listLocalAgentsFromDisk } from "@/cli/helpers/local-agent-listing";
@@ -672,12 +672,14 @@ describe("local backend pi transcript", () => {
     expect(reloaded.retrieveMessage(partialAssistantId ?? "")).toEqual([]);
   });
 
-  test("recompiles cached system prompt when committed memory changes", async () => {
+  test("sends committed memory changes through a transcript update", async () => {
     const storageDir = await mkdtemp(join(tmpdir(), "local-backend-cache-"));
     const systemPrompts: string[] = [];
+    const midConversationPrompts: Array<string | undefined> = [];
     const executor: HeadlessTurnExecutor = {
       async execute(input) {
         systemPrompts.push(input.systemPrompt ?? "");
+        midConversationPrompts.push(input.midConversationSystemPrompt);
         return lettaStreamFromChunks([
           {
             message_type: "assistant_message",
@@ -702,13 +704,12 @@ describe("local backend pi transcript", () => {
       agent_id: agent.id,
     } as never);
     const memoryDir = join(storageDir, "memfs", agent.id, "memory");
-    await mkdir(join(memoryDir, "system"), { recursive: true });
     await writeFile(
-      join(memoryDir, "system", "persona.md"),
-      "---\ndescription: Persona\n---\nChanged but not explicitly recompiled.\n",
+      join(memoryDir, "persona.md"),
+      '---\nname: "Persona"\ndescription: "Who the agent is"\n---\nChanged but not explicitly recompiled.\n',
       "utf8",
     );
-    execFileSync("git", ["add", "system/persona.md"], { cwd: memoryDir });
+    execFileSync("git", ["add", "persona.md"], { cwd: memoryDir });
     execFileSync("git", ["commit", "-m", "test memory change"], {
       cwd: memoryDir,
     });
@@ -720,73 +721,12 @@ describe("local backend pi transcript", () => {
     );
 
     expect(systemPrompts).toHaveLength(1);
-    expect(systemPrompts[0]).toContain(
+    expect(systemPrompts[0]).not.toContain(
       "Changed but not explicitly recompiled.",
     );
-  });
-
-  test("uses mid-conversation system prompt for Opus 4.8 memory changes", async () => {
-    const storageDir = await mkdtemp(join(tmpdir(), "local-backend-opus-"));
-    const systemPrompts: string[] = [];
-    const midConversationPrompts: Array<string | undefined> = [];
-    const executor: HeadlessTurnExecutor = {
-      async execute(input) {
-        systemPrompts.push(input.systemPrompt ?? "");
-        midConversationPrompts.push(input.midConversationSystemPrompt);
-        return lettaStreamFromChunks([
-          {
-            message_type: "assistant_message",
-            content: [{ type: "text", text: "ok" }],
-          } as LettaStreamingResponse,
-          {
-            message_type: "stop_reason",
-            stop_reason: "end_turn",
-          } as LettaStreamingResponse,
-        ]);
-      },
-    };
-    const backend = new LocalBackend({ storageDir, executor });
-    const agent = await backend.createAgent({
-      name: "Local",
-      model: "anthropic/claude-opus-4-8",
-      system: "base {CORE_MEMORY}",
-    } as never);
-    const conversation = await backend.createConversation({
-      agent_id: agent.id,
-    } as never);
-    const initialSystemPrompt = await backend.recompileConversation(
-      conversation.id,
-      { agent_id: agent.id } as never,
+    expect(midConversationPrompts[0]).toContain(
+      "Changed but not explicitly recompiled.",
     );
-    const memoryDir = join(storageDir, "memfs", agent.id, "memory");
-    await mkdir(join(memoryDir, "system"), { recursive: true });
-    await writeFile(
-      join(memoryDir, "system", "persona.md"),
-      "---\ndescription: Persona\n---\nEdited Opus persona.\n",
-      "utf8",
-    );
-    execFileSync("git", ["add", "system/persona.md"], { cwd: memoryDir });
-    execFileSync("git", ["commit", "-m", "test opus memory change"], {
-      cwd: memoryDir,
-    });
-
-    await drain(
-      await backend.createConversationMessageStream(conversation.id, {
-        agent_id: agent.id,
-        messages: [{ role: "user", content: "first" }],
-      } as ConversationMessageCreateBody),
-    );
-    await drain(
-      await backend.createConversationMessageStream(conversation.id, {
-        agent_id: agent.id,
-        messages: [{ role: "user", content: "second" }],
-      } as ConversationMessageCreateBody),
-    );
-
-    expect(systemPrompts).toEqual([initialSystemPrompt, initialSystemPrompt]);
-    expect(midConversationPrompts[0]).toContain("<memory_update>");
-    expect(midConversationPrompts[0]).toContain("Edited Opus persona.");
-    expect(midConversationPrompts[1]).toBeUndefined();
   });
 
   test("recompiles cached system prompt after local compaction", async () => {
@@ -1140,10 +1080,10 @@ describe("local backend pi transcript", () => {
       (model) => model.handle,
     );
     const zaiHandles = handles.filter((handle) => handle.startsWith("zai/"));
-    expect(zaiHandles[0]).toBe("zai/glm-5.2");
-    expect(handles).toContain("zai/glm-4.5-air");
+    expect(zaiHandles[0]).toBe("zai/glm-5.3");
+    expect(handles).toContain("zai/glm-5-turbo");
     expect(handles).toContain("zai/glm-5.2");
-    expect(handles).toContain("zai/glm-5.1");
+    expect(handles).toContain("zai/glm-5.3");
   });
 
   test("lists Fable 5 from the configured Anthropic pi catalog", async () => {
@@ -1230,7 +1170,6 @@ describe("local backend pi transcript", () => {
 
     expect(calls).toEqual(
       expect.arrayContaining([
-        "http://localhost:11434/v1/models",
         "http://localhost:11434/api/tags",
         "http://127.0.0.1:1234/v1/models",
         "http://localhost:8080/v1/models",
@@ -1335,68 +1274,10 @@ describe("local backend pi transcript", () => {
     ).map((model) => model.handle);
 
     expect(calls).toEqual(
-      expect.arrayContaining([
-        "http://localhost:11434/v1/models",
-        "http://localhost:11434/api/tags",
-      ]),
+      expect.arrayContaining(["http://localhost:11434/api/tags"]),
     );
     expect(handles).toContain("ollama/qwen2.5-coder:7b");
     expect(handles).not.toContain("ollama/llama2");
-  });
-
-  test("lists mod-registered local provider models with context windows", async () => {
-    registerPiProvider("lmstudio", {
-      baseUrl: "http://localhost:8000/v1",
-      apiKey: "not-needed",
-      api: "openai-completions",
-      models: [
-        {
-          id: "gemma-4-26B-A4B-it-oQ6",
-          name: "Gemma 4 VLM",
-          reasoning: true,
-          input: ["text", "image"],
-          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-          contextWindow: 256000,
-          maxTokens: 8192,
-        },
-      ],
-    });
-    const storageDir = await mkdtemp(
-      join(tmpdir(), "local-backend-pi-registered-provider-"),
-    );
-    await createOrUpdateLocalProvider({
-      providerType: "lmstudio",
-      providerName: "lc-lmstudio",
-      apiKey: "not-needed",
-      baseURL: "http://127.0.0.1:1234/v1",
-      storageDir,
-    });
-    const calls: string[] = [];
-    const fetchImpl = (async (input: unknown) => {
-      calls.push(typeof input === "string" ? input : String(input));
-      return new Response(
-        JSON.stringify({ data: [{ id: "heuristic-only-model" }] }),
-        { headers: { "content-type": "application/json" } },
-      );
-    }) as unknown as typeof fetch;
-
-    const models = await listLocalModels(storageDir, { fetch: fetchImpl });
-
-    expect(calls).toEqual(
-      expect.arrayContaining([
-        "http://localhost:11434/v1/models",
-        "http://localhost:8080/v1/models",
-      ]),
-    );
-    expect(models).toContainEqual({
-      handle: "lmstudio/gemma-4-26B-A4B-it-oQ6",
-      max_context_window: 256000,
-      model: "lmstudio/gemma-4-26B-A4B-it-oQ6",
-      model_endpoint_type: "lmstudio",
-    });
-    expect(models.map((model) => model.handle)).not.toContain(
-      "lmstudio/heuristic-only-model",
-    );
   });
 
   test("uses mod-registered context windows for local agent state", async () => {
@@ -1559,12 +1440,14 @@ describe("local backend pi transcript", () => {
     const fetchImpl = (async (input: unknown, init?: RequestInit) => {
       const url = typeof input === "string" ? input : String(input);
       calls.push(url);
-      if (url === "https://ollama.com/v1/models") {
+      if (url === "https://ollama.com/api/tags") {
         captured.authorization = new Headers(init?.headers).get(
           "Authorization",
         );
         return new Response(
-          JSON.stringify({ data: [{ id: "rnj-1:8b" }, { id: "glm-5.1" }] }),
+          JSON.stringify({
+            models: [{ name: "rnj-1:8b" }, { name: "glm-5.1" }],
+          }),
           { headers: { "content-type": "application/json" } },
         );
       }
@@ -1576,7 +1459,7 @@ describe("local backend pi transcript", () => {
     ).map((model) => model.handle);
 
     expect(calls).toEqual(
-      expect.arrayContaining(["https://ollama.com/v1/models"]),
+      expect.arrayContaining(["https://ollama.com/api/tags"]),
     );
     expect(captured.authorization).toBe("Bearer ollama-key");
     expect(handles).toContain("ollama-cloud/rnj-1:8b");

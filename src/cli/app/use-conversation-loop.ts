@@ -17,7 +17,7 @@ import {
 import { executeAutoAllowedTools } from "@/agent/approval-execution";
 import {
   extractConflictDetail,
-  fetchRunErrorDetail,
+  fetchRunErrorInfo,
   getPreStreamErrorAction,
   getRetryDelayMs,
   isApprovalPendingError,
@@ -27,12 +27,18 @@ import {
   parseRetryAfterHeaderMs,
   rebuildInputWithFreshDenials,
   refreshInputOtidsForNewRequest,
+  STALE_APPROVAL_RECOVERY_DENIAL_REASON,
   shouldAttemptApprovalRecovery,
 } from "@/agent/approval-recovery";
 import { getAvailableModelHandles } from "@/agent/available-models";
+import {
+  CHATGPT_PLAN_ROTATION_MAX_SWAPS_PER_TURN,
+  formatPlanRotationNotice,
+  rotateChatGPTPlanOnQuotaLimit,
+} from "@/agent/chatgpt-plan-rotation";
 import { getResumeDataFromBackend } from "@/agent/check-approval";
 import { getStreamToolContextId, sendMessageStream } from "@/agent/message";
-import { getModelInfo, getModelInfoForLlmConfig } from "@/agent/model";
+import { getModelInfoForLlmConfig } from "@/agent/model";
 import { INTERRUPT_RECOVERY_ALERT } from "@/agent/prompt-assets";
 import type { SessionStats } from "@/agent/stats";
 import {
@@ -63,24 +69,22 @@ import {
   isProviderStreamDisconnectErrorText,
 } from "@/cli/helpers/error-formatter";
 import { parsePatchOperations } from "@/cli/helpers/format-args-display";
-import { buildGoalBudgetLimitPrompt } from "@/cli/helpers/goal-command";
 import {
   buildLocalNoModelResponse,
   splitSyntheticAssistantResponse,
 } from "@/cli/helpers/local-no-model-response";
 import type { ExecutionPhase } from "@/cli/helpers/phase-visuals";
-import {
-  buildQueuedContentParts,
-  buildQueuedUserText,
-  getQueuedNotificationSummaries,
-} from "@/cli/helpers/queued-message-parts";
+import { getQueuedNotificationSummaries } from "@/cli/helpers/queued-message-parts";
 import { appendTranscriptDeltaJsonl } from "@/cli/helpers/reflection-transcript";
 import { safeJsonParseOr } from "@/cli/helpers/safe-json-parse";
 import {
   type ApprovalRequest,
+  advanceStreamSequenceCursor,
   type DrainResult,
   drainStream,
   drainStreamWithResume,
+  recordEmptyApprovalTelemetry,
+  type StreamSequenceCursor,
 } from "@/cli/helpers/stream";
 import { shouldClearCompletedSubagentsOnTurnStart } from "@/cli/helpers/subagent-turn-start";
 import {
@@ -92,10 +96,9 @@ import {
   isFileWriteTool,
   isPatchTool,
 } from "@/cli/helpers/tool-name-mapping";
-import { alwaysRequiresUserInput } from "@/cli/helpers/tool-name-mapping.js";
+import { finishTuiTurn } from "@/cli/helpers/tui-turn-lifecycle";
 import type { LocalModAdapter } from "@/cli/mods/use-local-mod-adapter";
 import { SYSTEM_ALERT_OPEN, SYSTEM_REMINDER_OPEN } from "@/constants";
-import { goalLoopMode } from "@/goal-loop-mode";
 import { runStopHooks } from "@/hooks";
 import { getTurnStartCancel } from "@/mods/turn-start-cancel";
 import type { ApprovalContext } from "@/permissions/analyzer";
@@ -105,6 +108,7 @@ import { permissionMode } from "@/permissions/mode";
 import type { QueueRuntime } from "@/queue/queue-runtime";
 import { settingsManager } from "@/settings-manager";
 import { telemetry } from "@/telemetry";
+import { replaceClientPreferences } from "@/tools/client-preferences";
 import { analyzeToolApproval, type ToolExecutionResult } from "@/tools/manager";
 import type { PreparedScopeToolContext } from "@/tools/toolset";
 import { debugLog, debugWarn, isDebugEnabled } from "@/utils/debug";
@@ -117,12 +121,10 @@ import {
   ERROR_FEEDBACK_HINT,
   INTERRUPT_MESSAGE,
   LLM_API_ERROR_MAX_RETRIES,
-  PROVIDER_FALLBACK_MAP,
   TEMP_QUOTA_OVERRIDE_MODEL,
 } from "./constants";
 import { extractErrorMeta } from "./errors";
-import { buildGoalPrompt } from "./goal-loop";
-import { appendOptimisticUserLine, createClientOtid, uid } from "./ids";
+import { uid } from "./ids";
 import {
   getErrorHintForStopReason,
   getPreferredAgentModelHandle,
@@ -130,6 +132,7 @@ import {
 import { sendDesktopNotification } from "./notifications";
 import { isRetriableError } from "./retry";
 import { stripSystemReminders } from "./system-reminders";
+import { prepareTuiQueuedTurn } from "./turn-input";
 import type {
   AppendError,
   ApprovalDecision,
@@ -193,6 +196,8 @@ type ConversationLoopContext = {
   consumeQueuedMessages: () => QueuedMessage[] | null;
   queueModeRef: MutableRefObject<"immediate" | "defer">;
   contextTrackerRef: MutableRefObject<ContextTracker>;
+  chatgptPlanSwapsRef: MutableRefObject<number>;
+  chatgptExhaustedProvidersRef: MutableRefObject<Set<string>>;
   conversationBusyRetriesRef: MutableRefObject<number>;
   conversationGenerationRef: MutableRefObject<number>;
   conversationIdRef: MutableRefObject<string>;
@@ -224,7 +229,6 @@ type ConversationLoopContext = {
     overrideModel?: string | null,
   ) => Promise<PreparedScopeToolContext>;
   processingConversationRef: MutableRefObject<number>;
-  providerFallbackAttemptedRef: MutableRefObject<boolean>;
   queueApprovalResults: QueueApprovalResults;
   queueSnapshotRef: MutableRefObject<QueuedMessage[]>;
   quotaAutoSwapAttemptedRef: MutableRefObject<boolean>;
@@ -243,6 +247,7 @@ type ConversationLoopContext = {
   setCurrentModelHandle: Dispatch<SetStateAction<string | null>>;
   setCurrentModelId: Dispatch<SetStateAction<string | null>>;
   setDequeueEpoch: Dispatch<SetStateAction<number>>;
+  setInterruptRequested: Dispatch<SetStateAction<boolean>>;
   lastStopReasonRef: MutableRefObject<string | null>;
   setIsExecutingTool: Dispatch<SetStateAction<boolean>>;
   setLlmConfig: Dispatch<SetStateAction<LlmConfig | null>>;
@@ -259,7 +264,6 @@ type ConversationLoopContext = {
   setTrajectoryElapsedBaseMs: Dispatch<SetStateAction<number>>;
   setTrajectoryTokenBase: Dispatch<SetStateAction<number>>;
   setUiPermissionMode: (mode: PermissionMode) => void;
-  setUiGoalLoopActive: Dispatch<SetStateAction<boolean>>;
   shouldAutoGenerateConversationTitleRef: MutableRefObject<boolean>;
   syncTrajectoryElapsedBase: () => void;
   syncTrajectoryTokenBase: () => void;
@@ -291,6 +295,8 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
     buffersRef,
     clearApprovalToolContext,
     closeTrajectorySegment,
+    chatgptPlanSwapsRef,
+    chatgptExhaustedProvidersRef,
     consumeQueuedMessages,
     queueModeRef,
     contextTrackerRef,
@@ -319,7 +325,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
     precomputedDiffsRef,
     prepareScopedToolExecutionContext,
     processingConversationRef,
-    providerFallbackAttemptedRef,
     queueApprovalResults,
     queueSnapshotRef,
     quotaAutoSwapAttemptedRef,
@@ -338,6 +343,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
     setCurrentModelHandle,
     setCurrentModelId,
     setDequeueEpoch,
+    setInterruptRequested,
     lastStopReasonRef,
     setIsExecutingTool,
     setLlmConfig,
@@ -354,7 +360,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
     setTrajectoryElapsedBaseMs,
     setTrajectoryTokenBase,
     setUiPermissionMode,
-    setUiGoalLoopActive,
     shouldAutoGenerateConversationTitleRef,
     syncTrajectoryElapsedBase,
     syncTrajectoryTokenBase,
@@ -472,12 +477,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
   const processConversation = useCallback(
     async (
       initialInput: Array<MessageCreate | ApprovalCreate>,
-      options?: {
-        allowReentry?: boolean;
-        submissionGeneration?: number;
-        transcriptStartLineIndex?: number | null;
-        allowResponseStateReuse?: boolean;
-      },
+      options?: import("./types").ProcessConversationOptions,
     ): Promise<void> => {
       // Transient pre-stream retries can yield for seconds.
       // Pin the user's permission mode for the duration of the submission so
@@ -531,84 +531,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
           refreshDerived();
         }
       }
-      // Helper for goal loop continuation. Defined here to access buffersRef
-      // and processConversation via closure.
-      const handleGoalContinuation = () => {
-        const goalState = goalLoopMode.getState();
-
-        // Extract LAST assistant message from buffers to check for a legacy
-        // <goal_status>complete</goal_status> completion marker.
-        const lines = toLines(buffersRef.current);
-        const assistantLines = lines.filter(
-          (l): l is Line & { kind: "assistant" } => l.kind === "assistant",
-        );
-        const lastAssistantText =
-          assistantLines.length > 0
-            ? (assistantLines[assistantLines.length - 1]?.text ?? "")
-            : "";
-
-        const goalStatusAfterTool = settingsManager.getConversationGoal(
-          conversationIdRef.current,
-        )?.status;
-        const goalStoppedByTool =
-          goalStatusAfterTool === "complete" ||
-          goalStatusAfterTool === "blocked";
-        if (
-          goalStoppedByTool ||
-          goalLoopMode.checkForGoalComplete(lastAssistantText)
-        ) {
-          const finalGoalStatus =
-            goalStatusAfterTool === "blocked" ? "blocked" : "complete";
-          goalLoopMode.deactivate();
-          setUiGoalLoopActive(false);
-          settingsManager.updateConversationGoalStatus(
-            conversationIdRef.current,
-            finalGoalStatus,
-          );
-          permissionMode.setMode("standard");
-          setUiPermissionMode("standard");
-
-          const statusId = uid("status");
-          buffersRef.current.byId.set(statusId, {
-            kind: "status",
-            id: statusId,
-            lines: [
-              finalGoalStatus === "blocked"
-                ? `⚠️ Goal blocked after ${goalState.currentIteration} iteration(s)`
-                : `✅ Goal complete after ${goalState.currentIteration} iteration(s)`,
-            ],
-          });
-          buffersRef.current.order.push(statusId);
-          refreshDerived();
-          return;
-        }
-
-        if (!goalLoopMode.shouldContinue()) {
-          return;
-        }
-
-        goalLoopMode.incrementIteration();
-        const nextGoalState = goalLoopMode.getState();
-        const systemMsg = buildGoalPrompt(
-          nextGoalState,
-          conversationIdRef.current,
-        );
-
-        setTimeout(() => {
-          processConversation(
-            [
-              {
-                type: "message",
-                role: "user",
-                content: [{ type: "text", text: systemMsg }],
-                otid: randomUUID(),
-              },
-            ],
-            { allowReentry: true },
-          );
-        }, 0);
-      };
-
       // Copy so we can safely mutate for retry recovery flows
       const inputList = Array.isArray(initialInput) ? initialInput : [];
       let currentInput = [...inputList];
@@ -632,6 +554,12 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
       if (processingConversationRef.current > 0 && !allowReentry) {
         return;
       }
+      if (options?.clientPreferences !== undefined)
+        replaceClientPreferences(
+          agentIdRef.current,
+          conversationIdRef.current,
+          options.clientPreferences,
+        );
       processingConversationRef.current += 1;
       let turnStartCancelReason: string | null = null;
 
@@ -682,13 +610,13 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
         emptyResponseRetriesRef.current = 0;
         conversationBusyRetriesRef.current = 0;
         quotaAutoSwapAttemptedRef.current = false;
-        providerFallbackAttemptedRef.current = false;
+        chatgptPlanSwapsRef.current = 0;
+        chatgptExhaustedProvidersRef.current.clear();
       }
 
-      // Track last run ID for error reporting (accessible in catch block)
       let currentRunId: string | undefined;
       let preserveTranscriptStartForApproval = false;
-
+      let turnAbortController: AbortController | null = null;
       try {
         if (turnStartCancelReason) {
           const statusId = uid("status");
@@ -718,7 +646,8 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
         openTrajectorySegment();
         setNetworkPhase("upload");
         setExecutionPhase("requesting");
-        abortControllerRef.current = new AbortController();
+        turnAbortController = new AbortController();
+        abortControllerRef.current = turnAbortController;
 
         if (
           await maybeStreamSyntheticNoModelResponse(
@@ -810,11 +739,9 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
           clearCompletedSubagents();
         }
 
-        let highestSeqIdSeen: number | null = null;
+        let streamSequenceCursor: StreamSequenceCursor | null = null;
 
         while (true) {
-          // Capture the signal BEFORE any async operations
-          // This prevents a race where handleInterrupt nulls the ref during await
           const signal = abortControllerRef.current?.signal;
 
           // Check if cancelled before starting new stream
@@ -931,7 +858,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 currentInput = rebuildInputWithFreshDenials(
                   currentInput,
                   existingApprovals ?? [],
-                  "Auto-denied: stale approval from interrupted session",
+                  STALE_APPROVAL_RECOVERY_DENIAL_REASON,
                 );
               } catch {
                 // Fetch failed — strip stale payload and retry plain message
@@ -1019,7 +946,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                   undefined, // no handleFirstMessage on resume
                   makeExecutionPhaseHook(setExecutionPhase),
                   contextTrackerRef.current,
-                  highestSeqIdSeen,
+                  streamSequenceCursor,
                 );
                 debugLog(
                   "stream",
@@ -1094,36 +1021,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             if (preStreamAction === "retry_transient") {
               llmApiErrorRetriesRef.current += 1;
               const attempt = llmApiErrorRetriesRef.current;
-
-              // Provider fallback: after 1 retry against Anthropic, switch to Bedrock
-              if (
-                attempt >= 2 &&
-                !providerFallbackAttemptedRef.current &&
-                currentModelId
-              ) {
-                const fallbackId = PROVIDER_FALLBACK_MAP[currentModelId];
-                const fallbackHandle = fallbackId
-                  ? getModelInfo(fallbackId)?.handle
-                  : undefined;
-                if (fallbackHandle) {
-                  providerFallbackAttemptedRef.current = true;
-                  setTempModelOverride(fallbackHandle);
-
-                  const statusId = uid("status");
-                  buffersRef.current.byId.set(statusId, {
-                    kind: "status",
-                    id: statusId,
-                    lines: ["Anthropic API error; falling back to Bedrock..."],
-                  });
-                  buffersRef.current.order.push(statusId);
-                  refreshDerived();
-
-                  buffersRef.current.interrupted = false;
-                  conversationBusyRetriesRef.current = 0;
-                  restorePinnedPermissionMode();
-                  continue;
-                }
-              }
 
               const retryAfterMs =
                 preStreamError instanceof APIError
@@ -1363,7 +1260,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                   if (modelInfo) {
                     setCurrentModelId(modelInfo.id);
                   } else {
-                    // Model not in models.json (e.g., BYOK model) - use handle as ID
+                    // Model not in the runtime catalog (e.g., BYOK model) - use handle as ID
                     setCurrentModelId(agentModelHandle || null);
                   }
                   setCurrentModelHandle(agentModelHandle || null);
@@ -1411,7 +1308,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             contextTrackerRef.current.currentTurnId++;
           }
 
-          const drainResult = preStreamResumeResult
+          const drainResult: Promise<DrainResult> = preStreamResumeResult
             ? preStreamResumeResult
             : (() => {
                 if (!stream) {
@@ -1427,7 +1324,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                   handleFirstMessage,
                   makeExecutionPhaseHook(setExecutionPhase),
                   contextTrackerRef.current,
-                  highestSeqIdSeen,
+                  streamSequenceCursor,
                 );
               })();
 
@@ -1439,11 +1336,14 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             lastRunId,
             lastSeqId,
             fallbackError,
+            errorInfo: streamErrorInfo,
           } = await drainResult;
 
-          if (lastSeqId != null) {
-            highestSeqIdSeen = Math.max(highestSeqIdSeen ?? 0, lastSeqId);
-          }
+          streamSequenceCursor = advanceStreamSequenceCursor(
+            streamSequenceCursor,
+            lastRunId,
+            lastSeqId,
+          );
 
           // Update currentRunId for error reporting in catch block
           currentRunId = lastRunId ?? undefined;
@@ -1459,43 +1359,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             0,
             buffersRef.current.tokenCount - runTokenStart,
           );
-          if (goalLoopMode.getState().isActive) {
-            const updatedGoal = settingsManager.accountConversationGoalUsage(
-              conversationIdRef.current,
-              tokenDelta,
-            );
-            if (
-              updatedGoal?.tokenBudget != null &&
-              updatedGoal.tokensUsed >= updatedGoal.tokenBudget &&
-              updatedGoal.status === "active"
-            ) {
-              const budgetLimitedGoal =
-                settingsManager.updateConversationGoalStatus(
-                  conversationIdRef.current,
-                  "budget_limited",
-                );
-              goalLoopMode.deactivate();
-              setUiGoalLoopActive(false);
-              permissionMode.setMode("standard");
-              setUiPermissionMode("standard");
-              if (budgetLimitedGoal) {
-                const systemMsg = buildGoalBudgetLimitPrompt(budgetLimitedGoal);
-                setTimeout(() => {
-                  processConversation(
-                    [
-                      {
-                        type: "message",
-                        role: "user",
-                        content: [{ type: "text", text: systemMsg }],
-                        otid: randomUUID(),
-                      },
-                    ],
-                    { allowReentry: true },
-                  );
-                }, 0);
-              }
-            }
-          }
           sessionStatsRef.current.accumulateTrajectory({
             apiDurationMs,
             usageDelta,
@@ -1507,8 +1370,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
           const wasAborted = !!signal?.aborted;
           let stopReasonToHandle = wasAborted ? "cancelled" : stopReason;
 
-          // Check if this conversation became stale while the stream was running.
-          // If stale, a newer processConversation is running and we shouldn't modify UI state.
           const isStaleAfterDrain =
             myGeneration !== conversationGenerationRef.current;
 
@@ -1575,7 +1436,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             llmApiErrorRetriesRef.current = 0; // Reset retry counter on success
             emptyResponseRetriesRef.current = 0;
             conversationBusyRetriesRef.current = 0;
-            providerFallbackAttemptedRef.current = false;
             lastDequeuedMessageRef.current = null; // Clear - message was processed successfully
             lastSentInputRef.current = null; // Clear - no recovery needed
             pendingInterruptRecoveryConversationIdRef.current = null;
@@ -1829,12 +1689,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
               queueSnapshotRef.current = [];
             }
 
-            // Continue active goals at the very end, right before releasing input.
-            if (goalLoopMode.getState().isActive) {
-              handleGoalContinuation();
-              return;
-            }
-
             return;
           }
 
@@ -1867,24 +1721,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
               if (!EAGER_CANCEL) {
                 appendError(INTERRUPT_MESSAGE, true);
               }
-
-              // ESC interrupts an active goal loop but keeps it resumable.
-              if (goalLoopMode.getState().isActive) {
-                settingsManager.updateConversationGoalStatus(
-                  conversationIdRef.current,
-                  "paused",
-                );
-                const statusId = uid("status");
-                buffersRef.current.byId.set(statusId, {
-                  kind: "status",
-                  id: statusId,
-                  lines: [
-                    `⏸️ Goal loop paused - type to continue or Shift+Tab to exit`,
-                  ],
-                });
-                buffersRef.current.order.push(statusId);
-                refreshDerived();
-              }
             }
 
             return;
@@ -1895,17 +1731,16 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             clearApprovalToolContext();
             preserveTranscriptStartForApproval = true;
             approvalToolContextIdRef.current = turnToolContextId;
-            // Clear stale state immediately to prevent ID mismatch bugs
             setAutoHandledResults([]);
             setAutoDeniedApprovals([]);
             lastSentInputRef.current = null; // Clear - message was received by server
             pendingInterruptRecoveryConversationIdRef.current = null;
 
-            // Use new approvals array, fallback to legacy approval for backward compat
             const approvalsToProcess = approvalsFromStream;
 
             if (approvalsToProcess.length === 0) {
               clearApprovalToolContext();
+              recordEmptyApprovalTelemetry(lastRunId, streamSequenceCursor);
               appendError(
                 `Unexpected empty approvals with stop reason: ${stopReason}`,
               );
@@ -1991,7 +1826,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             const { needsUserInput, autoAllowed, autoDenied } =
               await classifyApprovals(approvalsToProcess, {
                 getContext: analyzeToolApproval,
-                alwaysRequiresUserInput,
+                requireArgsForAutoApprove: true,
                 missingNameReason:
                   "Tool call incomplete - missing name or arguments",
                 toolContextId: approvalToolContextIdRef.current,
@@ -2020,31 +1855,15 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 } else if (isFileEditTool(toolName)) {
                   const filePath = args.file_path as string | undefined;
                   if (filePath) {
-                    // Check if it's a multi-edit (has edits array) or single edit
-                    if (args.edits && Array.isArray(args.edits)) {
-                      const result = computeAdvancedDiff({
-                        kind: "multi_edit",
-                        filePath,
-                        edits: args.edits as Array<{
-                          old_string: string;
-                          new_string: string;
-                          replace_all?: boolean;
-                        }>,
-                      });
-                      if (result.mode === "advanced") {
-                        precomputedDiffsRef.current.set(toolCallId, result);
-                      }
-                    } else {
-                      const result = computeAdvancedDiff({
-                        kind: "edit",
-                        filePath,
-                        oldString: (args.old_string as string) || "",
-                        newString: (args.new_string as string) || "",
-                        replaceAll: args.replace_all as boolean | undefined,
-                      });
-                      if (result.mode === "advanced") {
-                        precomputedDiffsRef.current.set(toolCallId, result);
-                      }
+                    const result = computeAdvancedDiff({
+                      kind: "edit",
+                      filePath,
+                      oldString: (args.old_string as string) || "",
+                      newString: (args.new_string as string) || "",
+                      replaceAll: args.replace_all as boolean | undefined,
+                    });
+                    if (result.mode === "advanced") {
+                      precomputedDiffsRef.current.set(toolCallId, result);
                     }
                   }
                 } else if (isPatchTool(toolName) && args.input) {
@@ -2207,46 +2026,22 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 const queuedNotifications = queuedItemsToAppend
                   ? getQueuedNotificationSummaries(queuedItemsToAppend)
                   : [];
-                const hadNotifications =
-                  appendTaskNotificationEvents(queuedNotifications);
-                const queuedUserText = queuedItemsToAppend
-                  ? buildQueuedUserText(queuedItemsToAppend)
-                  : "";
-
-                const queuedUserOtid = createClientOtid();
-                appendOptimisticUserLine(
+                appendTaskNotificationEvents(queuedNotifications);
+                const queuedTurn = prepareTuiQueuedTurn(
+                  queuedItemsToAppend,
+                  allResults,
                   buffersRef.current,
-                  queuedUserText,
-                  queuedUserOtid,
                 );
-
-                if (queuedItemsToAppend && queuedItemsToAppend.length > 0) {
-                  const queuedContentParts =
-                    buildQueuedContentParts(queuedItemsToAppend);
+                if (queuedTurn.hasQueuedMessage) {
                   setThinkingMessage(getRandomThinkingVerb());
                   refreshDerived();
                   toolResultsInFlightRef.current = true;
                   await processConversation(
-                    [
-                      {
-                        type: "approval",
-                        approvals: allResults,
-                        otid: createClientOtid(),
-                      },
-                      {
-                        type: "message",
-                        role: "user",
-                        content: queuedContentParts,
-                        otid: queuedUserOtid,
-                      },
-                    ],
-                    { allowReentry: true },
+                    queuedTurn.input,
+                    queuedTurn.options,
                   );
                   toolResultsInFlightRef.current = false;
                   return;
-                }
-                if (hadNotifications || queuedUserText.length > 0) {
-                  refreshDerived();
                 }
 
                 // Cancel mode - queue results and let dequeue effect handle
@@ -2404,9 +2199,8 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             }
           }
 
-          // Check for "Invalid tool call IDs" error - server HAS pending approvals but with different IDs.
-          // Fetch the actual pending approvals and show them to the user.
-          const detailFromRun = await fetchRunErrorDetail(lastRunId);
+          const runErrorInfo = await fetchRunErrorInfo(lastRunId),
+            detailFromRun = runErrorInfo?.detail ?? runErrorInfo?.message;
           const invalidIdsDetected =
             isInvalidToolCallIdsError(detailFromRun) ||
             isInvalidToolCallIdsError(latestErrorText);
@@ -2525,7 +2319,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
               currentInput = rebuildInputWithFreshDenials(
                 currentInput,
                 existingApprovals ?? [],
-                "Auto-denied: stale approval from interrupted session",
+                STALE_APPROVAL_RECOVERY_DENIAL_REASON,
               );
             } catch {
               // Fetch failed — strip stale payload and retry plain message
@@ -2535,6 +2329,36 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
             // Reset interrupted flag so retry stream chunks are processed
             buffersRef.current.interrupted = false;
             continue;
+          }
+
+          if (
+            chatgptPlanSwapsRef.current <
+            CHATGPT_PLAN_ROTATION_MAX_SWAPS_PER_TURN
+          ) {
+            const rotation = await rotateChatGPTPlanOnQuotaLimit({
+              agentId: agentIdRef.current,
+              conversationId: conversationIdRef.current,
+              currentHandle: currentModelId,
+              error: streamErrorInfo ?? runErrorInfo ?? fallbackError,
+              exhaustedProviders: chatgptExhaustedProvidersRef.current,
+              signal: turnAbortController.signal,
+            });
+            if (rotation) {
+              chatgptPlanSwapsRef.current += 1;
+              const statusId = uid("status");
+              buffersRef.current.byId.set(statusId, {
+                kind: "status",
+                id: statusId,
+                lines: [formatPlanRotationNotice(rotation)],
+              });
+              buffersRef.current.order.push(statusId);
+              refreshDerived();
+
+              currentInput = refreshInputOtidsForNewRequest(currentInput);
+              buffersRef.current.interrupted = false;
+              continue;
+            }
+            // No sibling plan available; try the hosted Auto fallback below.
           }
 
           // Quota-limit fallback: hosted Letta API can recover by switching to
@@ -2613,7 +2437,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 ...currentInput,
                 {
                   type: "message" as const,
-                  role: "system" as const,
+                  role: "user" as const,
                   content: `<system-reminder>The previous response was empty. Please provide a response with either text content or a tool call.</system-reminder>`,
                   otid: randomUUID(),
                 },
@@ -2661,36 +2485,6 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
 
             llmApiErrorRetriesRef.current += 1;
             const attempt = llmApiErrorRetriesRef.current;
-
-            // Provider fallback: after 1 retry against Anthropic, switch to Bedrock
-            if (
-              attempt >= 2 &&
-              !providerFallbackAttemptedRef.current &&
-              currentModelId
-            ) {
-              const fallbackId = PROVIDER_FALLBACK_MAP[currentModelId];
-              const fallbackHandle = fallbackId
-                ? getModelInfo(fallbackId)?.handle
-                : undefined;
-              if (fallbackHandle) {
-                providerFallbackAttemptedRef.current = true;
-                setTempModelOverride(fallbackHandle);
-
-                const statusId = uid("status");
-                buffersRef.current.byId.set(statusId, {
-                  kind: "status",
-                  id: statusId,
-                  lines: ["Anthropic API error; falling back to Bedrock..."],
-                });
-                buffersRef.current.order.push(statusId);
-                refreshDerived();
-
-                currentInput = refreshInputOtidsForNewRequest(currentInput);
-                highestSeqIdSeen = null;
-                buffersRef.current.interrupted = false;
-                continue;
-              }
-            }
 
             const delayMs = getRetryDelayMs({
               category: "transient_provider",
@@ -2768,7 +2562,7 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
                 ? []
                 : refreshInputOtidsForNewRequest(currentInput);
               // Reset seq_id threshold — new run starts from seq_id 1, not a resume.
-              highestSeqIdSeen = null;
+              streamSequenceCursor = null;
               // Reset interrupted flag so retry stream chunks are processed
               buffersRef.current.interrupted = false;
               // Retry by continuing the while loop with fresh OTIDs.
@@ -3023,30 +2817,18 @@ export function useConversationLoop(ctx: ConversationLoopContext) {
           pendingTranscriptStartLineIndexRef.current = null;
         }
 
-        // Check if this conversation was superseded by an ESC interrupt
-        const isStale = myGeneration !== conversationGenerationRef.current;
-
-        abortControllerRef.current = null;
-
-        // Decrement BEFORE bumping the epoch so that when the dequeue effect
-        // fires synchronously (Ink legacy mode), processingConversationRef.current
-        // already reflects the true count. The defer gate checks === 0 to confirm
-        // no more nested processConversation calls are outstanding.
-        if (!isStale) {
-          processingConversationRef.current = Math.max(
-            0,
-            processingConversationRef.current - 1,
-          );
-        }
-
-        // Trigger dequeue effect now that processConversation is no longer active.
-        // The dequeue effect checks abortControllerRef (a ref, not state), so it
-        // won't re-run on its own — bump dequeueEpoch to force re-evaluation.
-        // Only bump for normal completions — if stale (ESC was pressed), the user
-        // cancelled and queued messages should NOT be auto-submitted.
-        if (!isStale && (tuiQueueRef.current?.length ?? 0) > 0) {
-          setDequeueEpoch((e: number) => e + 1);
-        }
+        // Wakes dequeue on a normal completion; when superseded by an ESC
+        // interrupt, settles the interrupt (cancelling -> idle) instead.
+        finishTuiTurn({
+          isStale: myGeneration !== conversationGenerationRef.current,
+          turnAbortController,
+          abortControllerRef,
+          processingConversationRef,
+          userCancelledRef,
+          setInterruptRequested,
+          queueLength: () => tuiQueueRef.current?.length ?? 0,
+          bumpDequeueEpoch: () => setDequeueEpoch((e: number) => e + 1),
+        });
       }
     },
     [

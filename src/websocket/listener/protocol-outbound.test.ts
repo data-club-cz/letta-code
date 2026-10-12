@@ -1,8 +1,36 @@
 import { describe, expect, test } from "bun:test";
 import WebSocket from "ws";
+import { clearAllSubagents, registerSubagent } from "@/agent/subagent-state";
 import type { DequeuedBatch } from "@/queue/queue-runtime";
-import type { StreamDeltaMessage } from "@/types/protocol_v2";
-import { emitDequeuedUserMessage } from "@/websocket/listener/protocol-outbound";
+import {
+  backgroundProcesses,
+  backgroundTasks,
+} from "@/tools/impl/process_manager";
+import type {
+  DeviceStatusUpdateMessage,
+  StreamDeltaMessage,
+} from "@/types/protocol_v2";
+import {
+  markListenerConnectionInitialized,
+  openListenerConnection,
+  subscribeListenerConnection,
+  suspendListenerConnection,
+  TO_SUBSCRIBERS,
+  toListenerConnection,
+} from "@/websocket/listener/connection";
+import { getOrCreateScopedRuntime } from "@/websocket/listener/conversation-runtime";
+import { createRuntime as createListenerRuntime } from "@/websocket/listener/lifecycle";
+import {
+  createListenerModContext,
+  emitListenerModNotification,
+} from "@/websocket/listener/mod-adapter";
+import { OUTBOUND_QUEUE_LIMITS } from "@/websocket/listener/outbound-wire";
+import {
+  buildSubagentSnapshot,
+  emitDequeuedUserMessage,
+  emitDeviceStatusUpdateIfChanged,
+  emitProtocolV2Message,
+} from "@/websocket/listener/protocol-outbound";
 import type {
   ConversationRuntime,
   IncomingMessage,
@@ -10,12 +38,17 @@ import type {
 } from "@/websocket/listener/types";
 
 class MockSocket {
-  readyState = WebSocket.OPEN;
+  readyState: number = WebSocket.OPEN;
   bufferedAmount = 0;
   sentPayloads: string[] = [];
+  terminated = false;
 
   send(data: string): void {
     this.sentPayloads.push(data);
+  }
+
+  terminate(): void {
+    this.terminated = true;
   }
 }
 
@@ -29,6 +62,8 @@ function createRuntime(): {
     transport: socket as never,
     streamTransport: null,
     eventSeqCounter: 0,
+    connections: new Map(),
+    connectionIdsByRuntimeKey: new Map(),
     conversationRuntimes: new Map(),
   } as unknown as ListenerRuntime;
   const runtime = {
@@ -47,7 +82,573 @@ function parseOnlyStreamDelta(socket: MockSocket): StreamDeltaMessage {
   return message as StreamDeltaMessage;
 }
 
+describe("emitProtocolV2Message backpressure", () => {
+  test("delivers the canonical null-agent default scope", async () => {
+    const listener = createListenerRuntime();
+    const socket = new MockSocket();
+    const options = {
+      connectionId: "agent-free",
+      wsUrl: "ws://local",
+      deviceId: "device",
+      connectionName: "local",
+      onConnected: () => {},
+      onDisconnected: () => {},
+      onError: () => {},
+    };
+    openListenerConnection({
+      runtime: listener,
+      connectionId: options.connectionId,
+      writer: socket as never,
+      options,
+    });
+    markListenerConnectionInitialized(listener, options.connectionId);
+    const scope = { agent_id: null, conversation_id: "default" };
+    subscribeListenerConnection(listener, options.connectionId, scope);
+    const runtime = getOrCreateScopedRuntime(listener, null, "default");
+
+    const delivery = emitProtocolV2Message(
+      socket as never,
+      runtime,
+      {
+        type: "stream_delta",
+        delta: {
+          type: "message",
+          id: "agent-free-terminal",
+          date: new Date(0).toISOString(),
+          message_type: "client_tool_end",
+          tool_call_id: "tool-1",
+          status: "success",
+        },
+      } as never,
+      scope,
+      TO_SUBSCRIBERS,
+    );
+
+    await expect(delivery.receipts[0]?.settlement).resolves.toBe("sent");
+    const message = JSON.parse(socket.sentPayloads[0] ?? "{}");
+    expect(message.runtime).toEqual(scope);
+  });
+
+  test("replays a known-unsent terminal delta to a same-ID replacement", async () => {
+    const listener = createListenerRuntime();
+    const original = new MockSocket();
+    original.bufferedAmount =
+      OUTBOUND_QUEUE_LIMITS.HIGH_WATERMARK_BUFFERED_BYTES;
+    const options = {
+      connectionId: "relay",
+      wsUrl: "ws://relay",
+      deviceId: "device",
+      connectionName: "relay",
+      onConnected: () => {},
+      onDisconnected: () => {},
+      onError: () => {},
+    };
+    openListenerConnection({
+      runtime: listener,
+      connectionId: "relay",
+      writer: original as never,
+      options,
+    });
+    markListenerConnectionInitialized(listener, "relay");
+    const scope = { agent_id: "agent-1", conversation_id: "conv-1" };
+    subscribeListenerConnection(listener, "relay", scope);
+    const runtime = getOrCreateScopedRuntime(
+      listener,
+      scope.agent_id,
+      scope.conversation_id,
+    );
+    const delta = {
+      type: "message",
+      id: "stable-terminal-id",
+      date: new Date(0).toISOString(),
+      message_type: "client_tool_end",
+      tool_call_id: "tool-1",
+      status: "success",
+    } as never;
+    const delivery = emitProtocolV2Message(
+      original as never,
+      runtime,
+      { type: "stream_delta", delta } as never,
+      scope,
+      TO_SUBSCRIBERS,
+    );
+    original.readyState = WebSocket.CLOSED;
+    suspendListenerConnection(listener, "relay");
+    await expect(delivery.receipts[0]?.settlement).resolves.toBe("dropped");
+
+    const replacement = new MockSocket();
+    openListenerConnection({
+      runtime: listener,
+      connectionId: "relay",
+      writer: replacement as never,
+      options,
+    });
+    markListenerConnectionInitialized(listener, "relay");
+    const replay = delivery.replayTo("relay");
+    await expect(replay.receipts[0]?.settlement).resolves.toBe("sent");
+    const message = JSON.parse(replacement.sentPayloads[0] ?? "{}");
+    expect(message.delta.id).toBe("stable-terminal-id");
+    expect(original.sentPayloads).toEqual([]);
+  });
+
+  test("never sheds stream deltas that snapshots cannot replay", () => {
+    const { runtime, socket } = createRuntime();
+    socket.bufferedAmount = OUTBOUND_QUEUE_LIMITS.HIGH_WATERMARK_BUFFERED_BYTES;
+
+    for (let i = 0; i <= OUTBOUND_QUEUE_LIMITS.MAX_QUEUED_FRAMES; i += 1) {
+      emitProtocolV2Message(
+        socket as never,
+        runtime,
+        {
+          type: "stream_delta",
+          delta: {
+            message_type: "assistant_message",
+            content: `delta-${i}`,
+          },
+        } as never,
+        undefined,
+        TO_SUBSCRIBERS,
+      );
+    }
+
+    expect(socket.terminated).toBe(true);
+    expect(socket.sentPayloads).toEqual([]);
+  });
+
+  test("treats future protocol frame types as lossless by default", () => {
+    const { runtime, socket } = createRuntime();
+    socket.bufferedAmount = OUTBOUND_QUEUE_LIMITS.HIGH_WATERMARK_BUFFERED_BYTES;
+
+    for (let i = 0; i <= OUTBOUND_QUEUE_LIMITS.MAX_QUEUED_FRAMES; i += 1) {
+      emitProtocolV2Message(
+        socket as never,
+        runtime,
+        {
+          type: "future_protocol_message",
+          content: `frame-${i}`,
+        } as never,
+        undefined,
+        TO_SUBSCRIBERS,
+      );
+    }
+
+    expect(socket.terminated).toBe(true);
+    expect(socket.sentPayloads).toEqual([]);
+  });
+
+  test("never coalesces queue removal transitions", () => {
+    const { runtime, socket } = createRuntime();
+    socket.bufferedAmount = OUTBOUND_QUEUE_LIMITS.HIGH_WATERMARK_BUFFERED_BYTES;
+
+    for (let i = 0; i <= OUTBOUND_QUEUE_LIMITS.MAX_QUEUED_FRAMES; i += 1) {
+      emitProtocolV2Message(
+        socket as never,
+        runtime,
+        {
+          type: "update_queue",
+          queue: [],
+          removed: [
+            {
+              client_message_id: `cm-${i}`,
+              disposition: "dequeued",
+            },
+          ],
+        },
+        undefined,
+        TO_SUBSCRIBERS,
+      );
+    }
+
+    expect(socket.terminated).toBe(true);
+    expect(socket.sentPayloads).toEqual([]);
+  });
+});
+
+describe("emitProtocolV2Message connection routing", () => {
+  test("routes mod notifications as UI-only status deltas", () => {
+    const listener = createListenerRuntime();
+    const socket = new MockSocket();
+    const connectionId = "desktop-client";
+    const scope = { agent_id: "agent-1", conversation_id: "conv-1" };
+    openListenerConnection({
+      runtime: listener,
+      connectionId,
+      writer: socket as never,
+      options: {
+        connectionId,
+        wsUrl: "ws://test",
+        deviceId: "test",
+        connectionName: connectionId,
+        onConnected: () => {},
+        onDisconnected: () => {},
+        onError: () => {},
+      },
+    });
+    markListenerConnectionInitialized(listener, connectionId);
+    subscribeListenerConnection(listener, connectionId, scope);
+
+    emitListenerModNotification(
+      listener,
+      "Desktop-only message",
+      createListenerModContext({
+        agent: { id: scope.agent_id },
+        sessionId: scope.conversation_id,
+      }),
+    );
+
+    const message = parseOnlyStreamDelta(socket);
+    expect(message.runtime).toEqual(scope);
+    expect(message.delta).toMatchObject({
+      message_type: "status",
+      message: "Desktop-only message",
+      level: "info",
+    });
+  });
+
+  test("fans notifications out to subscribers and honors an explicit target", () => {
+    const listener = createListenerRuntime();
+    const runtime = getOrCreateScopedRuntime(listener, "agent-1", "conv-1");
+    const socketA = new MockSocket();
+    const socketB = new MockSocket();
+    const socketC = new MockSocket();
+    const scope = { agent_id: "agent-1", conversation_id: "conv-1" };
+
+    for (const [connectionId, socket] of [
+      ["client-a", socketA],
+      ["client-b", socketB],
+      ["client-c", socketC],
+    ] as const) {
+      openListenerConnection({
+        runtime: listener,
+        connectionId,
+        writer: socket as never,
+        options: {
+          connectionId,
+          wsUrl: "ws://test",
+          deviceId: "test",
+          connectionName: connectionId,
+          onConnected: () => {},
+          onDisconnected: () => {},
+          onError: () => {},
+        },
+      });
+      markListenerConnectionInitialized(listener, connectionId);
+    }
+    subscribeListenerConnection(listener, "client-a", scope);
+    subscribeListenerConnection(listener, "client-b", scope);
+
+    emitProtocolV2Message(
+      socketC as never,
+      runtime,
+      {
+        type: "update_loop_status",
+        loop_status: { status: "WAITING_ON_INPUT", active_run_ids: [] },
+      } as never,
+      scope,
+      TO_SUBSCRIBERS,
+    );
+
+    expect(socketA.sentPayloads).toHaveLength(1);
+    expect(socketB.sentPayloads).toHaveLength(1);
+    expect(socketC.sentPayloads).toHaveLength(0);
+
+    emitProtocolV2Message(
+      socketA as never,
+      runtime,
+      {
+        type: "control_request",
+        request_id: "approval-1",
+        request: {
+          subtype: "can_use_tool",
+          tool_name: "Bash",
+          input: {},
+          tool_call_id: "tool-1",
+          permission_suggestions: [],
+          blocked_path: null,
+        },
+      } as never,
+      scope,
+      toListenerConnection("client-b"),
+    );
+
+    expect(socketA.sentPayloads).toHaveLength(1);
+    expect(socketB.sentPayloads).toHaveLength(2);
+    expect(socketC.sentPayloads).toHaveLength(0);
+  });
+
+  test("drops scoped events when the scope has no subscribers", () => {
+    const listener = createListenerRuntime();
+    const runtime = getOrCreateScopedRuntime(listener, "agent-1", "conv-1");
+    const socketA = new MockSocket();
+    const socketB = new MockSocket();
+    for (const [connectionId, socket] of [
+      ["client-a", socketA],
+      ["client-b", socketB],
+    ] as const) {
+      openListenerConnection({
+        runtime: listener,
+        connectionId,
+        writer: socket as never,
+        options: {
+          connectionId,
+          wsUrl: "ws://test",
+          deviceId: "test",
+          connectionName: connectionId,
+          onConnected: () => {},
+          onDisconnected: () => {},
+          onError: () => {},
+        },
+      });
+      markListenerConnectionInitialized(listener, connectionId);
+    }
+
+    emitProtocolV2Message(
+      socketA as never,
+      runtime,
+      {
+        type: "update_queue",
+        queue: [],
+      } as never,
+      { agent_id: "agent-1", conversation_id: "conv-1" },
+      TO_SUBSCRIBERS,
+    );
+
+    expect(socketA.sentPayloads).toEqual([]);
+    expect(socketB.sentPayloads).toEqual([]);
+  });
+
+  test("serializes parent runtime claims independently from background grouping", () => {
+    clearAllSubagents();
+    try {
+      registerSubagent(
+        "subagent-child-send",
+        "general-purpose",
+        "Continue child work",
+        undefined,
+        true,
+        false,
+        { agentId: "agent-a", conversationId: "conv-a" },
+        "Finish the task",
+        false,
+      );
+      const listener = createListenerRuntime();
+      const runtime = getOrCreateScopedRuntime(listener, "agent-a", "conv-a");
+
+      expect(
+        buildSubagentSnapshot(runtime, {
+          agent_id: "agent-a",
+          conversation_id: "conv-a",
+        }),
+      ).toEqual([
+        expect.objectContaining({
+          subagent_id: "subagent-child-send",
+          is_background: true,
+          claims_parent_runtime: false,
+        }),
+      ]);
+    } finally {
+      clearAllSubagents();
+    }
+  });
+
+  test("keeps cron and background snapshots inside their subscribed runtime", () => {
+    const listener = createListenerRuntime();
+    const runtimeA = getOrCreateScopedRuntime(listener, "agent-a", "conv-a");
+    const socketA = new MockSocket();
+    const socketB = new MockSocket();
+    for (const [connectionId, socket] of [
+      ["client-a", socketA],
+      ["client-b", socketB],
+    ] as const) {
+      openListenerConnection({
+        runtime: listener,
+        connectionId,
+        writer: socket as never,
+        options: {
+          connectionId,
+          wsUrl: "ws://test",
+          deviceId: "test",
+          connectionName: connectionId,
+          onConnected: () => {},
+          onDisconnected: () => {},
+          onError: () => {},
+        },
+      });
+      markListenerConnectionInitialized(listener, connectionId);
+    }
+    subscribeListenerConnection(listener, "client-a", {
+      agent_id: "agent-a",
+      conversation_id: "conv-a",
+    });
+    subscribeListenerConnection(listener, "client-b", {
+      agent_id: "agent-b",
+      conversation_id: "conv-b",
+    });
+
+    emitProtocolV2Message(
+      socketA as never,
+      runtimeA,
+      {
+        type: "crons_updated",
+        timestamp: 1,
+        agent_id: "agent-a",
+        conversation_id: "conv-a",
+      } as never,
+      { agent_id: "agent-a", conversation_id: "conv-a" },
+      TO_SUBSCRIBERS,
+    );
+    emitProtocolV2Message(
+      socketA as never,
+      runtimeA,
+      {
+        type: "update_subagent_state",
+        subagents: [],
+      } as never,
+      { agent_id: "agent-a", conversation_id: "conv-a" },
+      TO_SUBSCRIBERS,
+    );
+
+    expect(socketA.sentPayloads).toHaveLength(2);
+    expect(socketB.sentPayloads).toEqual([]);
+  });
+
+  test("filters populated background jobs across two runtimes", () => {
+    const listener = createListenerRuntime();
+    const runtimeA = getOrCreateScopedRuntime(listener, "agent-a", "conv-a");
+    const runtimeB = getOrCreateScopedRuntime(listener, "agent-b", "conv-b");
+    const socketA = new MockSocket();
+    const socketB = new MockSocket();
+    for (const [connectionId, socket, agentId, conversationId] of [
+      ["client-a", socketA, "agent-a", "conv-a"],
+      ["client-b", socketB, "agent-b", "conv-b"],
+    ] as const) {
+      openListenerConnection({
+        runtime: listener,
+        connectionId,
+        writer: socket as never,
+        options: {
+          connectionId,
+          wsUrl: "ws://test",
+          deviceId: "test",
+          connectionName: connectionId,
+          onConnected: () => {},
+          onDisconnected: () => {},
+          onError: () => {},
+        },
+      });
+      markListenerConnectionInitialized(listener, connectionId);
+      subscribeListenerConnection(listener, connectionId, {
+        agent_id: agentId,
+        conversation_id: conversationId,
+      });
+    }
+    backgroundProcesses.clear();
+    backgroundTasks.clear();
+
+    try {
+      backgroundProcesses.set("bash-agent-a", {
+        process: { kill: () => true },
+        command: "agent-a-secret-command",
+        stdout: [],
+        stderr: [],
+        status: "running",
+        exitCode: null,
+        startTime: new Date("2026-07-27T12:00:00.000Z"),
+        runtimeScope: { agentId: "agent-a", conversationId: "conv-a" },
+      });
+      backgroundTasks.set("task-agent-b", {
+        description: "Agent B task",
+        subagentType: "review",
+        subagentId: "subagent-b",
+        status: "running",
+        startTime: new Date("2026-07-27T12:01:00.000Z"),
+        outputFile: "/tmp/task-agent-b.log",
+        runtimeScope: { agentId: "agent-b", conversationId: "conv-b" },
+      });
+      backgroundProcesses.set("unowned-job", {
+        process: { kill: () => true },
+        command: "legacy-unowned-command",
+        stdout: [],
+        stderr: [],
+        status: "running",
+        exitCode: null,
+      });
+
+      emitDeviceStatusUpdateIfChanged(
+        socketA as never,
+        runtimeA,
+        {},
+        { force: true },
+      );
+      emitDeviceStatusUpdateIfChanged(
+        socketB as never,
+        runtimeB,
+        {},
+        { force: true },
+      );
+
+      expect(socketA.sentPayloads).toHaveLength(1);
+      expect(socketB.sentPayloads).toHaveLength(1);
+      const statusA = (
+        JSON.parse(socketA.sentPayloads[0] ?? "{}") as DeviceStatusUpdateMessage
+      ).device_status;
+      const statusB = (
+        JSON.parse(socketB.sentPayloads[0] ?? "{}") as DeviceStatusUpdateMessage
+      ).device_status;
+
+      expect(
+        statusA.background_processes.map((process) => process.process_id),
+      ).toEqual(["bash-agent-a"]);
+      expect(
+        statusB.background_processes.map((process) => process.process_id),
+      ).toEqual(["task-agent-b"]);
+      expect(JSON.stringify(statusB.background_processes)).not.toContain(
+        "agent-a-secret-command",
+      );
+    } finally {
+      backgroundProcesses.clear();
+      backgroundTasks.clear();
+    }
+  });
+});
+
 describe("emitDequeuedUserMessage", () => {
+  test("includes the acting user for live observers", () => {
+    const { runtime, socket } = createRuntime();
+    const incoming = {
+      type: "message",
+      agentId: "agent-1",
+      conversationId: "conv-1",
+      actingUserId: "cloud-user-2",
+      messages: [{ role: "user", content: "hello from another person" }],
+    } as IncomingMessage;
+    const batch = {
+      batchId: "batch-user",
+      items: [
+        {
+          id: "item-user",
+          kind: "message",
+          source: "user",
+          content: "hello from another person",
+          actingUserId: "cloud-user-2",
+          agentId: "agent-1",
+          conversationId: "conv-1",
+          enqueuedAt: Date.now(),
+        },
+      ],
+      mergedCount: 1,
+      queueLenAfter: 0,
+    } satisfies DequeuedBatch;
+
+    emitDequeuedUserMessage(socket as never, runtime, incoming, batch);
+
+    const message = parseOnlyStreamDelta(socket);
+    expect(message.delta).toMatchObject({
+      message_type: "user_message",
+      created_by_id: "cloud-user-2",
+    });
+  });
+
   test("emits cron_prompt-only turns as visible scheduled task user messages", () => {
     const { runtime, socket } = createRuntime();
     const cronText = [
@@ -100,6 +701,7 @@ describe("emitDequeuedUserMessage", () => {
       content: unknown;
     };
     expect(userDelta.message_type).toBe("user_message");
+    expect(userDelta).not.toHaveProperty("created_by_id");
     expect(userDelta.content).toEqual([
       {
         type: "text",
@@ -183,5 +785,38 @@ describe("emitDequeuedUserMessage", () => {
     emitDequeuedUserMessage(socket as never, runtime, incoming, batch);
 
     expect(socket.sentPayloads).toHaveLength(0);
+  });
+});
+
+describe("emitDeviceStatusUpdateIfChanged", () => {
+  test("normalizes runtime scopes without cross-scope leakage", () => {
+    const listener = createListenerRuntime();
+    const runtime = getOrCreateScopedRuntime(listener, "agent-1", "default");
+    const otherRuntime = getOrCreateScopedRuntime(
+      listener,
+      "agent-2",
+      "default",
+    );
+    const socket = new MockSocket();
+    const otherSocket = new MockSocket();
+
+    expect(emitDeviceStatusUpdateIfChanged(socket as never, runtime, {})).toBe(
+      true,
+    );
+    expect(
+      emitDeviceStatusUpdateIfChanged(socket as never, runtime, {
+        agent_id: "agent-1",
+        conversation_id: "default",
+      }),
+    ).toBe(false);
+    expect(
+      emitDeviceStatusUpdateIfChanged(socket as never, otherRuntime, {}),
+    ).toBe(true);
+    expect(
+      emitDeviceStatusUpdateIfChanged(otherSocket as never, runtime, {}),
+    ).toBe(true);
+
+    expect(socket.sentPayloads).toHaveLength(2);
+    expect(otherSocket.sentPayloads).toHaveLength(1);
   });
 });

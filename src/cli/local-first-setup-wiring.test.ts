@@ -5,23 +5,21 @@ function readSource(relativePath: string): string {
   return readFileSync(new URL(relativePath, import.meta.url), "utf-8");
 }
 
-describe("local-first setup wiring", () => {
+describe("cloud-default setup wiring", () => {
   test("setup menu offers local mode and persists that choice", () => {
     const source = readSource("../auth/setup-ui.tsx");
 
     expect(source).toContain('const LOCAL_MODE_LABEL = "Proceed locally"');
+    expect(source).toContain('const AUTH_LOGIN_LABEL = "Sign in with Letta"');
     expect(source).toContain(
-      'const AUTH_LOGIN_LABEL = "Login to Constellation"',
-    );
-    expect(source).toContain(
-      'initialMode === "device-code" || localModeDisabled ? 0 : 1',
+      "const [selectedOption, setSelectedOption] = useState(0)",
     );
     expect(source).toContain('configureBackendMode("local")');
     expect(source).toContain(
       'settingsManager.updateSettings({ preferredBackendMode: "local" })',
     );
     expect(source).toContain("letta setup");
-    expect(source).toContain("letta backend api");
+    expect(source).toContain("letta backend cloud");
     expect(source).toContain("Agents you create are local to");
     expect(source).toContain("chat.letta.com");
     expect(source).toContain("Welcome to Letta Code");
@@ -31,23 +29,19 @@ describe("local-first setup wiring", () => {
     expect(source).not.toContain("Choose where your agents should live");
   });
 
-  test("successful cloud login records the api backend preference", () => {
-    const source = readSource("../auth/ConstellationLoginView.tsx");
-    const start = source.indexOf("settingsManager.updateSettings({");
-    const end = source.indexOf("await settingsManager.flush();", start);
+  test("in-session login preserves the active backend while setup activates cloud", () => {
+    const overlaySource = readSource("./components/LettaLoginOverlay.tsx");
+    const setupSource = readSource("../auth/setup-ui.tsx");
 
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    expect(source.slice(start, end)).toContain('preferredBackendMode: "api"');
+    expect(overlaySource).toContain("activateCloudBackend={false}");
+    expect(setupSource).toContain("activateCloudBackend");
   });
 
   test("reauthentication paths do not trust stale stored credentials", () => {
-    const loginSource = readSource("../auth/ConstellationLoginView.tsx");
+    const loginSource = readSource("../auth/LettaLoginView.tsx");
     const setupSource = readSource("../auth/setup-ui.tsx");
     const setupRunnerSource = readSource("../auth/setup.ts");
-    const overlaySource = readSource(
-      "./components/ConstellationLoginOverlay.tsx",
-    );
+    const overlaySource = readSource("./components/LettaLoginOverlay.tsx");
     const indexSource = readSource("../index.ts");
 
     expect(loginSource).not.toContain("onAlreadyLoggedIn");
@@ -58,7 +52,7 @@ describe("local-first setup wiring", () => {
     );
 
     expect(setupSource).toContain(
-      'initialMode === "device-code" || localModeDisabled ? 0 : 1',
+      "const [selectedOption, setSelectedOption] = useState(0)",
     );
     expect(setupSource).toContain('onCancel={() => setMode("menu")}');
     expect(setupRunnerSource).toContain("initialMode?: SetupInitialMode");
@@ -104,7 +98,7 @@ describe("local-first setup wiring", () => {
 
     expect(indexSource).toContain("const setupLocalModeDisabledReason =");
     expect(indexSource).toContain('inferredBackendModeFromAgentId === "api"');
-    expect(indexSource).toContain("is a Constellation agent");
+    expect(indexSource).toContain("requires Letta sign-in");
     expect(indexSource).toContain("rerun without --agent to start locally");
     expect(indexSource).toContain(
       "localModeDisabledReason: setupLocalModeDisabledReason",
@@ -123,46 +117,23 @@ describe("local-first setup wiring", () => {
     }
   });
 
-  test("startup auto-enters local mode for credentialless new users while honoring saved local preference", () => {
+  test("startup honors saved selection without automatically saving local for new users", () => {
     const source = readSource("../index.ts");
-    const start = source.indexOf('settings.preferredBackendMode === "local"');
-    const end = source.indexOf(
-      "await tryConfigureStartupLocalBackend()",
-      start,
+    expect(source).toContain(
+      "const startupBackendMode = resolveSubcommandBackendMode({",
     );
-
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-
-    const segment = source.slice(start - 120, end + 60);
-    expect(segment).toContain("!explicitBackendMode");
-    expect(segment).toContain("baseURL === LETTA_CLOUD_API_URL");
-    expect(segment).toContain('settings.preferredBackendMode === "local"');
-    expect(segment).not.toContain("!apiKey");
-    expect(segment).not.toContain("!settings.refreshToken");
-
-    const setupStart = source.indexOf(
-      "Local-first new-user flow: if the user has no Letta Cloud credentials",
+    expect(source).toContain(
+      "explicitBackendMode: explicitBackendMode ?? inferredBackendModeFromAgentId",
     );
-    const setupEnd = source.indexOf(
-      "const startupTargetLookupOrder",
-      setupStart,
-    );
-    expect(setupStart).toBeGreaterThan(-1);
-    expect(setupEnd).toBeGreaterThan(setupStart);
-    const setupSegment = source.slice(
-      setupStart,
-      setupEnd + "await settingsManager.flush();".length,
-    );
-    expect(setupSegment).toContain("!explicitBackendMode");
-    expect(setupSegment).toContain("!isHeadless");
-    expect(setupSegment).toContain("!settings.refreshToken");
-    expect(setupSegment).toContain("!apiKey");
-    expect(setupSegment).toContain("await tryConfigureStartupLocalBackend()");
-    expect(setupSegment).toContain(
+    expect(source).toContain("savedBackendMode: settings.preferredBackendMode");
+    expect(source).toContain('if (startupBackendMode === "local")');
+    expect(source).toContain("await tryConfigureStartupLocalBackend()");
+    expect(source).not.toContain(
       'settingsManager.updateSettings({ preferredBackendMode: "local" })',
     );
-    expect(setupSegment).toContain("await settingsManager.flush();");
+    expect(
+      source.match(/persistBackendPreference: !explicitBackendMode/g),
+    ).toHaveLength(3);
   });
 
   test("local transcript migration errors do not block setup login fallback", () => {
@@ -184,10 +155,12 @@ describe("local-first setup wiring", () => {
 
     expect(router).toContain('case "backend"');
     expect(router).toContain('case "setup"');
-    expect(backendCommand).toContain("letta backend api");
+    expect(backendCommand).toContain("letta backend cloud");
     expect(backendCommand).toContain("letta backend local");
-    expect(backendCommand).toContain("resolveStartupBackendDisplay");
-    expect(backendCommand).toContain("Proceed locally selected");
+    expect(backendCommand).toContain(
+      'settingsManager.getSettings().preferredBackendMode ?? "api"',
+    );
+    expect(backendCommand).not.toContain("Proceed locally selected");
     expect(backendCommand).toContain(
       "settingsManager.updateSettings({ preferredBackendMode: backendMode })",
     );

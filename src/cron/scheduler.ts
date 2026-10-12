@@ -12,19 +12,20 @@
  * On stop: clears interval, releases lease.
  */
 
+import { isLocalAgentId } from "@/agent/agent-id";
 import { getBackend } from "@/backend";
+import type { ConversationCreateBody } from "@/backend/backend";
 import type { CronPromptQueueItem, DequeuedBatch } from "@/queue/queue-runtime";
+import { debugWarn } from "@/utils/debug";
+import { TO_SUBSCRIBERS } from "@/websocket/listener/connection";
 import { ensureConversationQueueRuntime } from "@/websocket/listener/conversation-runtime";
+import { emitProtocolV2Message } from "@/websocket/listener/protocol-outbound";
 import { scheduleQueuePump } from "@/websocket/listener/queue";
 import {
   getActiveRuntime,
   getOrCreateConversationRuntime,
-  safeEmitWsEvent,
 } from "@/websocket/listener/runtime";
-import {
-  isListenerTransportOpen,
-  type ListenerTransport,
-} from "@/websocket/listener/transport";
+import type { ListenerTransport } from "@/websocket/listener/transport";
 import type {
   IncomingMessage,
   StartListenerOptions,
@@ -32,18 +33,35 @@ import type {
 import {
   type CronRunOutcome,
   type CronRunReason,
+  type CronSchedulerScope,
   type CronTask,
   claimSchedulerLease,
   garbageCollect,
   getActiveTasks,
   getCronFileMtime,
   getTask,
+  readCronFile,
+  recordTaskQueued,
+  refreshSchedulerLease,
   releaseSchedulerLease,
   updateTask,
-  verifySchedulerLease,
 } from "./cron-file";
-import { cronMatchesTime } from "./parse-interval";
+import { cronMatchesTime, isValidCron } from "./parse-interval";
+import {
+  type CronPromptTiming,
+  formatCronPrompt,
+  getIntendedCronOccurrence,
+} from "./prompt";
 import { safeAppendCronRunLogForTask } from "./run-log";
+import { isManagedCloudSandbox } from "./runner";
+import { SCHEDULE_ORIGIN_TAG } from "./scheduled-task-prompt";
+
+export {
+  type CronPromptTiming,
+  formatCronPrompt,
+  formatTimezoneQualifiedIso,
+  getIntendedCronOccurrence,
+} from "./prompt";
 
 // ── Types ───────────────────────────────────────────────────────────
 
@@ -54,6 +72,7 @@ type ProcessQueuedTurn = (
 
 interface SchedulerState {
   token: string;
+  scope: CronSchedulerScope;
   tickInterval: NodeJS.Timeout;
   gcInterval: NodeJS.Timeout;
   socket: ListenerTransport;
@@ -69,9 +88,31 @@ interface SchedulerState {
   lastMinuteKey: string;
   /** Pending jitter-delayed timers — cleared on stop/lease loss. */
   pendingTimers: Set<NodeJS.Timeout>;
+  /** Last live `scheduler_owner` token, used to recognize a sibling tombstone. */
+  tombstoneToken: string | undefined;
+  /** Scoped-only heartbeat that restores the mixed-version tombstone. */
+  tombstoneInterval: NodeJS.Timeout | null;
 }
 
 let schedulerState: SchedulerState | null = null;
+
+export const CRON_SCHEDULER_SCOPE_ENV = "LETTA_CRON_SCHEDULER_SCOPE";
+
+export function resolveCronSchedulerScope(
+  value = process.env[CRON_SCHEDULER_SCOPE_ENV],
+): CronSchedulerScope {
+  return value === "cloud" || value === "local" ? value : "all";
+}
+
+export function taskMatchesCronSchedulerScope(
+  task: CronTask,
+  scope: CronSchedulerScope,
+): boolean {
+  if (scope === "all") return true;
+  return scope === "local"
+    ? isLocalAgentId(task.agent_id)
+    : !isLocalAgentId(task.agent_id);
+}
 
 /**
  * Listener context stored independently of the scheduler lease.
@@ -89,33 +130,64 @@ let listenerFireContext: {
 
 const TICK_INTERVAL_MS = 60_000;
 const GC_INTERVAL_MS = 60 * 60_000; // 1 hour
+const TOMBSTONE_HEARTBEAT_MS = 1_000;
 const LEASE_RETRY_MS = 30_000; // 30 seconds between lease claim retries
 const MAX_LEASE_RETRIES = 3;
 const NEW_CONVERSATION_TARGET = "new";
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
+function logScheduler(opts: StartListenerOptions, message: string): void {
+  if (opts.onLog) {
+    opts.onLog(`[Cron] ${message}`);
+    return;
+  }
+  debugWarn("Cron", message);
+}
+
+function holdSchedulerLease(
+  state: SchedulerState,
+  opts: StartListenerOptions,
+): boolean {
+  if (refreshSchedulerLease(state.token, state.scope, state.tombstoneToken)) {
+    return true;
+  }
+  if (state.scope === "all") {
+    logScheduler(opts, "Scheduler lease lost. Stopping.");
+    stopScheduler();
+    return false;
+  }
+  try {
+    state.token = claimSchedulerLease(state.scope);
+    state.tombstoneToken = readCronFile().scheduler_owner?.token;
+    logScheduler(opts, "Reclaimed scoped scheduler lease.");
+    return true;
+  } catch (err) {
+    logScheduler(
+      opts,
+      `Scheduler lease lost; retrying: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    clearPendingFireTimers(state);
+    return false;
+  }
+}
+
+function clearPendingFireTimers(state: SchedulerState): void {
+  for (const handle of state.pendingTimers) {
+    clearTimeout(handle);
+  }
+  state.pendingTimers.clear();
+}
+
 export function minuteKey(date: Date): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}T${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-export function wrapCronPrompt(task: CronTask): string {
-  const lines = [
-    `Scheduled task "${task.name}" is firing.`,
-    `Description: ${task.description}`,
-    task.recurring
-      ? `This is fire #${task.fire_count + 1} (cron: ${task.cron}).`
-      : `This is a one-off scheduled task.`,
-    "",
-    "You are running autonomously: no user is watching this turn and questions will not be answered. Deliver results through your available channels or record them in memory, and work until the task is done or genuinely blocked.",
-    "",
-    `Prompt: ${task.prompt}`,
-  ];
-  return lines.join("\n");
-}
-
-function getCronConversationSummary(task: CronTask): string {
-  return `[Schedule] ${task.name}`;
+export function wrapCronPrompt(
+  task: CronTask,
+  timing: CronPromptTiming,
+): string {
+  return formatCronPrompt(task, timing);
 }
 
 async function resolveCronFireConversationId(
@@ -124,8 +196,9 @@ async function resolveCronFireConversationId(
   if (task.conversation_id === NEW_CONVERSATION_TARGET) {
     const conversation = await getBackend().createConversation({
       agent_id: task.agent_id,
-      summary: getCronConversationSummary(task),
-    });
+      summary: task.name,
+      tags: [SCHEDULE_ORIGIN_TAG],
+    } as ConversationCreateBody);
     return conversation.id;
   }
 
@@ -137,26 +210,25 @@ function emitCronsUpdated(
   task: CronTask,
   conversationId?: string | null,
 ): void {
-  if (!isListenerTransportOpen(socket)) {
-    return;
-  }
-
+  const listener = getActiveRuntime();
+  if (!listener) return;
+  const runtimeScope = {
+    agent_id: task.agent_id,
+    conversation_id: conversationId ?? task.conversation_id ?? "default",
+  };
   const payload = {
-    type: "crons_updated",
+    type: "crons_updated" as const,
     timestamp: Date.now(),
     agent_id: task.agent_id,
-    conversation_id: conversationId ?? task.conversation_id,
+    conversation_id: runtimeScope.conversation_id,
   };
-
-  try {
-    socket.send(JSON.stringify(payload));
-    safeEmitWsEvent("send", "protocol", payload);
-  } catch (err) {
-    console.error(
-      `[Cron] Error sending crons_updated for task ${task.id}:`,
-      err instanceof Error ? err.message : err,
-    );
-  }
+  emitProtocolV2Message(
+    socket,
+    listener,
+    payload,
+    runtimeScope,
+    TO_SUBSCRIBERS,
+  );
 }
 
 // ── Core tick logic ─────────────────────────────────────────────────
@@ -212,19 +284,59 @@ export function shouldFireTask(task: CronTask, now: Date): boolean {
   return cronMatchesTime(task.cron, now, task.timezone);
 }
 
+function getInvalidCronError(cron: string): string {
+  return `Invalid cron expression "${cron}". Delete and recreate this schedule.`;
+}
+
+function hasReportedInvalidCron(task: CronTask): boolean {
+  return (
+    task.last_run_outcome === "failed" &&
+    task.last_run_reason === "invalid_cron" &&
+    task.last_run_error === getInvalidCronError(task.cron)
+  );
+}
+
+/**
+ * Persist a visible failure for legacy recurring tasks that predate current
+ * cron validation. Keep the task active so the user can inspect and replace
+ * it instead of silently dropping it or garbage-collecting its definition.
+ */
+export function handleInvalidRecurringTask(task: CronTask, now: Date): boolean {
+  if (!task.recurring || isValidCron(task.cron)) return false;
+
+  const error = getInvalidCronError(task.cron);
+  if (hasReportedInvalidCron(task)) return true;
+
+  setLastRunOutcome(task.id, {
+    outcome: "failed",
+    reason: "invalid_cron",
+    runAt: now,
+    error,
+  });
+  safeAppendCronRunLogForTask(task, {
+    status: "error",
+    outcome: "failed",
+    reason: "invalid_cron",
+    error,
+    runAtMs: now.getTime(),
+  });
+  return true;
+}
+
 async function fireCronTask(
   task: CronTask,
-  now: Date,
+  timing: CronPromptTiming,
   socket: ListenerTransport,
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
+  trigger: "automatic" | "manual",
 ): Promise<boolean> {
   const listener = getActiveRuntime();
   if (!listener) {
     setLastRunOutcome(task.id, {
       outcome: "failed",
       reason: "runtime_unavailable",
-      runAt: now,
+      runAt: timing.schedulerNow,
       error: "No active runtime",
     });
     safeAppendCronRunLogForTask(task, {
@@ -232,7 +344,7 @@ async function fireCronTask(
       outcome: "failed",
       reason: "runtime_unavailable",
       error: "No active runtime",
-      runAtMs: now.getTime(),
+      runAtMs: timing.schedulerNow.getTime(),
       scheduledFor: task.scheduled_for,
     });
     return false;
@@ -246,7 +358,7 @@ async function fireCronTask(
       status: "error",
       error:
         err instanceof Error ? err.message : "failed to resolve conversation",
-      runAtMs: now.getTime(),
+      runAtMs: timing.schedulerNow.getTime(),
       scheduledFor: task.scheduled_for,
     });
     return false;
@@ -262,7 +374,7 @@ async function fireCronTask(
     setLastRunOutcome(task.id, {
       outcome: "failed",
       reason: "runtime_unavailable",
-      runAt: now,
+      runAt: timing.schedulerNow,
       error: "Conversation runtime unavailable",
     });
     safeAppendCronRunLogForTask(task, {
@@ -270,7 +382,7 @@ async function fireCronTask(
       outcome: "failed",
       reason: "runtime_unavailable",
       error: "Conversation runtime unavailable",
-      runAtMs: now.getTime(),
+      runAtMs: timing.schedulerNow.getTime(),
       scheduledFor: task.scheduled_for,
     });
     return false;
@@ -283,7 +395,13 @@ async function fireCronTask(
     rawRuntime,
   );
 
-  const text = wrapCronPrompt(task);
+  // Pause can land while a recurring task waits for jitter or while a new
+  // conversation is being created. Recheck immediately before enqueueing.
+  if (trigger === "automatic" && getTask(task.id)?.status !== "active") {
+    return false;
+  }
+
+  const text = wrapCronPrompt(task, timing);
 
   const queuedItem = conversationRuntime.queueRuntime.enqueue({
     kind: "cron_prompt",
@@ -298,7 +416,7 @@ async function fireCronTask(
     setLastRunOutcome(task.id, {
       outcome: "failed",
       reason: "queue_full",
-      runAt: now,
+      runAt: timing.schedulerNow,
       error: "queue buffer limit",
     });
     safeAppendCronRunLogForTask(task, {
@@ -306,7 +424,7 @@ async function fireCronTask(
       outcome: "failed",
       reason: "queue_full",
       error: "queue buffer limit",
-      runAtMs: now.getTime(),
+      runAtMs: timing.schedulerNow.getTime(),
       scheduledFor: task.scheduled_for,
     });
     return false;
@@ -314,36 +432,17 @@ async function fireCronTask(
 
   scheduleQueuePump(conversationRuntime, socket, opts, processQueuedTurn);
 
-  // Update task state
-  const nowIso = now.toISOString();
-  if (task.recurring) {
-    updateTask(task.id, (t) => {
-      t.last_fired_at = nowIso;
-      t.fire_count += 1;
-      t.last_run_at = nowIso;
-      t.last_run_outcome = "queued";
-      t.last_run_reason = "scheduled_time_matched";
-      t.last_run_error = null;
-    });
-  } else {
-    // One-shot: mark as fired
-    updateTask(task.id, (t) => {
-      t.status = "fired";
-      t.fired_at = nowIso;
-      t.last_fired_at = nowIso;
-      t.fire_count = 1;
-      t.last_run_at = nowIso;
-      t.last_run_outcome = "queued";
-      t.last_run_reason = "one_off_due";
-      t.last_run_error = null;
-    });
-  }
+  // A manual run records an occurrence but does not consume or reschedule the
+  // automatic occurrence. In particular, a one-off remains active or paused.
+  const nowIso = timing.schedulerNow.toISOString();
+  recordTaskQueued(task.id, trigger, timing.schedulerNow);
 
+  const runReason = task.recurring ? "scheduled_time_matched" : "one_off_due";
   safeAppendCronRunLogForTask(task, {
     status: "ok",
     outcome: "queued",
-    reason: task.recurring ? "scheduled_time_matched" : "one_off_due",
-    runAtMs: now.getTime(),
+    reason: runReason,
+    runAtMs: timing.schedulerNow.getTime(),
     queueItemId: queuedItem.id,
     scheduledFor: task.scheduled_for,
     firedAt: nowIso,
@@ -391,23 +490,38 @@ export function handleMissedOneShot(task: CronTask, now: Date): boolean {
   return false;
 }
 
+/** Apply scheduler lifecycle checks shared by the WS and TUI tick loops. */
+export function handleTaskPreflight(task: CronTask, now: Date): boolean {
+  return (
+    handleInvalidRecurringTask(task, now) || handleMissedOneShot(task, now)
+  );
+}
+
 export async function runCronTaskNow(taskId: string): Promise<{
   success: boolean;
   found: boolean;
   task?: CronTask;
   error?: string;
 }> {
+  if (isManagedCloudSandbox()) {
+    return {
+      success: false,
+      found: false,
+      error: "Local schedules cannot run in a managed Cloud sandbox",
+    };
+  }
+
   const task = getTask(taskId);
   if (!task) {
     return { success: false, found: false, error: "Schedule not found" };
   }
 
-  if (task.status !== "active") {
+  if (task.status !== "active" && task.status !== "paused") {
     return {
       success: false,
       found: true,
       task,
-      error: "Schedule is not active",
+      error: "Completed schedules cannot run again",
     };
   }
 
@@ -423,13 +537,17 @@ export async function runCronTaskNow(taskId: string): Promise<{
     };
   }
 
-  const now = new Date();
+  const schedulerNow = new Date();
   const fired = await fireCronTask(
     task,
-    now,
+    {
+      intendedOccurrence: getIntendedCronOccurrence(task, schedulerNow),
+      schedulerNow,
+    },
     ctx.socket,
     ctx.opts,
     ctx.processQueuedTurn,
+    "manual",
   );
 
   if (!fired) {
@@ -453,15 +571,13 @@ function tick(
   opts: StartListenerOptions,
   processQueuedTurn: ProcessQueuedTurn,
 ): void {
-  // Verify we still hold the lease
-  if (!verifySchedulerLease(state.token)) {
-    console.error("[Cron] Scheduler lease lost. Stopping.");
-    stopScheduler();
+  // Verify we still hold the lease and keep the mixed-version tombstone live.
+  if (!holdSchedulerLease(state, opts)) {
     return;
   }
 
-  const now = new Date();
-  const currentMinuteKey = minuteKey(now);
+  const matchedAt = new Date();
+  const currentMinuteKey = minuteKey(matchedAt);
 
   // Reset per-minute dedup when minute changes
   if (currentMinuteKey !== state.lastMinuteKey) {
@@ -473,40 +589,71 @@ function tick(
 
   for (const task of state.cachedTasks) {
     if (task.status !== "active") continue;
+    if (!taskMatchesCronSchedulerScope(task, state.scope)) continue;
 
-    // Handle missed one-shots (skip firing if marked missed)
-    if (handleMissedOneShot(task, now)) continue;
+    // Older clients could persist expressions that the current cron dialect
+    // rejects. Surface that state once rather than silently never firing.
+    const invalidCronWasReported = hasReportedInvalidCron(task);
+    const invalidCron = task.recurring && !isValidCron(task.cron);
+    if (handleTaskPreflight(task, matchedAt)) {
+      if (invalidCron && !invalidCronWasReported) {
+        emitCronsUpdated(socket, task);
+      }
+      continue;
+    }
 
     // Per-minute dedup
     if (state.firedThisMinute.has(task.id)) continue;
 
-    if (shouldFireTask(task, now)) {
+    if (shouldFireTask(task, matchedAt)) {
       state.firedThisMinute.add(task.id);
+      const intendedOccurrence = getIntendedCronOccurrence(task, matchedAt);
 
       // Apply jitter as a real delay for recurring tasks so that tasks with
       // different jitter values actually fire at different times.
       const jitterMs = task.recurring ? task.jitter_offset_ms : 0;
       const taskId = task.id;
       const doFire = () => {
-        // Revalidate before firing: scheduler may have stopped, lease may
-        // have been lost, or the task may have been deleted/cancelled during
-        // the jitter window.
+        // Revalidate before firing. Catch lock timeouts so a skipped jitter
+        // fire cannot terminate the listener.
         if (!schedulerState) return;
+        try {
+          if (
+            !refreshSchedulerLease(
+              schedulerState.token,
+              schedulerState.scope,
+              schedulerState.tombstoneToken,
+            )
+          ) {
+            return;
+          }
+        } catch (err) {
+          logScheduler(
+            opts,
+            `Jitter fire lease check error: ${err instanceof Error ? err.message : String(err)}`,
+          );
+          return;
+        }
         const freshTask = getTask(taskId);
         if (!freshTask || freshTask.status !== "active") return;
 
+        const schedulerNow = new Date();
         void fireCronTask(
           freshTask,
-          now,
+          { intendedOccurrence, schedulerNow },
           socket,
           opts,
           processQueuedTurn,
+          "automatic",
         ).catch((err) => {
-          console.error(`[Cron] Error firing task ${taskId}:`, err);
+          logScheduler(
+            opts,
+            `Error firing task ${taskId}: ${err instanceof Error ? err.message : String(err)}`,
+          );
           setLastRunOutcome(freshTask.id, {
             outcome: "failed",
             reason: "scheduler_error",
-            runAt: now,
+            runAt: schedulerNow,
             error: err instanceof Error ? err.message : String(err),
           });
           safeAppendCronRunLogForTask(freshTask, {
@@ -514,7 +661,7 @@ function tick(
             outcome: "failed",
             reason: "scheduler_error",
             error: err instanceof Error ? err.message : String(err),
-            runAtMs: now.getTime(),
+            runAtMs: schedulerNow.getTime(),
             scheduledFor: freshTask.scheduled_for,
           });
         });
@@ -550,6 +697,10 @@ export function startScheduler(
   processQueuedTurn: ProcessQueuedTurn,
   _retryCount = 0,
 ): void {
+  if (isManagedCloudSandbox()) {
+    return;
+  }
+
   // Always store the listener context so runCronTaskNow ("Send now") works
   // even when this process doesn't hold the scheduler lease.
   listenerFireContext = { socket, opts, processQueuedTurn };
@@ -557,26 +708,31 @@ export function startScheduler(
   if (schedulerState) return;
 
   let token: string;
+  const scope = resolveCronSchedulerScope();
   try {
-    token = claimSchedulerLease();
+    token = claimSchedulerLease(scope);
   } catch (err) {
     if (_retryCount < MAX_LEASE_RETRIES) {
-      console.warn(
-        `[Cron] Could not claim scheduler lease (attempt ${_retryCount + 1}/${MAX_LEASE_RETRIES + 1}): ${err instanceof Error ? err.message : err}`,
+      logScheduler(
+        opts,
+        `Could not claim scheduler lease (attempt ${_retryCount + 1}/${MAX_LEASE_RETRIES + 1}): ${err instanceof Error ? err.message : err}`,
       );
-      console.warn(
-        "[Cron] Cron tasks will not fire until the scheduler starts. Retrying...",
+      logScheduler(
+        opts,
+        "Cron tasks will not fire until the scheduler starts. Retrying...",
       );
       setTimeout(
         () => startScheduler(socket, opts, processQueuedTurn, _retryCount + 1),
         LEASE_RETRY_MS,
       );
     } else {
-      console.error(
-        `[Cron] Failed to claim scheduler lease after ${MAX_LEASE_RETRIES + 1} attempts. Cron tasks will not fire.`,
+      logScheduler(
+        opts,
+        `Failed to claim scheduler lease after ${MAX_LEASE_RETRIES + 1} attempts. Cron tasks will not fire.`,
       );
-      console.error(
-        "[Cron] Another process may hold the lease. Restart Letta Code to retry.",
+      logScheduler(
+        opts,
+        "Another process may hold the lease. Restart Letta Code to retry.",
       );
     }
     return;
@@ -585,6 +741,7 @@ export function startScheduler(
   const now = new Date();
   const state: SchedulerState = {
     token,
+    scope,
     tickInterval: null as unknown as NodeJS.Timeout,
     gcInterval: null as unknown as NodeJS.Timeout,
     socket,
@@ -595,10 +752,21 @@ export function startScheduler(
     firedThisMinute: new Set(),
     lastMinuteKey: minuteKey(now),
     pendingTimers: new Set(),
+    tombstoneToken: readCronFile().scheduler_owner?.token,
+    tombstoneInterval: null,
   };
 
-  // Initial tick
+  schedulerState = state;
+
+  // Initial tick after the process is recorded as running so zero-jitter
+  // fires are not dropped by the `if (!schedulerState) return` revalidation.
   tick(state, socket, opts, processQueuedTurn);
+  // tick() calls stopScheduler() when an all-agent lease is already gone.
+  // Do not arm intervals on that detached state or the failed scheduler wakes
+  // forever. Scoped lease loss keeps this process recorded so heartbeat can retry.
+  if (schedulerState !== state) {
+    return;
+  }
 
   state.tickInterval = setInterval(() => {
     tick(state, socket, opts, processQueuedTurn);
@@ -611,11 +779,25 @@ export function startScheduler(
         state.lastMtime = 0; // Force cache refresh
       }
     } catch (err) {
-      console.error("[Cron] GC error:", err);
+      logScheduler(
+        opts,
+        `GC error: ${err instanceof Error ? err.message : String(err)}`,
+      );
     }
   }, GC_INTERVAL_MS);
 
-  schedulerState = state;
+  if (scope !== "all") {
+    state.tombstoneInterval = setInterval(() => {
+      try {
+        holdSchedulerLease(state, opts);
+      } catch (err) {
+        logScheduler(
+          opts,
+          `Tombstone heartbeat error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }, TOMBSTONE_HEARTBEAT_MS);
+  }
 }
 
 /**
@@ -627,15 +809,14 @@ export function stopScheduler(): void {
 
   clearInterval(schedulerState.tickInterval);
   clearInterval(schedulerState.gcInterval);
-
-  // Cancel all jitter-delayed fires that haven't executed yet.
-  for (const handle of schedulerState.pendingTimers) {
-    clearTimeout(handle);
+  if (schedulerState.tombstoneInterval) {
+    clearInterval(schedulerState.tombstoneInterval);
   }
-  schedulerState.pendingTimers.clear();
+
+  clearPendingFireTimers(schedulerState);
 
   try {
-    releaseSchedulerLease(schedulerState.token);
+    releaseSchedulerLease(schedulerState.token, schedulerState.scope);
   } catch {
     // Best effort
   }

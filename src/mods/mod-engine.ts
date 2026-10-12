@@ -1,13 +1,10 @@
 import { createHash } from "node:crypto";
 import {
   existsSync,
-  lstatSync,
   mkdirSync,
   readdirSync,
   readFileSync,
-  readlinkSync,
   statSync,
-  symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -34,19 +31,19 @@ import {
   attachDeprecatedGetContextTrap,
   recordDeprecatedContextApiSourceDiagnostics,
 } from "@/mods/deprecated-api";
-import {
-  isModFileExtension,
-  isTypeScriptModFileExtension,
-} from "@/mods/file-extensions";
+import { isTypeScriptModFileExtension } from "@/mods/file-extensions";
+import * as modInvocationContext from "@/mods/invocation-context";
+import { createModChangeBatcher } from "@/mods/mod-change-batcher";
 import {
   appendModDiagnostic,
   recordModDiagnostic,
   recordStaleHandleUse,
 } from "@/mods/mod-diagnostics";
-import {
-  type ManagedModPackageDiagnostic,
-  resolveManagedModPackages,
-} from "@/mods/package-registry";
+import type {
+  LocalModSource,
+  ResolveLocalModSourcesOptions,
+} from "@/mods/mod-sources";
+import { resolveLocalModSources } from "@/mods/mod-sources";
 import {
   getGlobalModsDirectory,
   getLegacyGlobalExtensionsDirectory,
@@ -54,17 +51,30 @@ import {
 } from "@/mods/paths";
 import {
   getModPermissionDefinition,
+  type ModPermissionDefinition,
   registerModPermission,
   unregisterModPermission,
   unregisterModPermissionsForOwner,
 } from "@/mods/permission-registry";
+import { ensureRuntimeDependenciesForModCache } from "@/mods/runtime-dependencies";
 import {
   getModToolDefinition,
+  type ModToolDefinition,
   registerModTool,
   unregisterModTool,
   unregisterModToolsForOwner,
 } from "@/mods/tool-registry";
-import { normalizeTurnStartCancelReason } from "@/mods/turn-start-cancel";
+import {
+  applyTurnStartCancel,
+  createTurnStartCancelRecord,
+  type ModTurnStartCancelRecord,
+  normalizeTurnStartCancelReason,
+} from "@/mods/turn-start-cancel";
+import {
+  cloneTurnStartInput,
+  isTurnStartInput,
+  preserveApprovalFirstOrdering,
+} from "@/mods/turn-start-input";
 import type {
   ModCapabilities,
   ModCommand,
@@ -96,6 +106,13 @@ import type {
   ModTurnStartCancelResult,
   ModTurnStartEvent,
 } from "@/mods/types";
+import { createNoopModPanelHandle } from "@/mods/ui-helpers";
+
+export type {
+  LocalModSource,
+  ResolveLocalModSourcesOptions,
+} from "@/mods/mod-sources";
+export { resolveLocalModSources } from "@/mods/mod-sources";
 
 export const GLOBAL_MODS_DIRECTORY = getGlobalModsDirectory();
 export const LEGACY_GLOBAL_EXTENSIONS_DIRECTORY =
@@ -103,6 +120,7 @@ export const LEGACY_GLOBAL_EXTENSIONS_DIRECTORY =
 export const MOD_CACHE_DIRECTORY = getModCacheDirectory();
 
 const requireFromRuntime = createRequire(import.meta.url);
+let resolveRuntimePackageDirectory = getRuntimePackageDirectory;
 
 export type LettaModDisposer = () => void;
 
@@ -161,6 +179,7 @@ export interface LettaModApi {
   };
   ui: {
     closePanel: (id: string) => void;
+    notify: (message: string) => void;
     openPanel: (panel: ModPanelOptions) => ModPanelHandle;
     /** @deprecated Removed. Use openPanel; calls emit a migration diagnostic. */
     setStatus: (key: string, value?: unknown) => void;
@@ -195,32 +214,16 @@ export interface LocalModRegistry {
   loadedPaths: string[];
   ownerAbortControllers: Record<string, AbortController>;
   owners: Record<string, ModOwner>;
-  permissions: Record<string, ModPermission>;
+  permissions: Record<string, ModPermissionDefinition>;
+  registerCapabilitiesGlobally: boolean;
   sources: LocalModSource[];
-  tools: Record<string, ModTool>;
+  tools: Record<string, ModToolDefinition>;
   ui: LocalModUiRegistry;
-}
-
-export interface LocalModSource {
-  diagnostics?: ManagedModPackageDiagnostic[];
-  files: string[];
-  legacyMigrationTargetRoot?: string;
-  managedPackageRoots?: string[];
-  root: string;
-  scope: ModSourceScope;
-  trusted: boolean;
 }
 
 interface LocalModModule {
   activate?: unknown;
   default?: unknown;
-}
-
-export interface ResolveLocalModSourcesOptions {
-  agentModsDirectory?: string;
-  cacheDirectory?: string;
-  globalModsDirectory?: string;
-  legacyGlobalExtensionsDirectory?: string;
 }
 
 export interface LoadLocalModsOptions extends ResolveLocalModSourcesOptions {
@@ -230,6 +233,9 @@ export interface LoadLocalModsOptions extends ResolveLocalModSourcesOptions {
   generation?: number;
   onChange?: () => void;
   onDiagnostic?: (diagnostic: ModDiagnostic) => void;
+  onNotification?: modInvocationContext.ModNotificationHandler;
+  onRegistryCreated?: (registry: LocalModRegistry) => void;
+  registerCapabilitiesGlobally?: boolean;
   reservedToolNames?: Iterable<string>;
 }
 
@@ -245,26 +251,8 @@ export interface ModEngine {
   subscribe: (listener: () => void) => () => void;
 }
 
-export interface CreateModEngineOptions extends ResolveLocalModSourcesOptions {
-  getClient: () => Promise<Letta>;
+export interface CreateModEngineOptions extends LoadLocalModsOptions {
   getBackend?: () => Backend | undefined;
-  builtinCommandIds?: Iterable<string>;
-  capabilities?: ModCapabilities;
-  onDiagnostic?: (diagnostic: ModDiagnostic) => void;
-  reservedToolNames?: Iterable<string>;
-}
-
-function listModFiles(directory: string): string[] {
-  if (!existsSync(directory)) return [];
-
-  return readdirSync(directory, { withFileTypes: true })
-    .filter((entry) => {
-      if (!entry.isFile()) return false;
-      if (entry.name.startsWith(".")) return false;
-      return isModFileExtension(path.extname(entry.name));
-    })
-    .map((entry) => path.join(directory, entry.name))
-    .sort((a, b) => a.localeCompare(b));
 }
 
 function getModSourcePriority(scope: ModSourceScope): number {
@@ -298,64 +286,11 @@ function isShadowedByOwner(owner: ModOwner, existingOwner?: ModOwner): boolean {
   );
 }
 
-export function resolveLocalModSources(
-  options: ResolveLocalModSourcesOptions = {},
-): LocalModSource[] {
-  const globalModsDirectory =
-    options.globalModsDirectory ?? getGlobalModsDirectory();
-  const legacyGlobalExtensionsDirectory =
-    options.legacyGlobalExtensionsDirectory ??
-    (options.globalModsDirectory
-      ? undefined
-      : getLegacyGlobalExtensionsDirectory());
-  const managedPackages = resolveManagedModPackages(globalModsDirectory);
-  const globalDiagnostics = managedPackages.diagnostics;
-  const sources: LocalModSource[] = [];
-
-  if (
-    legacyGlobalExtensionsDirectory &&
-    path.resolve(legacyGlobalExtensionsDirectory) !==
-      path.resolve(globalModsDirectory) &&
-    existsSync(legacyGlobalExtensionsDirectory)
-  ) {
-    sources.push({
-      files: listModFiles(legacyGlobalExtensionsDirectory),
-      legacyMigrationTargetRoot: globalModsDirectory,
-      root: legacyGlobalExtensionsDirectory,
-      scope: "legacy_global",
-      trusted: true,
-    });
-  }
-
-  sources.push({
-    ...(globalDiagnostics.length > 0 ? { diagnostics: globalDiagnostics } : {}),
-    files: [...listModFiles(globalModsDirectory), ...managedPackages.files],
-    ...(managedPackages.packages.length > 0
-      ? {
-          managedPackageRoots: managedPackages.packages.map((pkg) => pkg.root),
-        }
-      : {}),
-    root: globalModsDirectory,
-    scope: "global",
-    trusted: true,
-  });
-
-  if (options.agentModsDirectory) {
-    sources.push({
-      files: listModFiles(options.agentModsDirectory),
-      root: options.agentModsDirectory,
-      scope: "agent",
-      trusted: true,
-    });
-  }
-
-  return sources;
-}
-
 function createEmptyModRegistry(
   sources: LocalModSource[],
   generation: number,
   capabilities: ModCapabilities,
+  registerCapabilitiesGlobally: boolean,
 ): LocalModRegistry {
   return {
     capabilities: cloneModCapabilities(capabilities),
@@ -368,6 +303,7 @@ function createEmptyModRegistry(
     ownerAbortControllers: {},
     owners: {},
     permissions: {},
+    registerCapabilitiesGlobally,
     sources,
     tools: {},
     ui: {
@@ -432,8 +368,10 @@ function removeOwnerCapabilities(
   registry: LocalModRegistry,
   owner: ModOwner,
 ): void {
-  unregisterPiProvidersForOwner(owner.id);
-  clearAvailableModelsCache();
+  if (registry.registerCapabilitiesGlobally) {
+    unregisterPiProvidersForOwner(owner.id);
+    clearAvailableModelsCache();
+  }
 
   for (const [id, command] of Object.entries(registry.commands)) {
     if (command.owner?.id === owner.id) {
@@ -458,13 +396,22 @@ function removeOwnerCapabilities(
     }
   }
 
+  for (const [id, permission] of Object.entries(registry.permissions)) {
+    if (permission.owner?.id === owner.id) {
+      delete registry.permissions[id];
+    }
+  }
+
   for (const [name, tool] of Object.entries(registry.tools)) {
     if (tool.owner?.id === owner.id) {
       delete registry.tools[name];
     }
   }
 
-  unregisterModToolsForOwner(owner);
+  if (registry.registerCapabilitiesGlobally) {
+    unregisterModPermissionsForOwner(owner);
+    unregisterModToolsForOwner(owner);
+  }
 
   delete registry.owners[owner.id];
 }
@@ -475,54 +422,10 @@ function getRuntimePackageDirectory(packageName: string): string {
   );
 }
 
-function normalizeRuntimeDependencyPath(value: string): string {
-  const normalized = path.normalize(value).replace(/^\\\\\?\\/, "");
-  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
-}
-
-function ensureRuntimeDependencySymlink(
-  cacheDirectory: string,
-  packageName: string,
+export function __testOverrideRuntimePackageDirectoryResolver(
+  resolver: ((packageName: string) => string) | null,
 ): void {
-  const nodeModulesDirectory = path.join(cacheDirectory, "node_modules");
-  const linkPath = path.join(nodeModulesDirectory, packageName);
-  const packageDirectory = path.resolve(
-    getRuntimePackageDirectory(packageName),
-  );
-
-  mkdirSync(nodeModulesDirectory, { recursive: true });
-  try {
-    const stats = lstatSync(linkPath);
-    if (!stats.isSymbolicLink()) return;
-
-    const existingTarget = readlinkSync(linkPath);
-    const resolvedTarget = path.resolve(nodeModulesDirectory, existingTarget);
-    if (
-      normalizeRuntimeDependencyPath(resolvedTarget) ===
-      normalizeRuntimeDependencyPath(packageDirectory)
-    ) {
-      return;
-    }
-
-    unlinkSync(linkPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-
-  try {
-    symlinkSync(
-      packageDirectory,
-      linkPath,
-      process.platform === "win32" ? "junction" : "dir",
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-  }
-}
-
-function ensureModCache(cacheDirectory: string): void {
-  mkdirSync(cacheDirectory, { recursive: true });
-  ensureRuntimeDependencySymlink(cacheDirectory, "react");
+  resolveRuntimePackageDirectory = resolver ?? getRuntimePackageDirectory;
 }
 
 function isPathInsideOrEqual(childPath: string, parentPath: string): boolean {
@@ -595,12 +498,6 @@ function createImportableModPath(
 ): string {
   const importCacheDirectory =
     getManagedPackageImportCacheDirectory(modPath, source) ?? cacheDirectory;
-  if (importCacheDirectory === cacheDirectory) {
-    ensureModCache(importCacheDirectory);
-  } else {
-    mkdirSync(importCacheDirectory, { recursive: true });
-  }
-
   const sourceText = readFileSync(modPath, "utf8");
   const hash = createHash("sha256")
     .update(sourceText)
@@ -608,6 +505,16 @@ function createImportableModPath(
     .slice(0, 16);
   const fileExtension = path.extname(modPath);
   const importableSource = prepareModForImport(modPath, sourceText);
+
+  if (importCacheDirectory === cacheDirectory) {
+    ensureRuntimeDependenciesForModCache(
+      importCacheDirectory,
+      importableSource,
+      resolveRuntimePackageDirectory,
+    );
+  } else {
+    mkdirSync(importCacheDirectory, { recursive: true });
+  }
   const baseName = path
     .basename(modPath, fileExtension)
     .replace(/[^a-zA-Z0-9_-]/g, "-");
@@ -629,9 +536,7 @@ function createImportableModPath(
         unlinkSync(path.join(importCacheDirectory, entry));
       }
     }
-  } catch {
-    // Best-effort cache cleanup only.
-  }
+  } catch {}
 
   return importPath;
 }
@@ -656,8 +561,6 @@ function createLazyClient(getClient: () => Promise<Letta>): Letta {
         });
       },
       get(_target, property) {
-        // Keep the proxy from being treated as a Promise when code does
-        // `await letta.client` or Promise.resolve(letta.client).
         if (property === "then") return undefined;
         return createProxy([...path, property]);
       },
@@ -734,19 +637,6 @@ function isTurnStartResultWithCancel(
     normalizeTurnStartCancelReason((cancel as { reason?: unknown }).reason) !==
       null
   );
-}
-
-function isTurnStartInput(value: unknown): value is ModTurnStartEvent["input"] {
-  return (
-    Array.isArray(value) &&
-    value.every((item) => typeof item === "object" && item !== null)
-  );
-}
-
-function cloneTurnStartInput(
-  input: ModTurnStartEvent["input"],
-): ModTurnStartEvent["input"] {
-  return input.map((item) => structuredClone(item));
 }
 
 function isToolStartResultWithArgs(
@@ -992,13 +882,6 @@ function upsertModPanel(
   };
 }
 
-function createNoopModPanelHandle(): ModPanelHandle {
-  return {
-    close() {},
-    update() {},
-  };
-}
-
 function createLettaModApi(
   registry: LocalModRegistry,
   owner: ModOwner,
@@ -1006,6 +889,7 @@ function createLettaModApi(
   getClient: () => Promise<Letta>,
   onChange: () => void,
   onDiagnostic: ((diagnostic: ModDiagnostic) => void) | undefined,
+  onNotification: modInvocationContext.ModNotificationHandler | undefined,
   builtinCommandIds: Set<string>,
   reservedToolNames: Set<string>,
   signal: AbortSignal,
@@ -1074,7 +958,9 @@ function createLettaModApi(
     const existing = registry.permissions[id];
     if (existing?.owner?.id === owner.id) {
       delete registry.permissions[id];
-      unregisterModPermission(id, owner);
+      if (registry.registerCapabilitiesGlobally) {
+        unregisterModPermission(id, owner);
+      }
       onChange();
     }
   };
@@ -1095,7 +981,7 @@ function createLettaModApi(
     recordCapabilityDiagnostic({
       capability: { id: apiId, kind: "statusline" },
       error: new Error(
-        `${apiId} is no longer available. Use letta.ui.openPanel({ id, order, render }) instead — order 0 is the primary line (replaces agent · model), negative orders stack below it.`,
+        `${apiId} is no longer available. Use letta.ui.openPanel({ id, order, render }) instead — order 0 is the primary line (replaces agent · model), order 1 replaces the default product-status row, orders > 1 render additive panels above input, and negative orders stack below it.`,
       ),
       phase: "deprecated_api",
       severity: "warning",
@@ -1109,7 +995,9 @@ function createLettaModApi(
     const existing = registry.tools[name];
     if (existing?.owner?.id === owner.id) {
       delete registry.tools[name];
-      unregisterModTool(name, owner);
+      if (registry.registerCapabilitiesGlobally) {
+        unregisterModTool(name, owner);
+      }
       onChange();
     }
   };
@@ -1305,12 +1193,15 @@ function createLettaModApi(
           );
         }
 
-        registry.tools[normalized.name] = normalized;
-        registerModTool({
+        const definition: ModToolDefinition = {
           ...normalized,
           activationSignal: signal,
           recordDiagnostic: recordCapabilityDiagnostic,
-        });
+        };
+        registry.tools[normalized.name] = definition;
+        if (registry.registerCapabilitiesGlobally) {
+          registerModTool(definition);
+        }
         onChange();
 
         return () => unregisterTool(normalized.name);
@@ -1357,23 +1248,29 @@ function createLettaModApi(
           );
         }
 
-        registry.permissions[normalized.id] = normalized;
-        registerModPermission({
+        const definition: ModPermissionDefinition = {
           ...normalized,
           activationSignal: signal,
           recordDiagnostic: recordCapabilityDiagnostic,
-        });
+        };
+        registry.permissions[normalized.id] = definition;
+        if (registry.registerCapabilitiesGlobally) {
+          registerModPermission(definition);
+        }
         onChange();
 
         return () => unregisterPermission(normalized.id);
       },
       unregister: unregisterPermission,
     },
-    diagnostics: {
-      report: reportDiagnostic,
-    },
+    diagnostics: { report: reportDiagnostic },
     ui: {
       closePanel,
+      notify(message) {
+        if (!onNotification || !message.trim()) return;
+        if (!guardLive({ id: "notify", kind: "panel" })) return;
+        modInvocationContext.notifyMod(onNotification, message);
+      },
       openPanel(panel) {
         if (!capabilities.ui.panels) {
           return createNoopModPanelHandle();
@@ -1494,7 +1391,13 @@ export async function loadLocalMods(
   const generation = options.generation ?? 1;
   const builtinCommandIds = new Set([...(options.builtinCommandIds ?? [])]);
   const reservedToolNames = new Set([...(options.reservedToolNames ?? [])]);
-  const registry = createEmptyModRegistry(sources, generation, capabilities);
+  const registry = createEmptyModRegistry(
+    sources,
+    generation,
+    capabilities,
+    options.registerCapabilitiesGlobally !== false,
+  );
+  options.onRegistryCreated?.(registry);
 
   for (const source of sources) {
     for (const diagnostic of source.diagnostics ?? []) {
@@ -1556,30 +1459,30 @@ export async function loadLocalMods(
         )) as LocalModModule;
         const factory = getModFactory(module);
         failurePhase = "activate";
-
         if (typeof factory !== "function") {
           throw new Error(
             "Mod must export a default function or activate() function",
           );
         }
-
-        const dispose = await (factory as LettaModFactory)(
-          createLettaModApi(
-            registry,
-            owner,
-            capabilities,
-            getConfiguredClient,
-            onChange,
-            options.onDiagnostic,
-            builtinCommandIds,
-            reservedToolNames,
-            abortController.signal,
-          ),
+        const changes = createModChangeBatcher(onChange);
+        const api = createLettaModApi(
+          registry,
+          owner,
+          capabilities,
+          getConfiguredClient,
+          changes.notify,
+          options.onDiagnostic,
+          options.onNotification,
+          builtinCommandIds,
+          reservedToolNames,
+          abortController.signal,
         );
+        const activate = factory as LettaModFactory;
+        const dispose = await changes.run(() => activate(api));
         if (typeof dispose === "function") {
           registry.disposers.push({
             abortController,
-            dispose,
+            dispose: () => changes.runSync(dispose),
             owner,
           });
         }
@@ -1620,8 +1523,10 @@ export async function emitLocalModEvent<TName extends ModEventName>(
   const registrations = [...(registry.events[name] ?? [])];
   const diagnostics: ModDiagnostic[] = [];
   const results: Array<NonNullable<ModEventResultMap[TName]>> = [];
-  let turnStartCancel: ModTurnStartCancelResult | undefined;
-
+  let turnStartCancel: ModTurnStartCancelRecord | undefined;
+  const turnStartHadApproval =
+    name === "turn_start" &&
+    (event as ModTurnStartEvent).input.some((item) => item.type === "approval");
   for (const registration of registrations) {
     const signal = registration.owner
       ? registry.ownerAbortControllers[registration.owner.id]?.signal
@@ -1677,13 +1582,16 @@ export async function emitLocalModEvent<TName extends ModEventName>(
         recordEventDiagnostic,
         "ctx.getContext",
       );
-      const result = await registration.handler(event, eventContext);
+      const result = await modInvocationContext.invoke(
+        eventContext,
+        registration,
+        event,
+      );
       if (isTurnStartResultWithInput(name, result)) {
         (event as ModTurnStartEvent).input = result.input;
       }
       if (!turnStartCancel && isTurnStartResultWithCancel(name, result)) {
-        const reason = normalizeTurnStartCancelReason(result.cancel.reason);
-        if (reason) turnStartCancel = { reason };
+        turnStartCancel = createTurnStartCancelRecord(result, registration);
       }
       if (isToolStartResultWithArgs(name, result)) {
         (event as ModToolStartEvent).args = result.args;
@@ -1754,14 +1662,12 @@ export async function emitLocalModEvent<TName extends ModEventName>(
   }
 
   if (name === "turn_start") {
-    const turnStartEventWithCancel = event as ModTurnStartEvent & {
-      cancel?: ModTurnStartCancelResult;
-    };
-    if (turnStartCancel) {
-      turnStartEventWithCancel.cancel = { ...turnStartCancel };
-    } else {
-      delete turnStartEventWithCancel.cancel;
-    }
+    const turnStartEvent = event as ModTurnStartEvent;
+    turnStartEvent.input = preserveApprovalFirstOrdering(
+      turnStartHadApproval,
+      turnStartEvent.input,
+    );
+    applyTurnStartCancel(turnStartEvent, turnStartCancel);
   }
 
   return { diagnostics, handlerCount: registrations.length, name, results };
@@ -1787,12 +1693,14 @@ export function disposeLocalMods(registry: LocalModRegistry): void {
     }
   }
 
-  for (const owner of Object.values(registry.owners)) {
-    unregisterPiProvidersForOwner(owner.id);
-    unregisterModPermissionsForOwner(owner);
-    unregisterModToolsForOwner(owner);
+  if (registry.registerCapabilitiesGlobally) {
+    for (const owner of Object.values(registry.owners)) {
+      unregisterPiProvidersForOwner(owner.id);
+      unregisterModPermissionsForOwner(owner);
+      unregisterModToolsForOwner(owner);
+    }
+    clearAvailableModelsCache();
   }
-  clearAvailableModelsCache();
 
   registry.commands = {};
   registry.events = {};
@@ -1808,10 +1716,13 @@ export function createModEngine(options: CreateModEngineOptions): ModEngine {
   let generation = 0;
   let disposed = false;
   const capabilities = resolveModCapabilities(modOptions.capabilities);
+  const registerCapabilitiesGlobally =
+    modOptions.registerCapabilitiesGlobally !== false;
   let activeRegistry = createEmptyModRegistry(
     resolveLocalModSources(modOptions),
     generation,
     capabilities,
+    registerCapabilitiesGlobally,
   );
   let snapshot = snapshotRegistryForReaders(activeRegistry);
   const listeners = new Set<() => void>();
@@ -1833,6 +1744,7 @@ export function createModEngine(options: CreateModEngineOptions): ModEngine {
       resolveLocalModSources(modOptions),
       loadGeneration,
       capabilities,
+      registerCapabilitiesGlobally,
     );
     publish();
 
@@ -1840,6 +1752,13 @@ export function createModEngine(options: CreateModEngineOptions): ModEngine {
     const nextRegistry = await loadLocalMods({
       ...modOptions,
       generation: loadGeneration,
+      onRegistryCreated: (registry) => {
+        loadingRegistry = registry;
+        if (!disposed && loadGeneration === generation) {
+          activeRegistry = registry;
+          publish();
+        }
+      },
       onChange: () => {
         if (!disposed && loadingRegistry && loadGeneration === generation) {
           activeRegistry = loadingRegistry;
@@ -1855,9 +1774,6 @@ export function createModEngine(options: CreateModEngineOptions): ModEngine {
           onDiagnostic?.(diagnostic);
           return;
         }
-        // Stale handles from a prior generation report through their old
-        // activation callback. Preserve the diagnostic on the current engine
-        // snapshot without reviving the old registry.
         appendModDiagnostic(activeRegistry, diagnostic);
         publish();
         onDiagnostic?.(diagnostic);
@@ -1883,6 +1799,7 @@ export function createModEngine(options: CreateModEngineOptions): ModEngine {
         resolveLocalModSources(modOptions),
         generation,
         capabilities,
+        registerCapabilitiesGlobally,
       );
       publish();
       listeners.clear();

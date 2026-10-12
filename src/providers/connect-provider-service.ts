@@ -1,4 +1,8 @@
 import type { ProviderResponse } from "@/backend/api/providers";
+import {
+  localOAuthAuthFromCredentials,
+  setLocalOAuthProvider,
+} from "@/backend/local/local-provider-auth-store";
 import type { LocalProviderTimeout } from "@/backend/local/local-provider-timeout";
 import {
   type AuthMethod,
@@ -14,9 +18,19 @@ import {
   removeProviderByName,
 } from "@/providers/byok-providers";
 import {
+  createOrUpdateOpenAICodexProvider,
+  normalizeChatGPTOAuthProviderName,
+} from "@/providers/openai-codex-provider";
+import {
   connectedRecordsForProvider,
   uniqueProviderNames,
 } from "@/providers/provider-connections";
+import type { ChatGPTOAuthConfig } from "@/types/chatgpt-oauth";
+import {
+  type ConnectProviderOAuthConfig,
+  isProviderOAuthTokensConfig,
+  type ProviderOAuthTokensConfig,
+} from "@/types/provider-oauth-config";
 
 export interface ConnectProviderField {
   key: string;
@@ -74,6 +88,8 @@ export interface ConnectProviderInput<
   providerId: string;
   authMethodId?: string;
   fields: Record<string, string>;
+  providerName?: string;
+  oauthConfig?: ConnectProviderOAuthConfig;
 }
 
 export interface DisconnectProviderInput<
@@ -90,6 +106,96 @@ export interface ResolvedProviderConnectionFields {
   region?: string;
   profile?: string;
   options: ProviderConnectionOptions;
+}
+
+export type ResolvedConnectProviderOAuth =
+  | { kind: "chatgpt"; providerName: string; oauthConfig: ChatGPTOAuthConfig }
+  | {
+      kind: "tokens";
+      providerName: string;
+      providerType: string;
+      credentials: ProviderOAuthTokensConfig;
+    };
+
+export function resolveChatGPTOAuthConnection(
+  provider: ByokProvider,
+  input: { providerName?: string; oauthConfig: ChatGPTOAuthConfig },
+): { providerName: string; oauthConfig: ChatGPTOAuthConfig } {
+  if (!provider.isOAuth || provider.providerType !== "chatgpt_oauth") {
+    throw new Error(`${provider.displayName} does not accept ChatGPT OAuth.`);
+  }
+  return {
+    providerName: normalizeChatGPTOAuthProviderName(
+      input.providerName ?? provider.providerName,
+    ),
+    oauthConfig: input.oauthConfig,
+  };
+}
+
+/**
+ * Accept tokens a client obtained from the provider's own subscription login.
+ * Only the local provider store holds raw OAuth tokens; Cloud rows carry the
+ * credential bundle in an encrypted `api_key` written through the Cloud API.
+ */
+export function resolveProviderOAuthTokensConnection(
+  provider: ByokProvider,
+  input: { providerName?: string; oauthConfig: ProviderOAuthTokensConfig },
+  target: ProviderStorageTarget,
+): Extract<ResolvedConnectProviderOAuth, { kind: "tokens" }> {
+  if (target !== "local") {
+    throw new Error(
+      "Subscription OAuth tokens can only be saved to local provider storage.",
+    );
+  }
+  if (!provider.isOAuth || !provider.oauthProviderId) {
+    throw new Error(
+      `${provider.displayName} does not accept subscription OAuth tokens.`,
+    );
+  }
+  if (provider.providerType === "chatgpt_oauth") {
+    throw new Error(
+      `${provider.displayName} requires a ChatGPT OAuth config, not subscription OAuth tokens.`,
+    );
+  }
+  const providerName = input.providerName ?? provider.providerName;
+  if (!uniqueProviderNames(provider).includes(providerName)) {
+    throw new Error(
+      `${provider.displayName} does not support the provider name "${providerName}".`,
+    );
+  }
+  return {
+    kind: "tokens",
+    providerName,
+    providerType: provider.providerType,
+    credentials: input.oauthConfig,
+  };
+}
+
+export function resolveConnectProviderOAuth(
+  provider: ByokProvider,
+  input: Pick<ConnectProviderInput, "providerName" | "oauthConfig">,
+  target: ProviderStorageTarget,
+): ResolvedConnectProviderOAuth | null {
+  if (!input.oauthConfig) {
+    if (input.providerName) {
+      throw new Error("providerName requires OAuth credentials.");
+    }
+    return null;
+  }
+  if (isProviderOAuthTokensConfig(input.oauthConfig)) {
+    return resolveProviderOAuthTokensConnection(
+      provider,
+      { ...input, oauthConfig: input.oauthConfig },
+      target,
+    );
+  }
+  return {
+    kind: "chatgpt",
+    ...resolveChatGPTOAuthConnection(provider, {
+      ...input,
+      oauthConfig: input.oauthConfig,
+    }),
+  };
 }
 
 function serializeConnectedProvider(
@@ -116,6 +222,7 @@ function serializeFields(
     label: field.label,
     ...(field.placeholder ? { placeholder: field.placeholder } : {}),
     ...(field.secret !== undefined ? { secret: field.secret } : {}),
+    required: field.required !== false,
   }));
 }
 
@@ -200,7 +307,7 @@ export function resolveProviderConnectionFields(
     input.authMethodId,
   );
   const missingField = requiredFields.find(
-    (field) => !fieldValue(input.fields, field.key),
+    (field) => field.required !== false && !fieldValue(input.fields, field.key),
   );
   if (missingField) {
     throw new Error(`Missing ${missingField.label}.`);
@@ -208,7 +315,9 @@ export function resolveProviderConnectionFields(
 
   const apiKey =
     fieldValue(input.fields, "apiKey") ?? defaultProviderApiKey(provider);
-  const apiKeyRequired = requiredFields.some((field) => field.key === "apiKey");
+  const apiKeyRequired = requiredFields.some(
+    (field) => field.key === "apiKey" && field.required !== false,
+  );
   if (!apiKey && apiKeyRequired) {
     throw new Error(`Missing ${provider.displayName} API key.`);
   }
@@ -299,6 +408,32 @@ export async function connectProvider<TTarget extends ProviderStorageTarget>(
     getProviderConfigs(input.target),
     input.providerId,
   );
+  const oauthConnection = resolveConnectProviderOAuth(
+    provider,
+    input,
+    input.target,
+  );
+  if (oauthConnection) {
+    if (input.authMethodId || Object.keys(input.fields).length > 0) {
+      throw new Error(
+        `${provider.displayName} OAuth does not accept API credential fields.`,
+      );
+    }
+    if (oauthConnection.kind === "chatgpt") {
+      await createOrUpdateOpenAICodexProvider(
+        oauthConnection.oauthConfig,
+        { target: input.target },
+        oauthConnection.providerName,
+      );
+    } else {
+      setLocalOAuthProvider({
+        providerName: oauthConnection.providerName,
+        providerType: oauthConnection.providerType,
+        auth: localOAuthAuthFromCredentials(oauthConnection.credentials),
+      });
+    }
+    return listConnectProviders(input.target);
+  }
   const resolved = resolveProviderConnectionFields(provider, {
     authMethodId: input.authMethodId,
     fields: input.fields,
@@ -310,7 +445,7 @@ export async function connectProvider<TTarget extends ProviderStorageTarget>(
     resolved.accessKey,
     resolved.region,
     resolved.profile,
-    { target: input.target },
+    { target: input.target, connection: resolved.options },
   );
   await createOrUpdateProvider(
     provider.providerType,

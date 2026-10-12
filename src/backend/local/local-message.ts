@@ -2,8 +2,10 @@ import type {
   Api,
   AssistantMessage,
   ImageContent,
+  JsonObject,
+  JsonValue,
   Message as PiMessage,
-  Provider,
+  ProviderId,
   TextContent,
   ThinkingContent,
   ToolCall,
@@ -54,6 +56,7 @@ export interface LocalUserMessage
   extends Omit<UserMessage, "timestamp">,
     LocalMessageBase {
   role: "user";
+  otid?: string;
   timestamp: number;
 }
 
@@ -63,7 +66,7 @@ export interface LocalAssistantMessage
   role: "assistant";
   content: (LocalTextContent | LocalThinkingContent | LocalToolCall)[];
   api: Api;
-  provider: Provider;
+  provider: ProviderId;
   model: string;
   usage: Usage;
   timestamp: number;
@@ -83,6 +86,15 @@ export type LocalMessage =
   | LocalToolResultMessage;
 
 export type LocalPiMessage = PiMessage;
+
+export function localToolArgumentsFromUnknown(value: unknown): JsonObject {
+  const serialized = JSON.stringify(value ?? {});
+  const parsed =
+    serialized === undefined ? null : (JSON.parse(serialized) as JsonValue);
+  return parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)
+    ? (parsed as JsonObject)
+    : { input: parsed };
+}
 
 export function emptyLocalUsage(): Usage {
   return {

@@ -4,13 +4,20 @@ import type { RunErrorInfo } from "@/agent/approval-recovery";
 import { extractConflictDetail } from "@/agent/turn-recovery-policy";
 import {
   checkCloudflareEdgeError,
+  type ErrorDisplaySurface,
+  type FormatErrorDetailsOptions,
   formatErrorDetails,
 } from "@/cli/helpers/error-formatter";
 import type { ErrorInfo } from "@/cli/helpers/stream-processor";
 import type { StatusMessage, StopReasonType } from "@/types/protocol_v2";
+import {
+  CLOUD_API_UNAVAILABLE_MESSAGE,
+  isCloudApiDeploymentInterrupted,
+} from "@/utils/cloud-api-shutdown";
 import { debugLog } from "@/utils/debug";
 import {
-  emitLoopErrorDelta,
+  createLifecycleMessageBase,
+  emitCanonicalMessageDelta,
   emitRetryDelta,
   emitStatusDelta,
 } from "./protocol-outbound";
@@ -49,11 +56,10 @@ export function getRecoverableStatusNoticeVisibility(
 
 export function getRecoverableRetryNoticeVisibility(
   kind: RecoverableRetryNoticeKind,
-  attempt: number,
 ): "debug_only" | "transcript" {
   switch (kind) {
     case "transient_provider_retry":
-      return attempt === 1 ? "debug_only" : "transcript";
+      return "transcript";
     default:
       return "transcript";
   }
@@ -184,6 +190,8 @@ export function getLoopErrorNoticeDecision(params: {
   conversationId?: string | null;
   cancelRequested?: boolean;
   abortSignal?: AbortSignal;
+  surface?: ErrorDisplaySurface;
+  unclassifiedFallback?: FormatErrorDetailsOptions["unclassifiedFallback"];
 }): LoopErrorNoticeDecision {
   const apiError =
     params.apiError ??
@@ -206,6 +214,16 @@ export function getLoopErrorNoticeDecision(params: {
     return {
       visibility: "debug_only",
       message: params.message,
+    };
+  }
+
+  if (
+    isCloudApiDeploymentInterrupted(params.errorInfo) ||
+    isCloudApiDeploymentInterrupted(params.runErrorInfo)
+  ) {
+    return {
+      visibility: "transcript",
+      message: CLOUD_API_UNAVAILABLE_MESSAGE,
     };
   }
 
@@ -234,6 +252,10 @@ export function getLoopErrorNoticeDecision(params: {
       : (params.error ?? params.message),
     params.agentId ?? undefined,
     params.conversationId ?? undefined,
+    {
+      surface: params.surface,
+      unclassifiedFallback: params.unclassifiedFallback,
+    },
   );
 
   return {
@@ -243,6 +265,28 @@ export function getLoopErrorNoticeDecision(params: {
   };
 }
 
+export function getTranscriptLoopErrorMessage(
+  params: Parameters<typeof getLoopErrorNoticeDecision>[0],
+): string | undefined {
+  const decision = getLoopErrorNoticeDecision({
+    ...params,
+    surface: "plain",
+    unclassifiedFallback: "generic",
+  });
+  return decision.visibility === "transcript" ? decision.message : undefined;
+}
+
+/** Match the plain error that interactive consumers receive from loop_error. */
+export function getConsumerLoopErrorMessage(
+  params: Parameters<typeof getLoopErrorNoticeDecision>[0],
+): string | undefined {
+  const decision = getLoopErrorNoticeDecision({
+    ...params,
+    surface: "plain",
+  });
+  return decision.visibility === "transcript" ? decision.message : undefined;
+}
+
 export function emitLoopErrorNotice(
   socket: ListenerTransport,
   runtime: ListenerRuntime | ConversationRuntime,
@@ -250,6 +294,7 @@ export function emitLoopErrorNotice(
     message: string;
     stopReason: StopReasonType;
     isTerminal: boolean;
+    clientMessageIds?: string[];
     runId?: string | null;
     agentId?: string | null;
     conversationId?: string | null;
@@ -272,15 +317,24 @@ export function emitLoopErrorNotice(
     return null;
   }
 
-  emitLoopErrorDelta(socket, runtime, {
-    message: decision.message,
-    stopReason: params.stopReason,
-    isTerminal: params.isTerminal,
-    runId: params.runId,
-    agentId: params.agentId,
-    conversationId: params.conversationId,
-    apiError: decision.apiError,
-  });
+  emitCanonicalMessageDelta(
+    socket,
+    runtime,
+    {
+      ...createLifecycleMessageBase("loop_error", params.runId),
+      message: decision.message,
+      stop_reason: params.stopReason,
+      is_terminal: params.isTerminal,
+      ...(params.clientMessageIds?.length
+        ? { client_message_ids: params.clientMessageIds }
+        : {}),
+      ...(decision.apiError ? { api_error: decision.apiError } : {}),
+    },
+    {
+      agent_id: params.agentId,
+      conversation_id: params.conversationId,
+    },
+  );
   return decision.message;
 }
 
@@ -323,10 +377,7 @@ export function emitRecoverableRetryNotice(
     kind: RecoverableRetryNoticeKind;
   },
 ): void {
-  const visibility = getRecoverableRetryNoticeVisibility(
-    params.kind,
-    params.attempt,
-  );
+  const visibility = getRecoverableRetryNoticeVisibility(params.kind);
 
   if (visibility === "debug_only") {
     debugLog(

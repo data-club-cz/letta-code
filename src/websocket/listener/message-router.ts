@@ -1,8 +1,7 @@
-import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
 import type WebSocket from "ws";
 import {
-  estimateSystemPromptTokensFromMemoryDir,
+  estimateActiveMemorySystemPromptTokens,
   setSystemPromptDoctorState,
 } from "@/cli/helpers/system-prompt-warning";
 import { settingsManager } from "@/settings-manager";
@@ -13,6 +12,7 @@ import type {
 } from "@/types/protocol_v2";
 import { isDebugEnabled } from "@/utils/debug";
 import { getErrorMessage } from "@/utils/error";
+import { sealStartupLogs } from "@/utils/startup-log-boundary";
 import {
   handleTerminalInput,
   handleTerminalKill,
@@ -21,49 +21,79 @@ import {
 } from "@/websocket/terminal-handler";
 import { handleExecuteCommand } from "./commands";
 import { handleAgentConversationManagementProtocolCommand } from "./commands/agents-conversations";
-import {
-  handleChannelsProtocolCommand,
-  isDetachedChannelsCommand,
-} from "./commands/channels";
+import { handleAppServerInfoCommand } from "./commands/app-server-info";
+import { handleCwdProtocolCommand } from "./commands/boot-working-directory";
+import { handleBrowserDeviceMcpOAuthProtocolCommand } from "./commands/browser-device-mcp-oauth";
 import { handleChatGPTUsageCommand } from "./commands/chatgpt-usage";
 import { handleConnectProvidersCommand } from "./commands/connect-providers";
 import { handleCronProtocolCommand } from "./commands/cron";
 import { handleGitBranchCommand } from "./commands/git-branches";
-import { handleMemoryProtocolCommand } from "./commands/memory";
+import { handleMemfsSyncedMemoryProtocolCommand } from "./commands/memory-command-sync";
 import { handleModelToolsetCommand } from "./commands/model-toolset";
+import { handleQueueCommand } from "./commands/queue";
 import { handleRuntimeStartProtocolCommand } from "./commands/runtime-start";
 import { handleSecretsCommand } from "./commands/secrets";
 import { handleSettingsProtocolCommand } from "./commands/settings";
 import { handleSkillAgentProtocolCommand } from "./commands/skills-agents";
-import { handleExternalToolCallResponseCommand } from "./external-tools";
+import {
+  subscribeListenerConnection,
+  waitForListenerConnectionStartup,
+} from "./connection";
+import { getBootWorkingDirectory } from "./cwd";
+import {
+  handleExternalToolCallResponseCommand,
+  updateRuntimeExternalTools,
+} from "./external-tools";
+import {
+  createIncomingMessage,
+  dispatchInboundMessageWhenReady,
+} from "./inbound-dispatch";
+import {
+  enqueueInboundUserMessage,
+  getInboundClientMessageId,
+} from "./inbound-queue";
+import {
+  commitInputDisposition,
+  forgetQueuedInputDisposition,
+  getInputDisposition,
+  ordinaryInputIdentity,
+  reserveInputDisposition,
+} from "./input-disposition";
+import { rollbackInputDisposition } from "./input-disposition-rollback";
 import {
   isExecuteCommandCommand,
   parseServerLifecycleMessage,
   parseServerMessage,
 } from "./protocol-inbound";
-import {
-  emitDeviceStatusUpdate,
-  emitQueueUpdateIfOpen,
-} from "./protocol-outbound";
+import { logV2Command, summarizeV2Command } from "./protocol-logging";
+import { emitDeviceStatusUpdate } from "./protocol-outbound";
 import {
   scheduleQueuePump,
   shouldProcessInboundMessageDirectly,
   shouldQueueInboundMessage,
 } from "./queue";
 import { emitLoopErrorNotice } from "./recoverable-notices";
+import { getActiveRuntime, safeEmitWsEvent } from "./runtime";
+import { parseListenerReadyMessage } from "./split-stream-lifecycle";
+import { validateResponseFormat } from "./structured-output";
 import {
-  emitListenerStatus,
-  getActiveRuntime,
-  safeEmitWsEvent,
-} from "./runtime";
+  handleTeleportFailure,
+  handleTeleportProbe,
+  handleTeleportRequest,
+  isRuntimeTeleportPending,
+} from "./teleport";
+import { admitTeleportContinueInput } from "./teleport-continue-input";
 import type { ListenerTransport } from "./transport";
 import { handleIncomingMessage } from "./turn";
+import { handleTurnFinishedAck } from "./turn-finished-ack";
 import type {
   ConversationRuntime,
   IncomingMessage,
+  ListenerConnectionId,
   ListenerRuntime,
   ProcessQueuedTurn,
   StartListenerOptions,
+  SyncReplayOptions,
 } from "./types";
 
 type SafeSocketSend = (
@@ -87,24 +117,18 @@ type TrackListenerError = (
 type FileCommandSession = {
   handle(parsed: unknown): boolean;
 };
-
 type RuntimeScope = {
-  agent_id: string;
+  agent_id: string | null;
   conversation_id: string;
 };
 
 type ParsedRuntimeScope = RuntimeScope | null;
 
-export type WireChannelIngress = (
-  listener: ListenerRuntime,
-  socket: ListenerTransport,
-  opts: StartListenerOptions,
-  processQueuedTurn: ProcessQueuedTurn,
-) => Promise<void>;
-
 type MessageRouterParams = {
   runtime: ListenerRuntime;
   socket: WebSocket;
+  connectionId?: ListenerConnectionId;
+  lineageId?: string;
   opts: StartListenerOptions;
   processQueuedTurn: ProcessQueuedTurn;
   fileCommandSession: FileCommandSession;
@@ -113,7 +137,7 @@ type MessageRouterParams = {
     listenerRuntime: ListenerRuntime,
     socket: WebSocket,
     scope: RuntimeScope,
-    opts?: { recoverApprovals?: boolean; forceDeviceStatus?: boolean },
+    opts?: SyncReplayOptions,
   ) => Promise<void>;
   getOrCreateScopedRuntime: (
     listener: ListenerRuntime,
@@ -128,6 +152,7 @@ type MessageRouterParams = {
         conversation_id?: string | null;
       };
       response: ApprovalResponseBody;
+      connectionId: ListenerConnectionId;
       socket: ListenerTransport;
       opts: {
         onStatusChange?: StartListenerOptions["onStatusChange"];
@@ -140,6 +165,7 @@ type MessageRouterParams = {
     listener: ListenerRuntime,
     params: {
       command: ChangeDeviceStateCommand;
+      connectionId: ListenerConnectionId;
       socket: WebSocket;
       opts: {
         onStatusChange?: StartListenerOptions["onStatusChange"];
@@ -152,6 +178,7 @@ type MessageRouterParams = {
     listener: ListenerRuntime,
     params: {
       command: AbortMessageCommand;
+      connectionId: ListenerConnectionId;
       socket: WebSocket;
       opts: {
         onStatusChange?: StartListenerOptions["onStatusChange"];
@@ -164,194 +191,8 @@ type MessageRouterParams = {
   safeSocketSend: SafeSocketSend;
   runDetachedListenerTask: RunDetachedListenerTask;
   trackListenerError: TrackListenerError;
-  wireChannelIngress: WireChannelIngress;
+  processIncomingMessage?: typeof handleIncomingMessage;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function formatLogValue(value: unknown): string | null {
-  if (value === undefined) return null;
-  if (value === null) return "null";
-  if (typeof value === "string") {
-    return value.length > 80 ? `${value.slice(0, 77)}...` : value;
-  }
-  if (typeof value === "number" || typeof value === "boolean") {
-    return String(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.length}]`;
-  }
-  return null;
-}
-
-function pushField(
-  fields: string[],
-  key: string,
-  value: unknown,
-  label = key,
-): void {
-  const formatted = formatLogValue(value);
-  if (formatted !== null) {
-    fields.push(`${label}=${formatted}`);
-  }
-}
-
-function summarizeInputPayload(payload: unknown): string[] {
-  if (!isRecord(payload)) return [];
-  const fields: string[] = [];
-  pushField(fields, "kind", payload.kind);
-  if (payload.kind === "create_message") {
-    pushField(fields, "messages", payload.messages);
-    pushField(fields, "client_tool_allowlist", payload.client_tool_allowlist);
-    pushField(
-      fields,
-      "external_tool_scope_ids",
-      payload.external_tool_scope_ids,
-    );
-  } else if (payload.kind === "approval_response") {
-    pushField(fields, "request_id", payload.request_id);
-    pushField(fields, "response", payload.response);
-    pushField(
-      fields,
-      "selected_suggestion_ids",
-      payload.selected_suggestion_ids,
-    );
-  }
-  return fields;
-}
-
-function summarizeRuntimeStartCommand(
-  command: Record<string, unknown>,
-): string[] {
-  const fields: string[] = [];
-  pushField(fields, "agent_id", command.agent_id, "agent");
-  pushField(fields, "conversation_id", command.conversation_id, "conversation");
-  if (isRecord(command.create_agent)) fields.push("create_agent=true");
-  if (isRecord(command.create_conversation)) {
-    fields.push("create_conversation=true");
-  }
-  pushField(fields, "cwd", command.cwd);
-  pushField(fields, "mode", command.mode);
-  pushField(fields, "external_tools", command.external_tools);
-  return fields;
-}
-
-function summarizeV2Command(parsed: unknown): string {
-  if (!isRecord(parsed) || typeof parsed.type !== "string") return "unknown";
-  const fields: string[] = [];
-  const runtime = isRecord(parsed.runtime) ? parsed.runtime : null;
-  if (runtime) {
-    fields.push(
-      `runtime=${runtime.agent_id ?? "<unknown>"}/${runtime.conversation_id ?? "<unknown>"}`,
-    );
-  }
-  pushField(fields, "request_id", parsed.request_id);
-
-  if (parsed.type === "input") {
-    fields.push(...summarizeInputPayload(parsed.payload));
-  } else if (
-    parsed.type === "change_device_state" &&
-    isRecord(parsed.payload)
-  ) {
-    pushField(fields, "mode", parsed.payload.mode);
-    pushField(fields, "cwd", parsed.payload.cwd);
-    pushField(fields, "agent_id", parsed.payload.agent_id);
-    pushField(fields, "conversation_id", parsed.payload.conversation_id);
-  } else if (parsed.type === "runtime_start") {
-    fields.push(...summarizeRuntimeStartCommand(parsed));
-  } else {
-    for (const key of [
-      "agent_id",
-      "conversation_id",
-      "task_id",
-      "channel_id",
-      "account_id",
-      "route_id",
-      "target_id",
-      "pairing_id",
-      "path",
-      "file_path",
-      "ref",
-      "encoding",
-      "query",
-      "glob",
-      "is_regex",
-      "case_sensitive",
-      "whole_word",
-      "cwd",
-      "mode",
-      "run_id",
-      "item_id",
-      "terminal_id",
-      "cols",
-      "rows",
-      "depth",
-      "limit",
-      "offset",
-      "max_results",
-      "context_lines",
-      "include_files",
-      "model_id",
-      "model_handle",
-      "toolset",
-      "provider_name",
-      "auth_method",
-      "scope",
-      "command_id",
-      "args",
-      "name",
-      "cron",
-      "recurring",
-      "source",
-      "replace_all",
-      "expected_replacements",
-      "recover_approvals",
-      "force_device_status",
-    ]) {
-      pushField(fields, key, parsed[key]);
-    }
-  }
-
-  if (parsed.type === "write_file" && typeof parsed.content === "string") {
-    fields.push(`content_bytes=${Buffer.byteLength(parsed.content)}`);
-  }
-  if (
-    parsed.type === "write_memory_file" &&
-    typeof parsed.content === "string"
-  ) {
-    fields.push(`content_bytes=${Buffer.byteLength(parsed.content)}`);
-  }
-  if (parsed.type === "edit_file") {
-    if (typeof parsed.old_string === "string") {
-      fields.push(`old_bytes=${Buffer.byteLength(parsed.old_string)}`);
-    }
-    if (typeof parsed.new_string === "string") {
-      fields.push(`new_bytes=${Buffer.byteLength(parsed.new_string)}`);
-    }
-  }
-  if (parsed.type === "file_ops") {
-    pushField(fields, "cg_entries", parsed.cg_entries);
-    pushField(fields, "ops", parsed.ops);
-    if (typeof parsed.document_content === "string") {
-      fields.push(
-        `document_bytes=${Buffer.byteLength(parsed.document_content)}`,
-      );
-    }
-  }
-  if (parsed.type === "terminal_input" && typeof parsed.data === "string") {
-    fields.push(`data_bytes=${Buffer.byteLength(parsed.data)}`);
-  }
-  if (parsed.type === "execute_command") {
-    pushField(fields, "command_id", parsed.command_id);
-    pushField(fields, "args", parsed.args);
-  }
-
-  return fields.length > 0
-    ? `${parsed.type} command (${fields.join(", ")})`
-    : `${parsed.type} command`;
-}
 
 export function createListenerMessageHandler(
   params: MessageRouterParams,
@@ -359,6 +200,8 @@ export function createListenerMessageHandler(
   const {
     runtime,
     socket,
+    connectionId: explicitConnectionId,
+    lineageId: explicitLineageId,
     opts,
     processQueuedTurn,
     fileCommandSession,
@@ -372,18 +215,28 @@ export function createListenerMessageHandler(
     safeSocketSend,
     runDetachedListenerTask,
     trackListenerError,
-    wireChannelIngress,
+    processIncomingMessage = handleIncomingMessage,
   } = params;
-
+  const connectionId = explicitConnectionId ?? opts.connectionId;
+  const lineageId =
+    explicitLineageId ??
+    runtime.connections.get(connectionId)?.startupOwner.lineageId ??
+    connectionId ??
+    runtime.sessionId;
   return async (data: WebSocket.RawData): Promise<void> => {
-    const raw = data.toString();
+    if (
+      !(await waitForListenerConnectionStartup(runtime, connectionId, socket))
+    )
+      return;
+
+    const lifecycleMessage =
+      parseListenerReadyMessage(data) ?? parseServerLifecycleMessage(data);
+    // Seal before parsing; only projected pongs are content-free.
+    if (lifecycleMessage?.type !== "pong") sealStartupLogs();
     let parsedScope: ParsedRuntimeScope = null;
 
     try {
-      const lifecycleMessage = parseServerLifecycleMessage(data);
       if (lifecycleMessage) {
-        // Record relay pongs so the heartbeat watchdog can detect a half-open
-        // socket (no pong within the timeout) and force a reconnect.
         if (lifecycleMessage.type === "pong") {
           runtime.lastPongAt = Date.now();
         }
@@ -396,23 +249,19 @@ export function createListenerMessageHandler(
       if (parsed) {
         safeEmitWsEvent("recv", "client", parsed);
       } else {
-        // Log unparseable frames so protocol drift is visible in debug mode
         safeEmitWsEvent("recv", "lifecycle", {
           type: "_ws_unparseable",
-          raw,
         });
       }
-      if (isDebugEnabled()) {
-        console.log(
-          `[Listen] Received message: ${JSON.stringify(parsed, null, 2)}`,
-        );
-      }
-
       if (!parsed) {
         return;
       }
 
-      console.log(`[Listen V2] Received ${summarizeV2Command(parsed)}`);
+      logV2Command(opts, `Received ${summarizeV2Command(parsed)}`);
+
+      if (parsedScope) {
+        subscribeListenerConnection(runtime, connectionId, parsedScope);
+      }
 
       if (parsed.type === "__invalid_input") {
         emitLoopErrorNotice(socket, runtime, {
@@ -425,27 +274,104 @@ export function createListenerMessageHandler(
         return;
       }
 
+      if (parsed.type === "turn_finished_ack") {
+        handleTurnFinishedAck(runtime, socket, connectionId, parsed);
+        return;
+      }
+
+      if (parsed.type === "launch_subagent" || parsed.type === "monitor_stop") {
+        const { handleTaskControlCommand } = await import(
+          "./commands/task-control"
+        );
+        await handleTaskControlCommand(parsed, {
+          runtime,
+          socket,
+          connectionId,
+          getOrCreateScopedRuntime,
+          runDetachedListenerTask,
+          safeSocketSend,
+        });
+        return;
+      }
+
+      if (parsed.type === "app_server_info") {
+        handleAppServerInfoCommand(parsed, { socket, safeSocketSend });
+        return;
+      }
       if (
         handleRuntimeStartProtocolCommand(parsed, {
           socket,
+          connectionId,
           runtime,
           safeSocketSend,
           runDetachedListenerTask,
           getOrCreateScopedRuntime,
           replaySyncStateForRuntime,
+          queuePumpOptions: opts,
+          processQueuedTurn,
         })
       ) {
         return;
       }
+      if (parsed.type === "teleport_probe") {
+        handleTeleportProbe(parsed, socket, safeSocketSend);
+        return;
+      }
+
+      if (parsed.type === "teleport_request") {
+        handleTeleportRequest({
+          listener: runtime,
+          command: parsed,
+          connectionId,
+        });
+        return;
+      }
+
+      if (parsed.type === "teleport_failed") {
+        handleTeleportFailure({
+          listener: runtime,
+          command: parsed,
+          socket,
+          connectionId,
+          onStatusChange: opts.onStatusChange,
+          getOrCreateScopedRuntime,
+          runDetachedListenerTask,
+          processIncomingMessage,
+        });
+        return;
+      }
 
       if (parsed.type === "external_tool_call_response") {
-        handleExternalToolCallResponseCommand(runtime, parsed);
+        handleExternalToolCallResponseCommand(runtime, connectionId, parsed);
+        return;
+      }
+
+      if (parsed.type === "runtime_external_tools_update") {
+        const respond = (success: boolean, error?: string): void => {
+          safeSocketSend(
+            socket,
+            {
+              type: "runtime_external_tools_update_response",
+              request_id: parsed.request_id,
+              success,
+              ...(error ? { error } : {}),
+            },
+            "runtime_external_tools_update_response",
+            "runtime_external_tools_update",
+          );
+        };
+        if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
+          respond(false, "Runtime is no longer active");
+          return;
+        }
+        updateRuntimeExternalTools(runtime, connectionId, parsed.updates);
+        respond(true);
         return;
       }
 
       if (parsed.type === "sync") {
         if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
-          console.log(`[Listen V2] Dropping sync: runtime mismatch or closed`);
+          logV2Command(opts, "Dropping sync: runtime mismatch or closed");
           if (parsed.request_id) {
             safeSocketSend(
               socket,
@@ -465,7 +391,10 @@ export function createListenerMessageHandler(
         try {
           await replaySyncStateForRuntime(runtime, socket, parsed.runtime, {
             recoverApprovals: parsed.recover_approvals !== false,
+            resumeInterruptedTurn: parsed.resume_interrupted_turn === true,
             forceDeviceStatus: parsed.force_device_status === true,
+            onStatusChange: opts.onStatusChange,
+            connectionId: opts.connectionId,
           });
           if (parsed.request_id) {
             safeSocketSend(
@@ -502,29 +431,76 @@ export function createListenerMessageHandler(
       }
 
       if (parsed.type === "input") {
+        const acknowledgeInput = (
+          accepted: boolean,
+          error?: string,
+          disposition?: "started" | "queued",
+        ): void => {
+          if (!parsed.request_id) return;
+          safeSocketSend(
+            socket,
+            {
+              type: "input_accepted",
+              request_id: parsed.request_id,
+              runtime: parsed.runtime,
+              accepted,
+              ...(disposition ? { disposition } : {}),
+              ...(error ? { error } : {}),
+            },
+            "input_accepted_response",
+            "input",
+          );
+        };
         if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
-          console.log(`[Listen V2] Dropping input: runtime mismatch or closed`);
+          logV2Command(opts, "Dropping input: runtime mismatch or closed");
+          acknowledgeInput(false, "Runtime is no longer active");
           return;
         }
-
-        if (parsed.payload.kind === "approval_response") {
-          if (
-            await handleApprovalResponseInput(runtime, {
-              runtime: parsed.runtime,
-              response: parsed.payload,
-              socket,
-              opts: {
-                onStatusChange: opts.onStatusChange,
-                connectionId: opts.connectionId,
-              },
-              processQueuedTurn,
-            })
-          ) {
+        if (parsed.payload.kind === "teleport_continue") {
+          const teleportAgentId = parsed.runtime.agent_id;
+          if (!teleportAgentId) {
+            acknowledgeInput(
+              false,
+              "Teleport requires an agent-backed runtime",
+            );
             return;
           }
+          admitTeleportContinueInput({
+            listener: runtime,
+            scopedRuntime: getOrCreateScopedRuntime(
+              runtime,
+              parsed.runtime.agent_id,
+              parsed.runtime.conversation_id,
+            ),
+            connectionId,
+            agentId: teleportAgentId,
+            conversationId: parsed.runtime.conversation_id,
+            payload: parsed.payload,
+            onStatusChange: opts.onStatusChange,
+            acknowledgeInput,
+            runDetachedListenerTask,
+            processIncomingMessage,
+          });
           return;
         }
-
+        if (parsed.payload.kind === "approval_response") {
+          const handled = await handleApprovalResponseInput(runtime, {
+            runtime: parsed.runtime,
+            response: parsed.payload,
+            connectionId,
+            socket,
+            opts: {
+              onStatusChange: opts.onStatusChange,
+              connectionId: opts.connectionId,
+            },
+            processQueuedTurn,
+          });
+          acknowledgeInput(
+            handled,
+            handled ? undefined : "Approval request is no longer pending",
+          );
+          return;
+        }
         const inputPayload = parsed.payload;
         if (inputPayload.kind !== "create_message") {
           emitLoopErrorNotice(socket, runtime, {
@@ -534,17 +510,20 @@ export function createListenerMessageHandler(
             agentId: parsed.runtime.agent_id,
             conversationId: parsed.runtime.conversation_id,
           });
+          acknowledgeInput(false, "Unsupported input payload kind");
           return;
         }
-
-        const incoming: IncomingMessage = {
-          type: "message",
-          agentId: parsed.runtime.agent_id,
-          conversationId: parsed.runtime.conversation_id,
-          clientToolAllowlist: inputPayload.client_tool_allowlist,
-          externalToolScopeIds: inputPayload.external_tool_scope_ids,
-          messages: inputPayload.messages,
-        };
+        const error = validateResponseFormat(inputPayload.response_format);
+        if (error) {
+          acknowledgeInput(false, error);
+          return;
+        }
+        const incoming = createIncomingMessage(
+          parsed.runtime,
+          inputPayload,
+          connectionId,
+          parsed.terminal_consumer_id,
+        );
         const hasApprovalPayload = incoming.messages.some(
           (payload): payload is ApprovalCreate =>
             "type" in payload && payload.type === "approval",
@@ -558,6 +537,10 @@ export function createListenerMessageHandler(
             agentId: parsed.runtime.agent_id,
             conversationId: parsed.runtime.conversation_id,
           });
+          acknowledgeInput(
+            false,
+            "Approval payloads require approval_response",
+          );
           return;
         }
 
@@ -570,64 +553,48 @@ export function createListenerMessageHandler(
         const processIncomingMessageDirectly = (
           directIncoming: IncomingMessage,
         ): void => {
-          scopedRuntime.messageQueue = scopedRuntime.messageQueue
-            .then(async () => {
-              if (
-                runtime !== getActiveRuntime() ||
-                runtime.intentionallyClosed
-              ) {
-                return;
-              }
-              emitListenerStatus(
-                runtime,
-                opts.onStatusChange,
-                opts.connectionId,
-              );
-              await handleIncomingMessage(
-                directIncoming,
-                socket,
-                scopedRuntime,
-                opts.onStatusChange,
-                opts.connectionId,
-              );
-              emitListenerStatus(
-                runtime,
-                opts.onStatusChange,
-                opts.connectionId,
-              );
-              if (
-                scopedRuntime.queueRuntime.length > 0 ||
-                scopedRuntime.queuePumpScheduled ||
-                scopedRuntime.queuePumpActive
-              ) {
-                scheduleQueuePump(
-                  scopedRuntime,
-                  socket,
-                  opts,
-                  processQueuedTurn,
-                );
-              }
-            })
-            .catch((error: unknown) => {
-              trackListenerError(
-                "listener_queued_input_failed",
-                error,
-                "listener_message_queue",
-              );
-              if (process.env.DEBUG) {
-                console.error("[Listen] Error handling queued input:", error);
-              }
-              emitListenerStatus(
-                runtime,
-                opts.onStatusChange,
-                opts.connectionId,
-              );
-              scheduleQueuePump(scopedRuntime, socket, opts, processQueuedTurn);
-            });
+          dispatchInboundMessageWhenReady({
+            listener: runtime,
+            runtime: scopedRuntime,
+            incoming: directIncoming,
+            socket,
+            options: opts,
+            processQueuedTurn,
+            processIncomingMessage,
+            actingUserId: parsed.runtime.acting_user_id,
+            trackListenerError,
+            onInputAccepted: ({ accepted, disposition }) =>
+              acknowledgeInput(
+                accepted,
+                accepted ? undefined : "Input was rejected by the queue",
+                disposition,
+              ),
+          });
         };
 
         if (shouldQueueInboundMessage(incoming)) {
           const stampedIncoming = stampInboundUserMessageOtids(incoming);
+          const identity = ordinaryInputIdentity(
+            getInboundClientMessageId(stampedIncoming),
+          );
+          const acceptedDisposition = getInputDisposition(
+            scopedRuntime,
+            identity,
+          );
+          if (acceptedDisposition) {
+            acknowledgeInput(true, undefined, acceptedDisposition);
+            return;
+          }
+          if (
+            isRuntimeTeleportPending(
+              runtime,
+              scopedRuntime.agentId,
+              scopedRuntime.conversationId,
+            )
+          ) {
+            acknowledgeInput(false, "Conversation is switching computers");
+            return;
+          }
           if (
             shouldProcessInboundMessageDirectly(scopedRuntime, stampedIncoming)
           ) {
@@ -635,35 +602,63 @@ export function createListenerMessageHandler(
             return;
           }
 
-          const firstUserPayload = stampedIncoming.messages.find(
-            (
-              payload,
-            ): payload is MessageCreate & { client_message_id?: string } =>
-              "content" in payload,
-          );
-          if (firstUserPayload) {
-            const enqueuedItem = scopedRuntime.queueRuntime.enqueue({
-              kind: "message",
-              source: "user",
-              content: firstUserPayload.content,
-              clientMessageId:
-                firstUserPayload.client_message_id ??
-                `cm-submit-${crypto.randomUUID()}`,
-              agentId: parsed.runtime.agent_id,
-              conversationId: parsed.runtime.conversation_id || "default",
-              // Forwarded by cloud-api so we can attribute the
-              // outbound createMessage to the actual sender on
-              // multi-user sandboxes. Absent on self-hosted flows.
-              actingUserId: parsed.runtime.acting_user_id,
-            } as Parameters<typeof scopedRuntime.queueRuntime.enqueue>[0]);
-            if (enqueuedItem) {
-              scopedRuntime.queuedMessagesByItemId.set(
-                enqueuedItem.id,
-                stampedIncoming,
-              );
-            }
+          const admission = reserveInputDisposition(scopedRuntime, identity);
+          if (admission.kind === "duplicate") {
+            acknowledgeInput(true, undefined, admission.disposition);
+            return;
           }
-          scheduleQueuePump(scopedRuntime, socket, opts, processQueuedTurn);
+          if (admission.kind === "full") {
+            acknowledgeInput(false, "Stable input ledger is at capacity");
+            return;
+          }
+          const reservation =
+            admission.kind === "reserved" ? admission.reservation : undefined;
+          const durableIncoming = identity
+            ? { ...stampedIncoming, durableInputIdentities: [identity] }
+            : stampedIncoming;
+          try {
+            const committed = commitInputDisposition(
+              scopedRuntime,
+              reservation,
+              "queued",
+              {
+                incoming: durableIncoming,
+                actingUserId: parsed.runtime.acting_user_id,
+              },
+            );
+            let enqueued = false;
+            try {
+              enqueued =
+                committed &&
+                enqueueInboundUserMessage(
+                  scopedRuntime,
+                  durableIncoming,
+                  parsed.runtime.acting_user_id,
+                );
+            } catch (error) {
+              if (committed)
+                forgetQueuedInputDisposition(scopedRuntime, identity);
+              throw error;
+            }
+            const durablyAccepted = committed && enqueued;
+            if (durablyAccepted) {
+              scheduleQueuePump(scopedRuntime, socket, opts, processQueuedTurn);
+            } else if (committed) {
+              forgetQueuedInputDisposition(scopedRuntime, identity);
+            } else {
+              rollbackInputDisposition(scopedRuntime, reservation);
+            }
+            acknowledgeInput(
+              durablyAccepted,
+              durablyAccepted
+                ? undefined
+                : "Input was rejected by the queue or durable ledger",
+              durablyAccepted ? "queued" : undefined,
+            );
+          } catch (error) {
+            rollbackInputDisposition(scopedRuntime, reservation);
+            throw error;
+          }
           return;
         }
 
@@ -674,6 +669,7 @@ export function createListenerMessageHandler(
       if (parsed.type === "change_device_state") {
         await handleChangeDeviceStateInput(runtime, {
           command: parsed,
+          connectionId,
           socket,
           opts: {
             onStatusChange: opts.onStatusChange,
@@ -706,6 +702,7 @@ export function createListenerMessageHandler(
         try {
           const aborted = await handleAbortMessageInput(runtime, {
             command: parsed,
+            connectionId,
             socket,
             opts: {
               onStatusChange: opts.onStatusChange,
@@ -749,32 +746,18 @@ export function createListenerMessageHandler(
         return;
       }
 
-      if (parsed.type === "remove_queue_item") {
-        const scopedRuntime = getOrCreateScopedRuntime(
-          runtime,
-          parsed.runtime.agent_id,
-          parsed.runtime.conversation_id || "default",
-        );
-        const removed = scopedRuntime.queueRuntime.removeItem(parsed.item_id);
-        // Emit a response so the client knows if the item was found/removed
-        safeSocketSend(
+      if (
+        parsed.type === "resume_queue" ||
+        parsed.type === "remove_queue_item"
+      ) {
+        handleQueueCommand(parsed, {
+          listener: runtime,
           socket,
-          {
-            type: "remove_queue_item_response",
-            request_id: parsed.request_id,
-            success: removed !== null,
-            item_id: parsed.item_id,
-          },
-          "remove_queue_item_response",
-          "remove_queue_item",
-        );
-        // Broadcast the updated queue so all connected clients see the change
-        if (removed !== null) {
-          emitQueueUpdateIfOpen(runtime, {
-            agent_id: parsed.runtime.agent_id,
-            conversation_id: parsed.runtime.conversation_id,
-          });
-        }
+          opts,
+          processQueuedTurn,
+          getOrCreateScopedRuntime,
+          safeSocketSend,
+        });
         return;
       }
 
@@ -783,8 +766,9 @@ export function createListenerMessageHandler(
       }
 
       if (
-        handleMemoryProtocolCommand(parsed, {
+        handleMemfsSyncedMemoryProtocolCommand(parsed, {
           socket,
+          runtime,
           safeSocketSend,
           runDetachedListenerTask,
         })
@@ -829,11 +813,17 @@ export function createListenerMessageHandler(
           socket,
           safeSocketSend,
           runDetachedListenerTask,
+        }) ||
+        handleBrowserDeviceMcpOAuthProtocolCommand(parsed, {
+          socket,
+          owner: runtime,
+          lineageId,
+          safeSocketSend,
+          runDetachedListenerTask,
         })
       ) {
         return;
       }
-
       if (
         handleAgentConversationManagementProtocolCommand(parsed, {
           socket,
@@ -844,19 +834,27 @@ export function createListenerMessageHandler(
         return;
       }
 
-      // Channels management commands (device/live management)
-      if (isDetachedChannelsCommand(parsed)) {
-        runDetachedListenerTask("channels_command", async () => {
-          await handleChannelsProtocolCommand(
-            parsed,
-            socket,
-            runtime,
-            opts,
-            processQueuedTurn,
-            runDetachedListenerTask,
-            wireChannelIngress,
-            safeSocketSend,
-          );
+      if (runtime.serviceCommandTypes.has(parsed.type)) {
+        runDetachedListenerTask("service_command", async () => {
+          const serviceCommandHandler = runtime.serviceCommandHandler;
+          if (!serviceCommandHandler) {
+            throw new Error("ChannelGateway service is not ready");
+          }
+          const result = await serviceCommandHandler({
+            kind: "protocol",
+            command: parsed,
+          });
+          if (result.kind !== "protocol") {
+            throw new Error("Service returned an invalid protocol response");
+          }
+          for (const response of result.messages) {
+            safeSocketSend(
+              socket,
+              response,
+              "listener_service_command_send_failed",
+              "listener_service_command",
+            );
+          }
         });
         return;
       }
@@ -871,19 +869,15 @@ export function createListenerMessageHandler(
         return;
       }
 
-      if (parsed.type === "get_cwd_map") {
-        safeSocketSend(
+      if (
+        parsed.type === "get_cwd_map" ||
+        parsed.type === "set_boot_working_directory"
+      ) {
+        await handleCwdProtocolCommand(parsed, {
           socket,
-          {
-            type: "get_cwd_map_response",
-            request_id: parsed.request_id,
-            success: true,
-            cwd_map: Object.fromEntries(runtime.workingDirectoryByConversation),
-            boot_working_directory: runtime.bootWorkingDirectory,
-          },
-          "get_cwd_map_response",
-          "get_cwd_map",
-        );
+          runtime,
+          safeSocketSend,
+        });
         return;
       }
 
@@ -898,9 +892,7 @@ export function createListenerMessageHandler(
         return;
       }
 
-      // Slash commands (execute_command)
       if (isExecuteCommandCommand(parsed)) {
-        // Internal-only: refresh doctor state after recompile (no chat output)
         if (parsed.command_id === "refresh_doctor_state") {
           const agentId = parsed.runtime.agent_id;
           if (agentId && settingsManager.isMemfsEnabled(agentId)) {
@@ -909,17 +901,14 @@ export function createListenerMessageHandler(
                 "@/agent/memory-filesystem"
               );
               const memoryDir = getScopedMemoryFilesystemRoot(agentId);
-              const tokens = estimateSystemPromptTokensFromMemoryDir(memoryDir);
+              const tokens = estimateActiveMemorySystemPromptTokens(memoryDir);
               setSystemPromptDoctorState(agentId, tokens);
-            } catch {
-              // best-effort
-            }
+            } catch {}
           }
           emitDeviceStatusUpdate(socket, runtime, parsed.runtime);
           return;
         }
 
-        // Slash commands need a scoped runtime for the conversation context
         const scopedRuntime = getOrCreateScopedRuntime(
           runtime,
           parsed.runtime.agent_id,
@@ -958,28 +947,28 @@ export function createListenerMessageHandler(
         return;
       }
 
-      // Terminal commands (no runtime scope required)
       if (parsed.type === "terminal_spawn") {
         handleTerminalSpawn(
           parsed,
           socket,
-          parsed.cwd ?? runtime.bootWorkingDirectory,
+          parsed.cwd ?? getBootWorkingDirectory(runtime),
+          connectionId,
         );
         return;
       }
 
       if (parsed.type === "terminal_input") {
-        handleTerminalInput(parsed);
+        handleTerminalInput(parsed, connectionId);
         return;
       }
 
       if (parsed.type === "terminal_resize") {
-        handleTerminalResize(parsed);
+        handleTerminalResize(parsed, connectionId);
         return;
       }
 
       if (parsed.type === "terminal_kill") {
-        handleTerminalKill(parsed);
+        handleTerminalKill(parsed, connectionId);
       }
     } catch (error) {
       trackListenerError(

@@ -2,16 +2,27 @@
  * Approval recovery helpers.
  *
  * Pure policy logic lives in `./turn-recovery-policy.ts` and is re-exported
- * here for backward compatibility. This module keeps only the async/side-effect
- * helper (`fetchRunErrorDetail`) that requires network access.
+ * here for backward compatibility. Async helpers that require backend access
+ * stay in this module.
  */
 
+import type { MessageCreate } from "@letta-ai/letta-client/resources/agents/agents";
+import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
+import { getResumeDataFromBackend } from "@/agent/check-approval";
 import { getBackend } from "@/backend";
+import {
+  rebuildInputWithFreshDenials,
+  STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+} from "./turn-recovery-policy";
 
 export interface RunErrorInfo {
   error_type?: string;
+  error_code?: string;
+  status_code?: number;
+  retryable?: boolean;
   message?: string;
   detail?: string;
+  raw?: unknown;
   run_id?: string;
 }
 
@@ -43,6 +54,7 @@ export {
   refreshInputOtidsForNewRequest,
   STALE_APPROVAL_RECOVERY_DENIAL_REASON,
   shouldAttemptApprovalRecovery,
+  shouldRetryPostStreamRunError,
   shouldRetryPreStreamTransientError,
   shouldRetryRunMetadataError,
 } from "./turn-recovery-policy";
@@ -53,14 +65,24 @@ type RunErrorMetadata =
   | {
       type?: string;
       error_type?: string;
+      errorCode?: string;
+      error_code?: string;
+      status_code?: number;
+      retryable?: boolean;
       message?: string;
       detail?: string;
+      raw?: unknown;
       run_id?: string;
       error?: {
         type?: string;
         error_type?: string;
+        errorCode?: string;
+        error_code?: string;
+        status_code?: number;
+        retryable?: boolean;
         message?: string;
         detail?: string;
+        raw?: unknown;
         run_id?: string;
       };
     }
@@ -81,12 +103,23 @@ export async function fetchRunErrorInfo(
         metaError?.type ??
         nestedError?.error_type ??
         nestedError?.type,
+      error_code:
+        metaError?.errorCode ??
+        metaError?.error_code ??
+        nestedError?.errorCode ??
+        nestedError?.error_code,
+      status_code: metaError?.status_code ?? nestedError?.status_code,
+      retryable: metaError?.retryable ?? nestedError?.retryable,
       message: metaError?.message ?? nestedError?.message,
       detail: metaError?.detail ?? nestedError?.detail,
+      raw: metaError?.raw ?? nestedError?.raw,
       run_id: metaError?.run_id ?? nestedError?.run_id ?? runId,
     };
 
-    return errorInfo.error_type || errorInfo.message || errorInfo.detail
+    return errorInfo.error_type ||
+      errorInfo.error_code ||
+      errorInfo.message ||
+      errorInfo.detail
       ? errorInfo
       : null;
   } catch {
@@ -99,4 +132,26 @@ export async function fetchRunErrorDetail(
 ): Promise<string | null> {
   const errorInfo = await fetchRunErrorInfo(runId);
   return errorInfo?.detail ?? errorInfo?.message ?? null;
+}
+
+export async function rebuildInputForApprovalResync(
+  agentId: string,
+  conversationId: string,
+  currentInput: Array<MessageCreate | ApprovalCreate>,
+): Promise<Array<MessageCreate | ApprovalCreate>> {
+  const backend = getBackend();
+  const agent = await backend.retrieveAgent(agentId);
+  const { pendingApprovals } = await getResumeDataFromBackend(
+    agent,
+    conversationId,
+  );
+  const rebuilt = rebuildInputWithFreshDenials(
+    currentInput,
+    pendingApprovals ?? [],
+    STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+  );
+  if (rebuilt.length === 0) {
+    throw new Error("Approval resync produced no retryable input");
+  }
+  return rebuilt;
 }

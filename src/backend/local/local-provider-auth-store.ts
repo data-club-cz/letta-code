@@ -1,21 +1,26 @@
+import { randomUUID } from "node:crypto";
 import {
-  chmodSync,
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  renameSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import {
-  getOAuthApiKey,
-  type OAuthCredentials,
-} from "@earendil-works/pi-ai/oauth";
+import type { OAuthCredentials } from "@earendil-works/pi-ai/oauth";
 import type { ProviderResponse } from "@/backend/api/providers";
+import { getProviderOAuthAuth } from "@/backend/dev/pi-oauth";
 import { getRegisteredPiProvider } from "@/backend/dev/pi-provider-mod-registry";
 import {
   LOCAL_CHATGPT_PROVIDER_NAME,
+  OPENAI_COMPATIBLE_PI_PROVIDER_ID,
   SUPPORTED_LOCAL_PROVIDER_TYPES,
 } from "@/backend/dev/pi-provider-registry";
+import { type FileLockOptions, withFileLock } from "@/utils/file-lock";
 import type { LocalProviderTimeout } from "./local-provider-timeout";
 import { getLocalBackendStorageDir } from "./paths";
 
@@ -31,6 +36,7 @@ export {
   LOCAL_MOONSHOT_PROVIDER_NAME,
   LOCAL_OLLAMA_CLOUD_PROVIDER_NAME,
   LOCAL_OLLAMA_PROVIDER_NAME,
+  LOCAL_OPENAI_COMPATIBLE_PROVIDER_NAME,
   LOCAL_OPENAI_PROVIDER_NAME,
   LOCAL_OPENROUTER_PROVIDER_NAME,
   LOCAL_ZAI_CODING_PROVIDER_NAME,
@@ -91,6 +97,32 @@ export function getLocalProviderAuthPath(
   return join(storageDir, "providers", "auth.json");
 }
 
+// An OAuth refresh (a network call) can run while holding the lock, so the
+// lock is reaped only when its holder process is gone, never by age:
+// age-based reaping could let a second process refresh the same rotating
+// token while a slow holder is still mid-refresh. A live but hung holder
+// then makes waiters fail after `timeoutMs` instead of double-refreshing.
+const AUTH_FILE_LOCK_OPTIONS: FileLockOptions = {
+  reapOnlyDeadOwner: true,
+  retryMs: 50,
+  timeoutMs: 120_000,
+};
+
+/**
+ * Run a read-modify-write of auth.json exclusively across every process
+ * sharing the storage dir (e.g. a channel listener and an App Server), so
+ * two processes cannot both spend the same rotating OAuth refresh token.
+ * Callers must re-read the record inside `fn`. Not reentrant.
+ */
+export function withLocalProviderAuthLock<T>(
+  fn: () => Promise<T>,
+  storageDir?: string,
+): Promise<T> {
+  const authPath = getLocalProviderAuthPath(storageDir);
+  mkdirSync(dirname(authPath), { recursive: true, mode: 0o700 });
+  return withFileLock(`${authPath}.lock`, fn, AUTH_FILE_LOCK_OPTIONS);
+}
+
 function emptyAuthFile(): LocalProviderAuthFile {
   return { version: 1, providers: {} };
 }
@@ -113,11 +145,25 @@ function readAuthFile(storageDir?: string): LocalProviderAuthFile {
 function writeAuthFile(file: LocalProviderAuthFile, storageDir?: string): void {
   const path = getLocalProviderAuthPath(storageDir);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  writeFileSync(path, `${JSON.stringify(file, null, 2)}\n`, {
-    encoding: "utf8",
-    mode: 0o600,
-  });
-  chmodSync(path, 0o600);
+  // Publish a complete snapshot: readers in other processes never see a
+  // half-written file, and a failed write leaves the previous file intact.
+  const temporaryPath = `${path}.${randomUUID()}.tmp`;
+  const fd = openSync(temporaryPath, "wx", 0o600);
+  try {
+    try {
+      writeFileSync(fd, `${JSON.stringify(file, null, 2)}\n`, "utf8");
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporaryPath, path);
+  } finally {
+    try {
+      unlinkSync(temporaryPath);
+    } catch {
+      // Usually already renamed. Cleanup must not mask a failed write/rename.
+    }
+  }
 }
 
 function providerId(providerName: string): string {
@@ -204,6 +250,13 @@ export async function createOrUpdateLocalProvider(input: {
 
   const file = readAuthFile(input.storageDir);
   const existing = file.providers[input.providerName];
+  const baseURL = input.baseURL ?? existing?.base_url;
+  if (
+    input.providerType === OPENAI_COMPATIBLE_PI_PROVIDER_ID &&
+    !baseURL?.trim()
+  ) {
+    throw new Error("OpenAI-compatible API requires a base URL.");
+  }
   const now = new Date().toISOString();
   const auth: LocalProviderAuth =
     input.providerType === "chatgpt_oauth"
@@ -218,9 +271,7 @@ export async function createOrUpdateLocalProvider(input: {
     ...(input.accessKey ? { access_key: input.accessKey } : {}),
     ...(input.region ? { region: input.region } : {}),
     ...(input.profile ? { profile: input.profile } : {}),
-    ...((input.baseURL ?? existing?.base_url)
-      ? { base_url: input.baseURL ?? existing?.base_url }
-      : {}),
+    ...(baseURL ? { base_url: baseURL } : {}),
     ...(input.timeout !== undefined
       ? { timeout: input.timeout }
       : existing?.timeout !== undefined
@@ -328,6 +379,8 @@ export function setLocalOAuthProvider(input: {
   providerType: string;
   auth: LocalProviderOAuthAuth;
   storageDir?: string;
+  baseURL?: string;
+  timeout?: LocalProviderTimeout;
 }): void {
   if (!isLocalProviderTypeSupported(input.providerType)) {
     throw new Error(
@@ -344,6 +397,14 @@ export function setLocalOAuthProvider(input: {
     provider_type: input.providerType,
     provider_category: "byok",
     auth: input.auth,
+    ...((input.baseURL ?? existing?.base_url)
+      ? { base_url: input.baseURL ?? existing?.base_url }
+      : {}),
+    ...(input.timeout !== undefined
+      ? { timeout: input.timeout }
+      : existing?.timeout !== undefined
+        ? { timeout: existing.timeout }
+        : {}),
     created_at: existing?.created_at ?? now,
     updated_at: now,
   };
@@ -422,29 +483,63 @@ export async function getLocalOAuthApiKey(input: {
   | {
       apiKey: string;
       credentials: OAuthCredentials;
+      baseUrl?: string;
+      headers?: Record<string, string>;
     }
   | undefined
 > {
   const record = localOAuthRecord(input.providerNames, input.storageDir);
   if (!record || record.auth.type !== "oauth") return undefined;
 
-  const result = await getOAuthApiKey(input.providerId, {
-    [input.providerId]: toPiOAuthCredentials(record.auth),
-  });
-  if (!result) return undefined;
+  // pi-ai 0.81: OAuth lives on the provider (Provider.auth.oauth). Refresh
+  // expired tokens through the provider's own flow, then derive request auth
+  // (apiKey plus per-credential baseUrl/headers, e.g. GitHub Copilot).
+  const oauth = getProviderOAuthAuth(input.providerId);
+  if (!oauth) return undefined;
 
-  const nextAuth = toLocalOAuthAuth(result.newCredentials, record.auth);
-  if (!localOAuthAuthEquals(nextAuth, record.auth)) {
-    setLocalOAuthProvider({
-      providerName: record.name,
-      providerType: record.provider_type,
-      auth: nextAuth,
-      storageDir: input.storageDir,
-    });
+  let credentials = toPiOAuthCredentials(record.auth);
+  if (Date.now() >= credentials.expires) {
+    // Refresh under the cross-process auth lock, re-reading first: another
+    // process may already have spent this refresh token and stored the
+    // rotated credentials.
+    const refreshed = await withLocalProviderAuthLock(async () => {
+      const current = localOAuthRecord(input.providerNames, input.storageDir);
+      if (!current || current.auth.type !== "oauth") return undefined;
+      const currentCredentials = toPiOAuthCredentials(current.auth);
+      if (Date.now() < currentCredentials.expires) return currentCredentials;
+      // pi-ai 0.84+: OAuthAuth.refresh requires an AbortSignal.
+      const next = await oauth.refresh(
+        { type: "oauth", ...currentCredentials },
+        new AbortController().signal,
+      );
+      const nextAuth = toLocalOAuthAuth(next, current.auth);
+      if (!localOAuthAuthEquals(nextAuth, current.auth)) {
+        setLocalOAuthProvider({
+          providerName: current.name,
+          providerType: current.provider_type,
+          auth: nextAuth,
+          storageDir: input.storageDir,
+        });
+      }
+      return next;
+    }, input.storageDir);
+    if (!refreshed) return undefined;
+    credentials = refreshed;
   }
+  const modelAuth = await oauth.toAuth({ type: "oauth", ...credentials });
+  if (!modelAuth.apiKey) return undefined;
+  const headers = modelAuth.headers
+    ? Object.fromEntries(
+        Object.entries(modelAuth.headers).filter(
+          (entry): entry is [string, string] => entry[1] !== null,
+        ),
+      )
+    : undefined;
   return {
-    apiKey: result.apiKey,
-    credentials: result.newCredentials,
+    apiKey: modelAuth.apiKey,
+    credentials,
+    ...(modelAuth.baseUrl ? { baseUrl: modelAuth.baseUrl } : {}),
+    ...(headers && Object.keys(headers).length > 0 ? { headers } : {}),
   };
 }
 

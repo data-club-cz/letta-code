@@ -9,7 +9,7 @@ import { AnimatedLogo } from "@/cli/components/AnimatedLogo";
 import { colors } from "@/cli/components/colors";
 import { Text } from "@/cli/components/Text";
 import { settingsManager } from "@/settings-manager";
-import { ConstellationLoginView } from "./ConstellationLoginView";
+import { LettaLoginView } from "./LettaLoginView";
 
 type SetupMode = "menu" | "device-code" | "auth-code" | "self-host" | "done";
 export type SetupInitialMode = "menu" | "device-code";
@@ -18,7 +18,7 @@ export type SetupResult =
   | { kind: "local" }
   | { kind: "cancelled" };
 
-const AUTH_LOGIN_LABEL = "Login to Constellation";
+const AUTH_LOGIN_LABEL = "Sign in with Letta";
 const LOCAL_MODE_LABEL = "Proceed locally";
 const AUTH_LOGO_ANIMATE = false;
 
@@ -27,6 +27,7 @@ interface SetupUIProps {
   onCancel: () => void;
   initialMode?: SetupInitialMode;
   localModeDisabledReason?: string;
+  persistBackendPreference?: boolean;
 }
 
 export function SetupUI({
@@ -34,12 +35,11 @@ export function SetupUI({
   onCancel,
   initialMode = "menu",
   localModeDisabledReason,
+  persistBackendPreference = true,
 }: SetupUIProps) {
   const localModeDisabled = Boolean(localModeDisabledReason);
   const [mode, setMode] = useState<SetupMode>(initialMode);
-  const [selectedOption, setSelectedOption] = useState(
-    initialMode === "device-code" || localModeDisabled ? 0 : 1,
-  );
+  const [selectedOption, setSelectedOption] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [doneMessage, setDoneMessage] = useState("Starting Letta Code...");
   const selectNextOption = (current: number, delta: 1 | -1): number => {
@@ -62,7 +62,7 @@ export function SetupUI({
           setSelectedOption((prev) => selectNextOption(prev, 1));
         } else if (key.return) {
           if (selectedOption === 0) {
-            // Login to Constellation - start device code flow
+            // Sign in with Letta - start device code flow
             setMode("device-code");
           } else if (selectedOption === 1 && !localModeDisabled) {
             proceedLocally();
@@ -78,10 +78,12 @@ export function SetupUI({
   const proceedLocally = async () => {
     try {
       configureBackendMode("local");
-      settingsManager.updateSettings({ preferredBackendMode: "local" });
-      await settingsManager.flush();
+      if (persistBackendPreference) {
+        settingsManager.updateSettings({ preferredBackendMode: "local" });
+        await settingsManager.flush();
+      }
       setDoneMessage(
-        "Local mode enabled. Agents you create now will be stored on this device. To sign into Letta Cloud later, run `letta setup` or `letta backend api`.",
+        "Local mode enabled. Agents you create now will be stored on this device. To sign into Letta Cloud later, run `letta setup` or `letta backend cloud`.",
       );
       setMode("done");
       setTimeout(() => onComplete({ kind: "local" }), 500);
@@ -118,10 +120,12 @@ export function SetupUI({
         <Text> </Text>
         <Text bold>{AUTH_LOGIN_LABEL}</Text>
         <Text> </Text>
-        <ConstellationLoginView
+        <LettaLoginView
+          activateCloudBackend
+          persistBackendPreference={persistBackendPreference}
           onComplete={() => onComplete({ kind: "cloud-login" })}
           onCancel={() => setMode("menu")}
-          successMessage="Signed in to Constellation. Starting Letta Code..."
+          successMessage="Signed in with Letta. Starting Letta Code..."
         />
       </Box>
     );
@@ -134,7 +138,7 @@ export function SetupUI({
       <Text> </Text>
       <Text bold>Welcome to Letta Code</Text>
       <Text dimColor>
-        Sign in to Constellation for remote access via chat.letta.com and other
+        Sign in with Letta for remote access via chat.letta.com and other
         devices, or continue locally with agent state stored on this device.
       </Text>
       <Text> </Text>
@@ -145,7 +149,7 @@ export function SetupUI({
           }
         >
           {selectedOption === 0 ? "> " : "  "}
-          {AUTH_LOGIN_LABEL}
+          {AUTH_LOGIN_LABEL} (default)
         </Text>
       </Box>
       <Box paddingLeft={2}>
@@ -164,7 +168,7 @@ export function SetupUI({
           dimColor={localModeDisabled}
         >
           {selectedOption === 1 ? "> " : "  "}
-          {LOCAL_MODE_LABEL} {localModeDisabled ? "(unavailable)" : "(default)"}
+          {LOCAL_MODE_LABEL} {localModeDisabled ? "(unavailable)" : ""}
         </Text>
       </Box>
       <Box paddingLeft={2}>
@@ -187,6 +191,11 @@ export function SetupUI({
         </Text>
       </Box>
       <Text> </Text>
+      <Text dimColor>
+        {persistBackendPreference
+          ? "Your choice is saved. Use --backend cloud or --backend local to override it."
+          : "This invocation overrides your saved default without changing it."}
+      </Text>
       <Text dimColor>Use ↑/↓ to navigate, Enter to select</Text>
     </Box>
   );

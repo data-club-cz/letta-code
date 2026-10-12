@@ -15,8 +15,13 @@ import {
   modToolApprovalPolicy,
 } from "@/mods/tool-registry";
 import type { ModContext } from "@/mods/types";
-import type { PermissionModeState } from "@/tools/manager";
-import { canonicalToolName, isShellToolName } from "./canonical";
+import { getRuntimeContext } from "@/runtime-context";
+import type { PermissionModeState } from "@/tools/permission-mode-state";
+import {
+  canonicalToolName,
+  isShellToolName,
+  toolNameForPermissionCheck,
+} from "./canonical";
 import { cliPermissions } from "./cli-permissions-instance";
 import { evaluateCrossAgentGuard, extractFilePath } from "./cross-agent-guard";
 import {
@@ -25,6 +30,7 @@ import {
   matchesFilePattern,
   matchesToolPattern,
 } from "./matcher";
+import { isOwnMemoryWrite } from "./memory-write-allowance";
 import { permissionMode } from "./mode";
 import { isMemoryDirCommand, isReadOnlyShellCommand } from "./read-only-shell";
 import { sessionPermissions } from "./session";
@@ -36,69 +42,20 @@ import type {
   PermissionRules,
   PermissionTraceEvent,
 } from "./types";
+import { evaluateWorkspaceSandboxGuard } from "./workspace-sandbox";
 
 /**
  * Tools that don't require approval within working directory
  */
-const WORKING_DIRECTORY_TOOLS_V2 = ["Read", "Glob", "Grep", "ListDir"];
-const WORKING_DIRECTORY_TOOLS_V1 = [
+const WORKING_DIRECTORY_TOOLS = [
   "Read",
   "Glob",
   "Grep",
-  "read_file",
-  "ReadFile",
-  "list_dir",
   "ListDir",
-  "grep_files",
-  "GrepFiles",
-  "read_file_gemini",
-  "ReadFileGemini",
-  "glob_gemini",
-  "GlobGemini",
-  "list_directory",
-  "ListDirectory",
-  "search_file_content",
-  "SearchFileContent",
-  "read_many_files",
-  "ReadManyFiles",
+  "ViewImage",
+  "ReadLSP",
 ];
-const READ_ONLY_SHELL_TOOLS = new Set([
-  "Bash",
-  "shell",
-  "Shell",
-  "shell_command",
-  "ShellCommand",
-  "exec_command",
-  "write_stdin",
-  "run_shell_command",
-  "RunShellCommand",
-]);
-const FILE_TOOLS_V2 = ["Read", "Write", "Edit", "Glob", "Grep", "ListDir"];
-const FILE_TOOLS_V1 = [
-  "Read",
-  "Write",
-  "Edit",
-  "Glob",
-  "Grep",
-  "read_file",
-  "ReadFile",
-  "list_dir",
-  "ListDir",
-  "grep_files",
-  "GrepFiles",
-  "read_file_gemini",
-  "ReadFileGemini",
-  "write_file_gemini",
-  "WriteFileGemini",
-  "glob_gemini",
-  "GlobGemini",
-  "list_directory",
-  "ListDirectory",
-  "search_file_content",
-  "SearchFileContent",
-  "read_many_files",
-  "ReadManyFiles",
-];
+const FILE_TOOLS = ["Read", "Write", "Edit", "Glob", "Grep", "ListDir"];
 
 type ToolArgs = Record<string, unknown>;
 
@@ -288,19 +245,59 @@ function checkPermissionForEngine(
   agentId?: string,
   modTools: Map<string, ModToolDefinition> = getAvailableModToolsRegistry(),
 ): { result: PermissionCheckResult; trace: PermissionCheckTrace } {
-  const canonicalTool = canonicalToolName(toolName);
-  const queryTool = engine === "v2" ? canonicalTool : toolName;
-  const query = buildPermissionQuery(queryTool, toolArgs, engine);
+  const permissionToolName = toolNameForPermissionCheck(toolName, toolArgs);
+  const canonicalTool = canonicalToolName(permissionToolName);
+  const queryTool = engine === "v2" ? canonicalTool : permissionToolName;
+  const query = buildPermissionQuery(queryTool, toolArgs);
+  const originalQueryTool =
+    engine === "v2" ? canonicalToolName(toolName) : toolName;
+  const originalQuery =
+    permissionToolName === toolName
+      ? query
+      : buildPermissionQuery(originalQueryTool, toolArgs);
+  const matchesRule = (pattern: string, includeOriginal = false): boolean =>
+    matchesPattern(
+      permissionToolName,
+      query,
+      pattern,
+      workingDirectory,
+      engine,
+    ) ||
+    (includeOriginal &&
+      permissionToolName !== toolName &&
+      matchesPattern(
+        toolName,
+        originalQuery,
+        pattern,
+        workingDirectory,
+        engine,
+      ));
   const trace = createTrace(engine, toolName, canonicalTool, query);
   const sessionRules = sessionPermissions.getRules();
-  const workingDirectoryTools =
-    engine === "v2" ? WORKING_DIRECTORY_TOOLS_V2 : WORKING_DIRECTORY_TOOLS_V1;
+
+  const workspaceGuardResult = evaluateWorkspaceSandboxGuard(
+    permissionToolName,
+    toolArgs,
+    workingDirectory,
+    getRuntimeContext()?.workspaceSandbox,
+  );
+  if (workspaceGuardResult) {
+    traceEvent(trace, "workspace-sandbox", workspaceGuardResult.reason);
+    return {
+      result: {
+        decision: "deny",
+        matchedRule: workspaceGuardResult.matchedRule,
+        reason: workspaceGuardResult.reason,
+      },
+      trace,
+    };
+  }
 
   // Cross-agent guard — when enabled, denies any tool call targeting another
   // agent's memory unless that agent is in the allowed set. Unbypassable by
   // any mode, rule, or flag.
   const guardResult = evaluateCrossAgentGuard(
-    toolName,
+    permissionToolName,
     toolArgs,
     workingDirectory,
     { currentAgentId: agentId },
@@ -319,13 +316,7 @@ function checkPermissionForEngine(
 
   if (permissions.deny) {
     for (const pattern of permissions.deny) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern, true);
       traceEvent(trace, "deny-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -342,13 +333,7 @@ function checkPermissionForEngine(
 
   const disallowedTools = cliPermissions.getDisallowedTools();
   for (const pattern of disallowedTools) {
-    const matched = matchesPattern(
-      toolName,
-      query,
-      pattern,
-      workingDirectory,
-      engine,
-    );
+    const matched = matchesRule(pattern, true);
     traceEvent(trace, "cli-disallow-rule", undefined, pattern, matched);
     if (matched) {
       return {
@@ -364,13 +349,7 @@ function checkPermissionForEngine(
 
   if (sessionRules.alwaysAsk) {
     for (const pattern of sessionRules.alwaysAsk) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern, true);
       traceEvent(trace, "session-always-ask-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -387,13 +366,7 @@ function checkPermissionForEngine(
 
   if (permissions.alwaysAsk) {
     for (const pattern of permissions.alwaysAsk) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern, true);
       traceEvent(trace, "always-ask-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -428,7 +401,7 @@ function checkPermissionForEngine(
   // otherwise fall back to the global singleton (local/CLI mode).
   const effectiveMode = modeState?.mode ?? permissionMode.getMode();
   const modeOverride = permissionMode.checkModeOverride(
-    toolName,
+    permissionToolName,
     effectiveMode,
   );
   if (modeOverride) {
@@ -446,13 +419,7 @@ function checkPermissionForEngine(
 
   const allowedTools = cliPermissions.getAllowedTools();
   for (const pattern of allowedTools) {
-    const matched = matchesPattern(
-      toolName,
-      query,
-      pattern,
-      workingDirectory,
-      engine,
-    );
+    const matched = matchesRule(pattern);
     traceEvent(trace, "cli-allow-rule", undefined, pattern, matched);
     if (matched) {
       return {
@@ -466,7 +433,11 @@ function checkPermissionForEngine(
     }
   }
 
-  if (toolName === "Skill") {
+  // Strict mode skips all auto-allow paths; every tool goes through the
+  // approval callback (or defaults to "ask" if no callback is registered).
+  const isStrictMode = effectiveMode === "strict";
+
+  if (toolName === "Skill" && !isStrictMode) {
     traceEvent(trace, "skill-auto-allow", "Skill tool is always allowed");
     return {
       result: {
@@ -477,7 +448,19 @@ function checkPermissionForEngine(
     };
   }
 
-  if (READ_ONLY_SHELL_TOOLS.has(toolName) || isShellToolName(canonicalTool)) {
+  // Memory() only reads the scoped agent's own memory directory.
+  if (toolName === "Memory" && !isStrictMode) {
+    traceEvent(trace, "memory-auto-allow", "Memory tool is always allowed");
+    return {
+      result: {
+        decision: "allow",
+        reason: "Memory tool is always allowed (reads own memory)",
+      },
+      trace,
+    };
+  }
+
+  if (!isStrictMode && isShellToolName(canonicalTool)) {
     const shellCommand = extractShellCommand(toolArgs);
     if (
       shellCommand &&
@@ -520,7 +503,26 @@ function checkPermissionForEngine(
     }
   }
 
-  if (workingDirectoryTools.includes(queryTool)) {
+  // File-tool counterpart of the memory-dir shell allowance above.
+  if (
+    !isStrictMode &&
+    isOwnMemoryWrite(canonicalTool, toolArgs, workingDirectory, agentId)
+  ) {
+    traceEvent(
+      trace,
+      "memory-dir-auto-allow",
+      "Agent memory directory operation",
+    );
+    return {
+      result: {
+        decision: "allow",
+        reason: "Agent memory directory operation",
+      },
+      trace,
+    };
+  }
+
+  if (!isStrictMode && WORKING_DIRECTORY_TOOLS.includes(queryTool)) {
     const filePath = extractFilePath(toolArgs);
     if (
       filePath &&
@@ -543,13 +545,7 @@ function checkPermissionForEngine(
 
   if (sessionRules.allow) {
     for (const pattern of sessionRules.allow) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern);
       traceEvent(trace, "session-allow-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -566,13 +562,7 @@ function checkPermissionForEngine(
 
   if (permissions.allow) {
     for (const pattern of permissions.allow) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern);
       traceEvent(trace, "allow-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -589,13 +579,7 @@ function checkPermissionForEngine(
 
   if (permissions.ask) {
     for (const pattern of permissions.ask) {
-      const matched = matchesPattern(
-        toolName,
-        query,
-        pattern,
-        workingDirectory,
-        engine,
-      );
+      const matched = matchesRule(pattern, true);
       traceEvent(trace, "ask-rule", undefined, pattern, matched);
       if (matched) {
         return {
@@ -610,7 +594,12 @@ function checkPermissionForEngine(
     }
   }
 
-  const defaultDecision = getDefaultDecision(toolName, toolArgs, modTools);
+  const defaultDecision = getDefaultDecision(
+    permissionToolName,
+    toolArgs,
+    modTools,
+    effectiveMode,
+  );
   traceEvent(trace, "default-decision", `Default: ${defaultDecision}`);
   return {
     result: {
@@ -668,11 +657,7 @@ function getAllowedShellPathRoots(
 /**
  * Build permission query string for a tool execution
  */
-function buildPermissionQuery(
-  toolName: string,
-  toolArgs: ToolArgs,
-  engine: PermissionEngine,
-): string {
+function buildPermissionQuery(toolName: string, toolArgs: ToolArgs): string {
   switch (toolName) {
     // File tools: "ToolName(path/to/file)"
     case "Read":
@@ -680,43 +665,14 @@ function buildPermissionQuery(
     case "Edit":
     case "Glob":
     case "Grep":
-    case "ListDir":
-    case "read_file":
-    case "ReadFile":
-    case "list_dir":
-    case "grep_files":
-    case "GrepFiles":
-    case "read_file_gemini":
-    case "ReadFileGemini":
-    case "write_file_gemini":
-    case "WriteFileGemini":
-    case "glob_gemini":
-    case "GlobGemini":
-    case "list_directory":
-    case "ListDirectory":
-    case "search_file_content":
-    case "SearchFileContent":
-    case "read_many_files":
-    case "ReadManyFiles": {
+    case "ListDir": {
       const filePath = extractFilePath(toolArgs);
       return filePath ? `${toolName}(${filePath})` : toolName;
     }
 
-    case "Bash": {
-      // Bash: "Bash(command with args)"
-      const command =
-        typeof toolArgs.cmd === "string"
-          ? toolArgs.cmd
-          : typeof toolArgs.command === "string"
-            ? toolArgs.command
-            : Array.isArray(toolArgs.command)
-              ? toolArgs.command.join(" ")
-              : "";
-      return `Bash(${command})`;
-    }
-    case "shell":
-    case "shell_command":
+    case "Bash":
     case "exec_command": {
+      // Both shell tools: "Bash(command with args)"
       const command =
         typeof toolArgs.cmd === "string"
           ? toolArgs.cmd
@@ -729,20 +685,6 @@ function buildPermissionQuery(
     }
     case "write_stdin":
       return "Bash(write_stdin)";
-    case "run_shell_command":
-    case "RunShellCommand": {
-      if (engine === "v1") {
-        // Legacy behavior did not normalize this alias into Bash queries.
-        return toolName;
-      }
-      const command =
-        typeof toolArgs.command === "string"
-          ? toolArgs.command
-          : Array.isArray(toolArgs.command)
-            ? toolArgs.command.join(" ")
-            : "";
-      return `Bash(${command})`;
-    }
 
     default:
       // Other tools: just the tool name
@@ -777,20 +719,14 @@ function matchesPattern(
       ? { canonicalizeToolNames: true, allowBareToolFallback: true }
       : { canonicalizeToolNames: false, allowBareToolFallback: false };
   const toolForMatch = engine === "v2" ? canonicalToolName(toolName) : toolName;
-  const fileTools = engine === "v2" ? FILE_TOOLS_V2 : FILE_TOOLS_V1;
   // File tools use glob matching
-  if (fileTools.includes(toolForMatch)) {
+  if (FILE_TOOLS.includes(toolForMatch)) {
     return matchesFilePattern(query, pattern, workingDirectory, matcherOptions);
   }
 
   // Bash uses prefix matching
-  const legacyShellTool =
-    engine === "v1" &&
-    (toolForMatch === "Bash" ||
-      toolForMatch === "shell" ||
-      toolForMatch === "shell_command");
   const v2ShellTool = engine === "v2" && isShellToolName(toolName);
-  if (toolForMatch === "Bash" || legacyShellTool || v2ShellTool) {
+  if (toolForMatch === "Bash" || v2ShellTool) {
     return matchesBashPattern(query, pattern, matcherOptions);
   }
 
@@ -804,11 +740,11 @@ function matchesPattern(
  * mutations are constrained by the memory-subagent sandbox.
  */
 const SAFE_AUTO_APPROVE_SUBAGENT_TYPES = new Set([
-  "recall", // Conversation history search - Skill, Bash, Read, TaskOutput
+  "recall", // Conversation history search - Skill, Bash, Read
   "Recall",
   "reflection", // Memory reflection - writes constrained by memory-subagent sandbox
   "Reflection",
-  "history-analyzer", // History analysis - writes constrained by memory-subagent sandbox
+  "memory", // Memory worker - edits its private memory worktree under the same sandbox
 ]);
 
 /**
@@ -818,7 +754,14 @@ function getDefaultDecision(
   toolName: string,
   toolArgs?: ToolArgs,
   modTools: Map<string, ModToolDefinition> = getAvailableModToolsRegistry(),
+  mode?: string,
 ): PermissionDecision {
+  // Strict mode: every tool defaults to "ask" so the approval callback
+  // (or user) must explicitly allow it.
+  if (mode === "strict") {
+    return "ask";
+  }
+
   const modApprovalPolicy = modToolApprovalPolicy(toolName, modTools);
   if (modApprovalPolicy !== undefined) {
     if (modApprovalPolicy === "auto") return "allow";
@@ -826,48 +769,28 @@ function getDefaultDecision(
     return "ask";
   }
 
-  // Check TOOL_PERMISSIONS to determine if tool requires approval
-  // Import is async so we need to do this synchronously - get the permissions from manager
-  // For now, use a hardcoded check that matches TOOL_PERMISSIONS configuration
+  // Tools that run without asking in standard and acceptEdits modes.
   const autoAllowTools = [
-    // Anthropic toolset - tools that don't require approval
     "Read",
     "Glob",
     "Grep",
-    "TodoWrite",
-    "TaskOutput",
     "LS",
-    // Codex toolset (snake_case) - tools that don't require approval
-    "read_file",
-    "list_dir",
-    "grep_files",
     "write_stdin",
-    "update_plan",
-    // Codex toolset (PascalCase) - tools that don't require approval
-    "ReadFile",
-    "ListDir",
-    "GrepFiles",
     "UpdatePlan",
-    // Gemini toolset (snake_case) - tools that don't require approval
-    "read_file_gemini",
-    "list_directory",
-    "glob_gemini",
-    "search_file_content",
-    "write_todos",
-    "read_many_files",
-    // Gemini toolset (PascalCase) - tools that don't require approval
-    "ReadFileGemini",
-    "ListDirectory",
-    "GlobGemini",
-    "SearchFileContent",
-    "WriteTodos",
-    "ReadManyFiles",
-    // Memory tools are constrained to the memfs repo and include their
-    // own path/read_only guardrails, so allow by default.
-    "memory",
-    "memory_apply_patch",
     // Channel sends are scoped by routing + parentScope checks in the tool.
     "MessageChannel",
+    // These only touch agent-owned state: the session task list, the
+    // ~/.letta/artifacts store, and prompts scheduled back to this agent.
+    "TaskCreate",
+    "TaskGet",
+    "TaskList",
+    "TaskUpdate",
+    "read_artifact_file",
+    "write_artifact_file",
+    "Wake",
+    "WatchPR",
+    "AskUserQuestion",
+    "AskUserQuestionAsync",
   ];
 
   if (autoAllowTools.includes(toolName)) {

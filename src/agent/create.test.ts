@@ -1,13 +1,15 @@
 import { describe, expect, test } from "bun:test";
 import {
   buildCreatedAgentTags,
-  resolveCreatedAgentMemfsConfig,
-} from "@/agent/create";
-import { GIT_MEMORY_ENABLED_TAG } from "@/agent/memory-git";
-import {
+  GIT_MEMORY_ENABLED_TAG,
   LETTA_CODE_ORIGIN_TAG,
   LETTA_CODE_SUBAGENT_TAG,
-} from "@/agent/system-prompt-versioning";
+} from "@/agent/agent-tags";
+import {
+  resolveCreatedAgentMemfsConfig,
+  resolveCreatedAgentSystemPrompt,
+} from "@/agent/create";
+import { buildSystemPrompt } from "@/agent/prompt-assets";
 
 const remoteMemfsBackend = { localMemfs: false, remoteMemfs: true } as const;
 const localMemfsBackend = { localMemfs: true, remoteMemfs: false } as const;
@@ -23,36 +25,123 @@ describe("created agent MemFS defaults", () => {
         capabilities: remoteMemfsBackend,
         isLettaCloud: true,
       }),
-    ).toEqual({ enableMemfs: true, memoryPromptMode: "memfs" });
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "root-memfs" });
   });
 
-  test("defaults to local MemFS on the local backend", () => {
+  test("defaults fresh local agents to the root MemFS layout", () => {
     expect(
       resolveCreatedAgentMemfsConfig({
         capabilities: localMemfsBackend,
         isLettaCloud: false,
       }),
-    ).toEqual({ enableMemfs: true, memoryPromptMode: "local-memfs" });
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "root-memfs" });
   });
 
-  test("keeps explicit MemFS disable on created agents", () => {
+  test("maps an explicit legacy local mode to the root layout for fresh agents", () => {
+    expect(
+      resolveCreatedAgentMemfsConfig({
+        capabilities: localMemfsBackend,
+        requestedMemoryPromptMode: "local-memfs",
+        isLettaCloud: false,
+      }),
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "root-memfs" });
+  });
+
+  test("maps an explicit memfs request to the root layout on Letta Cloud", () => {
     expect(
       resolveCreatedAgentMemfsConfig({
         capabilities: remoteMemfsBackend,
-        enableMemfs: false,
+        requestedMemoryPromptMode: "memfs",
         isLettaCloud: true,
+      }),
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "root-memfs" });
+  });
+
+  test("keeps an explicit memfs request on self-hosted servers", () => {
+    expect(
+      resolveCreatedAgentMemfsConfig({
+        capabilities: remoteMemfsBackend,
+        requestedMemoryPromptMode: "memfs",
+        isLettaCloud: false,
+      }),
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "memfs" });
+  });
+
+  test("subagents are stateless: no MemFS even on Letta Cloud", () => {
+    expect(
+      resolveCreatedAgentMemfsConfig({
+        capabilities: remoteMemfsBackend,
+        isLettaCloud: true,
+        isSubagent: true,
       }),
     ).toEqual({ enableMemfs: false, memoryPromptMode: "standard" });
   });
 
-  test("treats standard memory prompt mode as an opt-out", () => {
+  test("ignores standard memory prompt mode for regular agents (no opt-out)", () => {
     expect(
       resolveCreatedAgentMemfsConfig({
         capabilities: remoteMemfsBackend,
         requestedMemoryPromptMode: "standard",
         isLettaCloud: true,
       }),
+    ).toEqual({ enableMemfs: true, memoryPromptMode: "root-memfs" });
+  });
+
+  test("self-hosted servers without memfs support stay standard", () => {
+    expect(
+      resolveCreatedAgentMemfsConfig({
+        capabilities: remoteMemfsBackend,
+        isLettaCloud: false,
+      }),
     ).toEqual({ enableMemfs: false, memoryPromptMode: "standard" });
+  });
+});
+
+describe("created agent system prompt defaults", () => {
+  test("delegates the default prompt to Letta Cloud", async () => {
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: true,
+        memoryPromptMode: "memfs",
+      }),
+    ).resolves.toBeNull();
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: true,
+        systemPromptPreset: "default",
+        memoryPromptMode: "memfs",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("keeps explicit and non-Cloud prompts client-owned", async () => {
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: true,
+        systemPromptCustom: "Custom prompt",
+        memoryPromptMode: "memfs",
+      }),
+    ).resolves.toBe("Custom prompt");
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: true,
+        systemPromptCustom: "",
+        memoryPromptMode: "memfs",
+      }),
+    ).resolves.toBe("");
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: true,
+        systemPromptPreset: "letta",
+        memoryPromptMode: "memfs",
+      }),
+    ).resolves.toBe(buildSystemPrompt("letta", "memfs"));
+    await expect(
+      resolveCreatedAgentSystemPrompt({
+        isLettaCloud: false,
+        memoryPromptMode: "standard",
+      }),
+    ).resolves.toBe(buildSystemPrompt("default", "standard"));
   });
 });
 

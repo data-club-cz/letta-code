@@ -5,6 +5,10 @@ import {
   type SlackDefaultPermissionMode,
 } from "@/channels/types";
 import { migratePermissionMode } from "@/permissions/mode";
+import {
+  isValidSlackAllowBotsConfigValue,
+  normalizeSlackAllowBotsMode,
+} from "./bot-policy";
 
 const SLACK_CONFIG_KEYS = new Set([
   "bot_token",
@@ -15,6 +19,8 @@ const SLACK_CONFIG_KEYS = new Set([
   "transcribe_voice",
   "show_completed_reaction",
   "listen_mode",
+  "mention_only_channels",
+  "allow_bots",
 ]);
 
 function isString(value: unknown): value is string {
@@ -27,6 +33,10 @@ function isNullableString(value: unknown): value is string | null {
 
 function isBoolean(value: unknown): value is boolean {
   return value === true || value === false;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(isString);
 }
 
 function isDefaultPermissionMode(
@@ -62,7 +72,10 @@ export const slackAccountConfigAdapter: ChannelAccountConfigAdapter<SlackChannel
           isBoolean(config.transcribe_voice)) &&
         (config.show_completed_reaction === undefined ||
           isBoolean(config.show_completed_reaction)) &&
-        (config.listen_mode === undefined || isBoolean(config.listen_mode))
+        (config.listen_mode === undefined || isBoolean(config.listen_mode)) &&
+        (config.mention_only_channels === undefined ||
+          isStringArray(config.mention_only_channels)) &&
+        isValidSlackAllowBotsConfigValue(config.allow_bots)
       );
     },
 
@@ -84,12 +97,17 @@ export const slackAccountConfigAdapter: ChannelAccountConfigAdapter<SlackChannel
         transcribeVoice: isBoolean(config.transcribe_voice)
           ? config.transcribe_voice
           : undefined,
-        showCompletedReaction: isBoolean(config.show_completed_reaction)
-          ? config.show_completed_reaction
-          : undefined,
         listenMode: isBoolean(config.listen_mode)
           ? config.listen_mode
           : undefined,
+        mentionOnlyChannels: isStringArray(config.mention_only_channels)
+          ? [...config.mention_only_channels]
+          : undefined,
+        allowBots:
+          config.allow_bots !== undefined &&
+          isValidSlackAllowBotsConfigValue(config.allow_bots)
+            ? normalizeSlackAllowBotsMode(config.allow_bots)
+            : undefined,
       };
     },
 
@@ -102,8 +120,9 @@ export const slackAccountConfigAdapter: ChannelAccountConfigAdapter<SlackChannel
         default_permission_mode:
           account.defaultPermissionMode ?? DEFAULT_SLACK_PERMISSION_MODE,
         transcribe_voice: account.transcribeVoice === true,
-        show_completed_reaction: account.showCompletedReaction !== false,
         listen_mode: account.listenMode === true,
+        mention_only_channels: [...(account.mentionOnlyChannels ?? [])],
+        allow_bots: account.allowBots ?? false,
       };
     },
 
@@ -116,8 +135,9 @@ export const slackAccountConfigAdapter: ChannelAccountConfigAdapter<SlackChannel
         default_permission_mode:
           account.defaultPermissionMode ?? DEFAULT_SLACK_PERMISSION_MODE,
         transcribe_voice: account.transcribeVoice === true,
-        show_completed_reaction: account.showCompletedReaction !== false,
         listen_mode: account.listenMode === true,
+        mention_only_channels: [...(account.mentionOnlyChannels ?? [])],
+        allow_bots: account.allowBots ?? false,
       };
     },
 

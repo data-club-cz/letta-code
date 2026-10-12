@@ -3,7 +3,8 @@ export type ExperimentId =
   | "conversation_titles"
   | "desktop_conversation_bootstrap"
   | "diffs"
-  | "node"
+  | "memory_palace"
+  | "reflection_arena"
   | "tui_cron";
 
 export type ExperimentSource = "override" | "env" | "default";

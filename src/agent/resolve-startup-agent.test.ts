@@ -65,7 +65,7 @@ describe("resolveStartupTarget", () => {
         pinnedCount: 0,
       }),
     );
-    expect(result).toEqual({ action: "create" });
+    expect(result).toEqual({ action: "create", trigger: "fresh-start" });
   });
 
   test("dir with local LRU + valid agent → resumes local with conversation", () => {
@@ -85,7 +85,7 @@ describe("resolveStartupTarget", () => {
     });
   });
 
-  test("valid pinned agent takes priority over stale local LRU", () => {
+  test("valid project LRU takes priority over a pinned agent", () => {
     const result = resolveStartupTarget(
       makeInput({
         pinnedAgentId: "agent-pinned-123",
@@ -98,11 +98,12 @@ describe("resolveStartupTarget", () => {
     );
     expect(result).toEqual({
       action: "resume",
-      agentId: "agent-pinned-123",
+      agentId: "agent-last-used-456",
+      conversationId: "conv-stale-789",
     });
   });
 
-  test("valid pinned agent preserves conversation when it matches local LRU", () => {
+  test("project LRU preserves its conversation when the agent is also pinned", () => {
     const result = resolveStartupTarget(
       makeInput({
         pinnedAgentId: "agent-pinned-123",
@@ -120,7 +121,7 @@ describe("resolveStartupTarget", () => {
     });
   });
 
-  test("multiple existing pinned agents open selector before stale local LRU", () => {
+  test("project LRU resumes before the multiple-pin selector", () => {
     const result = resolveStartupTarget(
       makeInput({
         pinnedCount: 2,
@@ -130,7 +131,11 @@ describe("resolveStartupTarget", () => {
         localAgentExists: true,
       }),
     );
-    expect(result).toEqual({ action: "select" });
+    expect(result).toEqual({
+      action: "resume",
+      agentId: "agent-last-used-456",
+      conversationId: "conv-stale-789",
+    });
   });
 
   test("multiple pins but only one exists → resume that pin (stale pins ignored)", () => {
@@ -140,8 +145,8 @@ describe("resolveStartupTarget", () => {
         pinnedAgentExists: true,
         pinnedCount: 3,
         existingPinnedCount: 1,
-        localAgentId: "agent-last-used-456",
-        localAgentExists: true,
+        localAgentId: "agent-last-used-missing",
+        localAgentExists: false,
       }),
     );
     expect(result).toEqual({
@@ -219,7 +224,7 @@ describe("resolveStartupTarget", () => {
 
   test("true fresh user (no local, no global, no pinned) → create", () => {
     const result = resolveStartupTarget(makeInput());
-    expect(result).toEqual({ action: "create" });
+    expect(result).toEqual({ action: "create", trigger: "fresh-start" });
   });
 
   test("no LRU but pinned agents exist → select", () => {
@@ -241,7 +246,7 @@ describe("resolveStartupTarget", () => {
         forceNew: true,
       }),
     );
-    expect(result).toEqual({ action: "create" });
+    expect(result).toEqual({ action: "create", trigger: "force-new" });
   });
 
   test("needsModelPicker + no valid agents → select (not create)", () => {
@@ -304,7 +309,7 @@ describe("resolveStartupTarget", () => {
         pinnedCount: 0,
       }),
     );
-    expect(result).toEqual({ action: "create" });
+    expect(result).toEqual({ action: "create", trigger: "fresh-start" });
   });
 
   test("same local/global ID invalid + pinned → select", () => {

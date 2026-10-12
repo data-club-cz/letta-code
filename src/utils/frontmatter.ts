@@ -24,6 +24,49 @@ export function getStringField(
   return typeof val === "string" ? val : undefined;
 }
 
+function parseBlockScalar(
+  lines: string[],
+  style: "|" | ">",
+  chomping: "" | "+" | "-",
+): string {
+  const contentIndent = lines.reduce<number | null>((minimum, line) => {
+    if (!line.trim()) return minimum;
+    const indentation = line.length - line.trimStart().length;
+    return minimum === null ? indentation : Math.min(minimum, indentation);
+  }, null);
+  const deindented = lines.map((line) =>
+    line.trim() && contentIndent !== null ? line.slice(contentIndent) : "",
+  );
+
+  let value: string;
+  if (style === "|") {
+    value = deindented.join("\n");
+  } else {
+    let pendingBreaks = 0;
+    value = "";
+    for (const line of deindented) {
+      if (!line) {
+        pendingBreaks += 1;
+        continue;
+      }
+      if (value) {
+        value += pendingBreaks > 0 ? "\n".repeat(pendingBreaks) : " ";
+      } else if (pendingBreaks > 0) {
+        value += "\n".repeat(pendingBreaks);
+      }
+      value += line;
+      pendingBreaks = 0;
+    }
+    value += "\n".repeat(pendingBreaks);
+  }
+
+  if (chomping === "+") return `${value}\n`;
+  const withoutTrailingNewlines = value.replace(/\n+$/, "");
+  return chomping === "-"
+    ? withoutTrailingNewlines
+    : `${withoutTrailingNewlines}\n`;
+}
+
 /**
  * Parse frontmatter and content from a markdown file
  */
@@ -40,15 +83,15 @@ export function parseFrontmatter(content: string): {
     .replace(/\r\n/g, "\n")
     .replace(/\r/g, "\n");
 
-  const frontmatterRegex = /^---\n([\s\S]*?)\n---\n([\s\S]*)$/;
+  const frontmatterRegex = /^---\n([\s\S]*?)\n---(?:\n([\s\S]*))?$/;
   const match = normalized.match(frontmatterRegex);
 
-  if (!match || !match[1] || !match[2]) {
+  if (!match || match[1] === undefined) {
     return { frontmatter: {}, body: normalized };
   }
 
   const frontmatterText = match[1];
-  const body = match[2];
+  const body = match[2] ?? "";
   const frontmatter: Record<string, string | string[]> = {};
 
   // Parse YAML-like frontmatter (simple key: value pairs and arrays)
@@ -56,42 +99,66 @@ export function parseFrontmatter(content: string): {
   let currentKey: string | null = null;
   let currentArray: string[] = [];
 
-  for (const line of lines) {
-    // Check if this is an array item
-    if (line.trim().startsWith("-") && currentKey) {
-      const value = line.trim().slice(1).trim();
-      currentArray.push(value);
+  const savePendingKey = () => {
+    if (!currentKey) return;
+    frontmatter[currentKey] = currentArray.length > 0 ? currentArray : "";
+    currentKey = null;
+    currentArray = [];
+  };
+
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const line = lines[lineIndex] ?? "";
+    const trimmedLine = line.trim();
+    const indentation = line.length - line.trimStart().length;
+
+    if (indentation > 0) {
+      // Preserve the existing top-level string-array support without flattening
+      // nested YAML objects into the frontmatter record.
+      if (indentation <= 2 && trimmedLine.startsWith("-") && currentKey) {
+        const value = trimmedLine.slice(1).trim();
+        currentArray.push(value);
+      }
       continue;
     }
 
-    // If we were building an array, save it
-    if (currentKey && currentArray.length > 0) {
-      frontmatter[currentKey] = currentArray;
-      currentKey = null;
-      currentArray = [];
-    }
+    savePendingKey();
 
     const colonIndex = line.indexOf(":");
     if (colonIndex > 0) {
       const key = line.slice(0, colonIndex).trim();
       const value = line.slice(colonIndex + 1).trim();
-      currentKey = key;
+
+      const blockScalar = value.match(/^([|>])([+-]?)$/);
+      if (blockScalar?.[1]) {
+        const blockLines: string[] = [];
+        let blockLineIndex = lineIndex + 1;
+        for (; blockLineIndex < lines.length; blockLineIndex += 1) {
+          const blockLine = lines[blockLineIndex] ?? "";
+          if (blockLine.trim() && blockLine === blockLine.trimStart()) break;
+          blockLines.push(blockLine);
+        }
+        frontmatter[key] = parseBlockScalar(
+          blockLines,
+          blockScalar[1] as "|" | ">",
+          (blockScalar[2] ?? "") as "" | "+" | "-",
+        );
+        lineIndex = blockLineIndex - 1;
+        continue;
+      }
 
       if (value) {
         // Simple key: value pair
         frontmatter[key] = value;
-        currentKey = null;
       } else {
-        // Might be starting an array
+        // Might be starting an array. If no array items follow, this is an
+        // explicit empty scalar field.
+        currentKey = key;
         currentArray = [];
       }
     }
   }
 
-  // Save any remaining array
-  if (currentKey && currentArray.length > 0) {
-    frontmatter[currentKey] = currentArray;
-  }
+  savePendingKey();
 
   return { frontmatter, body: body.trim() };
 }
