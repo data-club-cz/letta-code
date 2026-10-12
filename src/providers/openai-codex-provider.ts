@@ -5,6 +5,10 @@
  */
 
 import { getBalanceMetadata } from "@/backend/api/metadata";
+import type { ChatGPTOAuthConfig } from "@/types/chatgpt-oauth";
+
+export type { ChatGPTOAuthConfig } from "@/types/chatgpt-oauth";
+
 import {
   createProvider,
   getProviderByName,
@@ -13,11 +17,12 @@ import {
   type ProviderResponse,
   updateProvider,
 } from "./byok-providers";
+import { OPENAI_CODEX_PROVIDER_NAME } from "./openai-codex-constants";
 
 export { listProviders };
 
 // Provider name constant for letta-code's ChatGPT OAuth provider
-export const OPENAI_CODEX_PROVIDER_NAME = "chatgpt-plus-pro";
+export { OPENAI_CODEX_PROVIDER_NAME };
 
 const CHATGPT_OAUTH_PROVIDER_NAME_PATTERN = /^[A-Za-z0-9._-]+$/;
 
@@ -37,17 +42,6 @@ export function normalizeChatGPTOAuthProviderName(
     );
   }
   return normalized;
-}
-
-/**
- * ChatGPT OAuth configuration persisted by the active provider store.
- */
-export interface ChatGPTOAuthConfig {
-  access_token: string;
-  id_token: string;
-  refresh_token?: string;
-  account_id: string;
-  expires_at: number; // Unix timestamp in milliseconds
 }
 
 interface EligibilityCheckResult {

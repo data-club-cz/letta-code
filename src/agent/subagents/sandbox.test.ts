@@ -1,4 +1,8 @@
 import { expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
   type WrapSubagentLauncherInput,
@@ -10,7 +14,9 @@ import {
   getDefaultAgentsTreeRoot,
 } from "@/permissions/sandbox-policy";
 import {
+  detectSandboxBackend,
   isFsSandboxEnabled,
+  isShellSandboxEnabled,
   type SandboxAvailability,
 } from "@/sandbox/availability";
 import { SANDBOX_ENV_VAR } from "@/sandbox/policy";
@@ -25,6 +31,44 @@ const LAUNCHER = {
   command: "bun",
   args: ["run", "src/index.ts", "--headless"],
 };
+
+test("sandboxed shell scratch files are writable while workspace writes stay denied", () => {
+  const availability = detectSandboxBackend();
+  if (!availability.backend) return;
+  const workspace = mkdtempSync(join(tmpdir(), "memory-sandbox-test-"));
+  try {
+    const result = wrapSubagentLauncher({
+      ...baseInput(),
+      availability,
+      launcher: {
+        command: process.execPath,
+        args: [
+          "-e",
+          `const fs = require('node:fs');
+           const path = require('node:path');
+           const scratch = fs.mkdtempSync(path.join(require('node:os').tmpdir(), 'letta-background-'));
+           try {
+             fs.writeFileSync(path.join(scratch, 'output.log'), 'shell output');
+             let denied = false;
+             try { fs.writeFileSync(${JSON.stringify(join(workspace, "forbidden"))}, 'no'); }
+             catch (error) { if (['EPERM', 'EACCES', 'EROFS'].includes(error.code)) denied = true; else throw error; }
+             if (!denied) throw new Error('Workspace write was allowed');
+           } finally { fs.rmSync(scratch, { recursive: true }); }`,
+        ],
+      },
+    });
+    if (!result) throw new Error("Expected sandbox launcher");
+    expect(() =>
+      execFileSync(result.command, result.args, {
+        env: { ...process.env, ...result.sandboxEnv },
+        cwd: workspace,
+        stdio: "pipe",
+      }),
+    ).not.toThrow();
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
 
 function baseInput(): WrapSubagentLauncherInput {
   return {
@@ -56,6 +100,19 @@ test("isFsSandboxEnabled is on by default and only an explicit off-switch disabl
   expect(isFsSandboxEnabled({ LETTA_FS_SANDBOX: "0" })).toBe(false);
   expect(isFsSandboxEnabled({ LETTA_FS_SANDBOX: "false" })).toBe(false);
   expect(isFsSandboxEnabled({ LETTA_FS_SANDBOX: "FALSE" })).toBe(false);
+});
+
+test("isShellSandboxEnabled is off by default and only an explicit on-switch enables it", () => {
+  // Default off (unset / empty): only memory subagents are sandboxed.
+  expect(isShellSandboxEnabled({})).toBe(false);
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "" })).toBe(false);
+  // Explicit off values stay off.
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "0" })).toBe(false);
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "false" })).toBe(false);
+  // Only the on-switch turns it on.
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "1" })).toBe(true);
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "true" })).toBe(true);
+  expect(isShellSandboxEnabled({ LETTA_FS_SANDBOX: "TRUE" })).toBe(true);
 });
 
 test("wraps an API subagent with the memory-subagent profile under the backend", () => {
@@ -132,4 +189,50 @@ test("returns null when there are no memory roots to scope to", () => {
       inheritedPrimaryRoot: null,
     }),
   ).toBeNull();
+});
+
+test("memoryScope confines a reflection subagent to an exact worktree plus git metadata", () => {
+  const result = wrapSubagentLauncher({
+    ...baseInput(),
+    memoryScope: {
+      primaryRoot: "/home/u/.letta/agents/parent/memory-worktrees/reflection-1",
+      writableRoots: [
+        "/home/u/.letta/agents/parent/memory-worktrees/reflection-1",
+        "/home/u/.letta/agents/parent/memory/.git",
+      ],
+      readonlyRoots: ["/home/u/.letta/agents/parent"],
+    },
+  });
+
+  expect(result).not.toBeNull();
+  expect(defineValues(result?.args ?? [], "-DWRITABLE_")).toEqual([
+    `0=${canonicalizeRoot("/home/u/.letta/agents/parent/memory-worktrees/reflection-1")}`,
+    `1=${canonicalizeRoot("/home/u/.letta/agents/parent/memory/.git")}`,
+  ]);
+  expect(
+    defineValues(result?.args ?? [], "-DREADONLY_").map((value) =>
+      value.replace(/^\d+=/, ""),
+    ),
+  ).toContain(canonicalizeRoot("/home/u/.letta/agents/parent"));
+});
+
+test("an inherited scratchpad outside ~/.letta stays writable", () => {
+  const parent = mkdtempSync(join(tmpdir(), "memory-sandbox-scratch-"));
+  const scratchpad = join(parent, "scratch");
+  try {
+    const result = wrapSubagentLauncher({
+      ...baseInput(),
+      scratchpadDir: scratchpad,
+    });
+    expect(result).not.toBeNull();
+    // Created up front so bwrap's --bind-try does not skip it.
+    expect(existsSync(scratchpad)).toBe(true);
+    expect(
+      defineValues(result?.args ?? [], "-DBASEWRITABLE_").map((value) =>
+        value.replace(/^\d+=/, ""),
+      ),
+    ).toContain(canonicalizeRoot(scratchpad));
+  } finally {
+    rmSync(parent, { recursive: true, force: true });
+  }
 });

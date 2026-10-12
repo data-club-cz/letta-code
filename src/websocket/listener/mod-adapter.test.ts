@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getScopedMemoryFilesystemRoot } from "@/agent/memory-filesystem";
 import { __testSetBackend } from "@/backend";
 import { FakeHeadlessBackend } from "@/backend/dev/fake-headless-backend";
 import {
@@ -13,6 +14,7 @@ import {
   getModToolDefinition,
   registerModTool,
 } from "@/mods/tool-registry";
+import { settingsManager } from "@/settings-manager";
 import {
   clearCapturedToolExecutionContexts,
   executeTool,
@@ -21,10 +23,13 @@ import { prepareToolExecutionContextForScope } from "@/tools/toolset";
 import {
   createListenerModAdapter,
   createListenerModContext,
+  createListenerModEvents,
   LISTENER_MOD_CAPABILITIES,
 } from "@/websocket/listener/mod-adapter";
 
 const tempRoots: string[] = [];
+const originalIsMemfsEnabled =
+  settingsManager.isMemfsEnabled.bind(settingsManager);
 
 function createTempDir(): string {
   const dir = mkdtempSync(join(tmpdir(), "letta-listener-mod-"));
@@ -33,6 +38,7 @@ function createTempDir(): string {
 }
 
 afterEach(() => {
+  settingsManager.isMemfsEnabled = originalIsMemfsEnabled;
   clearModTools();
   clearRegisteredPiProviders();
   clearCapturedToolExecutionContexts();
@@ -54,12 +60,13 @@ describe("listener mod adapter", () => {
         compact: false,
         llm: false,
       },
-      permissions: false,
+      permissions: true,
       providers: true,
       ui: {
         panels: false,
       },
     });
+    expect(createListenerModEvents([]).hasHandlers?.("tool_end")).toBe(false);
   });
 
   test("builds a listener-scoped mod context", () => {
@@ -111,6 +118,93 @@ describe("listener mod adapter", () => {
     });
     expect(context.permissionMode).toBe("standard");
     expect(context.toolset).toBe("default");
+  });
+
+  test("delivers UI notifications with the active invocation scope when panels are unavailable", async () => {
+    const root = createTempDir();
+    const modsDir = join(root, "mods");
+    const cacheDir = join(root, "cache");
+    mkdirSync(modsDir, { recursive: true });
+    writeFileSync(
+      join(modsDir, "notify.ts"),
+      `export default function activate(letta) {
+        letta.events.on("turn_start", (_event, ctx) => {
+          letta.ui.notify("Desktop-only message");
+        });
+      }`,
+    );
+
+    const notifications: Array<{
+      message: string;
+      agentId: string | null;
+      conversationId: string | null;
+    }> = [];
+    const adapter = createListenerModAdapter({
+      cacheDirectory: cacheDir,
+      globalModsDirectory: modsDir,
+      includeGlobalMods: true,
+      onNotification: (message, context) => {
+        notifications.push({
+          message,
+          agentId: context?.agent.id ?? null,
+          conversationId: context?.sessionId ?? null,
+        });
+      },
+    });
+    await adapter.reload();
+
+    const context = createListenerModContext({
+      agent: { id: "agent-123" },
+      sessionId: "conversation-456",
+    });
+    await adapter.events.emit(
+      "turn_start",
+      {
+        agentId: "agent-123",
+        conversationId: "conversation-456",
+        input: [],
+      },
+      context,
+    );
+
+    expect(notifications).toEqual([
+      {
+        message: "Desktop-only message",
+        agentId: "agent-123",
+        conversationId: "conversation-456",
+      },
+    ]);
+    adapter.dispose();
+  });
+
+  test("builds isolated agent MemFS roots", () => {
+    settingsManager.isMemfsEnabled = (agentId) => agentId !== "agent-disabled";
+
+    const agentAContext = createListenerModContext({
+      agent: { id: "agent-a" },
+    });
+    const agentBContext = createListenerModContext({
+      agent: { id: "agent-b" },
+    });
+
+    expect(agentAContext.memfs).toEqual({
+      enabled: true,
+      memoryDir: getScopedMemoryFilesystemRoot("agent-a"),
+    });
+    expect(agentBContext.memfs).toEqual({
+      enabled: true,
+      memoryDir: getScopedMemoryFilesystemRoot("agent-b"),
+    });
+    expect(agentAContext.memfs.memoryDir).not.toBe(
+      agentBContext.memfs.memoryDir,
+    );
+    expect(
+      createListenerModContext({ agent: { id: "agent-disabled" } }).memfs,
+    ).toEqual({ enabled: false, memoryDir: null });
+    expect(createListenerModContext().memfs).toEqual({
+      enabled: false,
+      memoryDir: null,
+    });
   });
 
   test("loads provider, tool, and command registrations without exposing events or panels", async () => {
@@ -506,7 +600,13 @@ describe("listener mod adapter", () => {
       sessionId: "tool-end-test",
       workingDirectory: root,
     });
-    await adapter.reload();
+    const reload = adapter.reload();
+    expect(adapter.events.hasHandlers?.("tool_end")).toBe(true);
+    await reload;
+    expect(adapter.events.hasHandlers?.("tool_end")).toBe(true);
+    expect(createListenerModEvents([adapter]).hasHandlers?.("tool_end")).toBe(
+      true,
+    );
 
     const context = createListenerModContext({
       sessionId: "conv-tool-end-test",

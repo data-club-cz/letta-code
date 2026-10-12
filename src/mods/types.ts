@@ -6,6 +6,7 @@ import type {
 } from "@letta-ai/letta-client/resources/agents/messages";
 import type { ChalkInstance } from "chalk";
 import type { ModelReasoningEffort } from "@/agent/model";
+import type { SubagentLifecycleContext } from "@/agent/subagent-state";
 
 export interface ModWorkspaceContext {
   cwd: string;
@@ -63,6 +64,7 @@ export interface ModBackgroundAgentContext {
   type: string;
   status: string;
   durationMs: number;
+  agentId: string | null;
 }
 
 export interface ModUiCapabilities {
@@ -95,6 +97,10 @@ export type ModConversationMessage = MessageCreate | ApprovalCreate;
 export interface ModConversationSendMessageOptions {
   background?: boolean;
   overrideModel?: string;
+  /**
+   * @deprecated Image normalization is always enforced at the send boundary.
+   * This option is retained as an ignored compatibility shim for existing mods.
+   */
   skipImageNormalization?: boolean;
   streamTokens?: boolean;
   workingDirectory?: string;
@@ -119,7 +125,7 @@ export interface ModUpdateLlmConfigOptions {
   /** Model handle, e.g. "anthropic/claude-opus-4-8". Omit to keep the current model. */
   model?: string;
   /** Reasoning effort tier. Omit to leave reasoning settings untouched. */
-  reasoningEffort?: ModelReasoningEffort;
+  reasoningEffort?: ModelReasoningEffort | null;
   /** Context window limit. Omit to leave the current limit untouched. */
   contextWindow?: number;
   /**
@@ -135,6 +141,8 @@ export interface ModConversationHandle {
     options?: ModConversationForkOptions,
   ) => Promise<ModConversationHandle>;
   getHistory: (options?: ModConversationHistoryOptions) => Promise<Message[]>;
+  /** Persist a new conversation title and refresh active local UI consumers. */
+  updateTitle?: (title: string) => Promise<void>;
   sendMessageStream: (
     messages: ModConversationMessage[],
     options?: ModConversationSendMessageOptions,
@@ -143,7 +151,7 @@ export interface ModConversationHandle {
   /**
    * Update the model, reasoning effort, and/or context window for this
    * conversation (or the agent default with scope: "agent"). Only the fields you
-   * pass change; others are preserved. Works for local and constellation agents.
+   * pass change; others are preserved. Works for local and cloud agents.
    */
   updateLlmConfig: (options: ModUpdateLlmConfigOptions) => Promise<void>;
 }
@@ -430,6 +438,7 @@ export interface ModContext {
   workspace: ModWorkspaceContext;
   cwd: string;
   sessionId: string | null;
+  conversationSummary: string | null;
   lastRunId: string | null;
   agent: ModAgentContext;
   model: ModModelContext;
@@ -443,6 +452,7 @@ export interface ModContext {
   reflection: ModReflectionContext;
   memfs: ModMemfsContext;
   backgroundAgents: ModBackgroundAgentContext[];
+  subagents: SubagentLifecycleContext;
 }
 
 export interface ModCommandContext extends ModInvocationContext {
@@ -466,6 +476,8 @@ export interface ModPanelRenderContext extends ModContext {
   row: (left: string, right: string, width: number) => string;
   /** Spread parts evenly across `width` (ANSI-aware). */
   columns: (parts: string[], width: number) => string;
+  /** Build a terminal hyperlink string. */
+  link: (label: string, url: string) => string;
   /** Chalk instance for coloring panel output. */
   chalk: ChalkInstance;
 }
@@ -474,9 +486,10 @@ export type ModPanelRender = (ctx: ModPanelRenderContext) => string | string[];
 
 /**
  * Panels are placed by a signed `order` around the input:
- * `> 0` renders above the input (highest at the top), `0` is the primary line
- * just below the input (overrides the built-in agent · model line), and `< 0`
- * stacks below the primary line. A panel whose render is empty is hidden.
+ * `> 1` renders above the input (highest at the top), `1` replaces the default
+ * product-status row, `0` is the primary line just below the input (overrides
+ * the built-in agent · model line), and `< 0` stacks below the primary line.
+ * A panel whose render is empty is hidden.
  */
 export interface ModPanelOptions {
   id: string;

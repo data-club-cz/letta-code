@@ -1,6 +1,7 @@
 import { Box } from "ink";
-import { Fragment, memo, type ReactNode } from "react";
+import { memo, type ReactNode } from "react";
 import { getSubagentByToolCallId } from "@/agent/subagent-state.js";
+import { parseAskUserQuestionReceipt } from "@/ask-user-question";
 import type { AdvancedDiffSuccess } from "@/cli/helpers/diff";
 import {
   formatArgsDisplay,
@@ -23,8 +24,10 @@ import {
   isTaskCrudTool,
   isTaskTool,
   isTodoTool,
+  isWorkflowTool,
 } from "@/cli/helpers/tool-name-mapping.js";
 import { formatUnifiedExecOutputForTui } from "@/cli/helpers/unified-exec-output.js";
+import { formatWorkflowLaunchLine } from "@/cli/helpers/workflow-display";
 import { INTERRUPTED_BY_USER } from "@/constants";
 import { listTasks } from "@/tools/impl/tasks/store.js";
 import { clipToolReturn } from "@/tools/manager.js";
@@ -38,59 +41,9 @@ function isQuestionTool(name: string): boolean {
   return name === "AskUserQuestion";
 }
 
-/**
- * Colorize tool args string with file paths, numbers, and labels.
- * Regex-based tokenizer that applies shell syntax palette colors.
- */
-function colorizeArgs(argsStr: string): ReactNode {
-  if (!argsStr) return null;
-
-  const palette = colors.shellSyntax;
-  const parts: ReactNode[] = [];
-  let lastIndex = 0;
-  let key = 0;
-
-  // Group 1: paths containing / (e.g. src/cli/foo.tsx, **/*.ts)
-  // Group 2: filenames with extension (e.g. foo.tsx, package.json)
-  // Group 3: labels before : (e.g. offset, limit)
-  // Group 4: standalone numbers (e.g. 50, 10)
-  const re =
-    /([\w.*?\-@~/]+\/[\w.*?\-@~/]*)|((?<=[(\s,])[\w.-]+\.\w{1,5}(?=[)\s,]|$))|(\w+)(?=\s*:)|(\b\d+\b)/g;
-
-  for (let m = re.exec(argsStr); m !== null; m = re.exec(argsStr)) {
-    if (m.index > lastIndex) {
-      parts.push(
-        <Fragment key={key++}>{argsStr.slice(lastIndex, m.index)}</Fragment>,
-      );
-    }
-
-    const color = m[1]
-      ? palette.string // path with /
-      : m[2]
-        ? palette.string // filename.ext
-        : m[3]
-          ? palette.comment // label (dimmed)
-          : palette.number; // number
-
-    parts.push(
-      <Text key={key++} color={color}>
-        {m[0]}
-      </Text>,
-    );
-    lastIndex = m.index + m[0].length;
-  }
-
-  if (lastIndex < argsStr.length) {
-    parts.push(<Fragment key={key++}>{argsStr.slice(lastIndex)}</Fragment>);
-  }
-
-  return <>{parts}</>;
-}
-
 import type { StreamingState } from "@/cli/helpers/accumulator";
 import { useTerminalWidth } from "@/cli/hooks/use-terminal-width";
 import { AdvancedDiffRenderer } from "./AdvancedDiffRenderer";
-import { BlinkDot } from "./BlinkDot.js";
 import { CollapsedOutputDisplay } from "./CollapsedOutputDisplay";
 import { colors } from "./colors.js";
 import {
@@ -98,13 +51,13 @@ import {
   MultiEditRenderer,
   WriteRenderer,
 } from "./DiffRenderer.js";
-import {
-  EnterWorktreeResultRenderer,
-  parseEnterWorktreeResult,
-} from "./EnterWorktreeResultRenderer.js";
 import { MarkdownDisplay } from "./MarkdownDisplay.js";
 import { MemoryDiffRenderer } from "./MemoryDiffRenderer.js";
 import { PlanRenderer } from "./PlanRenderer.js";
+import {
+  parseSendAgentMessageDisplay,
+  SendAgentMessageRenderer,
+} from "./SendAgentMessageRenderer";
 import { StreamingOutputDisplay } from "./StreamingOutputDisplay";
 import {
   clipStyledSpans,
@@ -112,6 +65,11 @@ import {
   type StyledSpan,
 } from "./SyntaxHighlightedCommand";
 import { TodoRenderer } from "./TodoRenderer.js";
+import { colorizeArgs, ToolCallHeader } from "./ToolCallHeader";
+import {
+  hasWorktreeResultRenderer,
+  WorktreeToolResult,
+} from "./WorktreeResultRenderer.js";
 
 const LIVE_SHELL_ARGS_MAX_LINES = 2;
 
@@ -193,6 +151,19 @@ export const ToolCallMessage = memo(
         // Finished Task tools render here (both success and error)
       }
 
+      if (rawName === "SendAgentMessage") {
+        const display = parseSendAgentMessageDisplay(line);
+        if (display) {
+          return (
+            <SendAgentMessageRenderer
+              display={display}
+              phase={line.phase}
+              isStreaming={isStreaming}
+            />
+          );
+        }
+      }
+
       // Apply tool name remapping
       let displayName = getDisplayToolName(rawName);
 
@@ -217,7 +188,9 @@ export const ToolCallMessage = memo(
       // For AskUserQuestion, show friendly header only after completion
       if (isQuestionTool(rawName)) {
         if (line.phase === "finished" && line.resultOk !== false) {
-          displayName = "User answered Letta Code's questions:";
+          displayName = parseAskUserQuestionReceipt(line.resultText)
+            ? "Questions posted"
+            : "User answered Letta Code's questions:";
         } else {
           displayName = "Asking user questions...";
         }
@@ -232,6 +205,7 @@ export const ToolCallMessage = memo(
       let args: ReactNode = null;
       let shellCommand: string | null = null;
       let shellSemanticKind: "read" | "list" | "search" | "run" | null = null;
+      let hasShellDescription = false;
       if (!isQuestionTool(rawName)) {
         const parseArgs = (): {
           formatted: ReturnType<typeof formatArgsDisplay> | null;
@@ -277,7 +251,13 @@ export const ToolCallMessage = memo(
           if (formattedArgs.shellSemantic) {
             shellSemanticKind = formattedArgs.shellSemantic.kind;
             displayName = formattedArgs.shellSemantic.label;
-            if (formattedArgs.shellSemantic.kind === "run") {
+            hasShellDescription =
+              typeof formattedArgs.parsed.description === "string" &&
+              formattedArgs.parsed.description.trim().length > 0;
+            if (
+              formattedArgs.shellSemantic.kind === "run" &&
+              !hasShellDescription
+            ) {
               shellCommand = formattedArgs.shellSemantic.rawCommand;
             }
           } else if (formattedArgs.displayName) {
@@ -301,6 +281,7 @@ export const ToolCallMessage = memo(
         !shellCommand &&
         isShellTool(rawName) &&
         argsText.trim() &&
+        !hasShellDescription &&
         (shellSemanticKind === null || shellSemanticKind === "run")
       ) {
         try {
@@ -337,28 +318,6 @@ export const ToolCallMessage = memo(
         shellContinuationLines = visibleLines.slice(1);
       }
 
-      // If name exceeds available width, fall back to simple wrapped rendering
-      const fallback = displayName.length >= rightWidth;
-
-      const dotColor = (() => {
-        switch (line.phase) {
-          case "streaming":
-            return colors.tool.streaming;
-          case "ready":
-            return colors.tool.pending;
-          case "running":
-            return colors.tool.running;
-          case "finished":
-            return line.resultOk === false
-              ? colors.tool.error
-              : colors.tool.completed;
-          default:
-            return undefined;
-        }
-      })();
-      const dotShouldAnimate =
-        line.phase === "running" || (line.phase === "ready" && !isStreaming);
-
       // Extract display text from tool result (handles JSON responses)
       const extractMessageFromResult = (text: string): string => {
         try {
@@ -377,7 +336,6 @@ export const ToolCallMessage = memo(
         return text;
       };
 
-      // Format result for display
       const getResultElement = () => {
         if (!line.resultText) return null;
 
@@ -386,7 +344,6 @@ export const ToolCallMessage = memo(
         const prefixWidth = 5; // Total width of prefix
         const contentWidth = Math.max(0, columns - prefixWidth);
 
-        // Special cases from old ToolReturnBlock (check before truncation)
         if (line.resultText === "Running...") {
           return (
             <Box flexDirection="row">
@@ -415,12 +372,12 @@ export const ToolCallMessage = memo(
           );
         }
 
-        // Truncate the result text for display (UI only, API gets full response)
-        // Strip trailing newlines to avoid extra visual spacing (e.g., from bash echo)
-        const displayResultText = clipToolReturn(extractedText).replace(
-          /\n+$/,
-          "",
-        );
+        // Clip for display only (the API gets the full text). Workflow launches
+        // show a one-line summary instead of the model-facing task notes.
+        const displayResultText =
+          (isWorkflowTool(rawName) &&
+            formatWorkflowLaunchLine(extractedText)) ||
+          clipToolReturn(extractedText).replace(/\n+$/, "");
 
         // Check if this is a todo_write tool with successful result
         if (
@@ -492,7 +449,7 @@ export const ToolCallMessage = memo(
           }
         }
 
-        // Check if this is an update_plan tool with successful result
+        // Check if this is an UpdatePlan tool with successful result
         if (
           isPlanTool(rawName, displayName) &&
           line.resultOk !== false &&
@@ -577,12 +534,12 @@ export const ToolCallMessage = memo(
           // Fall through to regular handling if parsing fails
         }
 
-        // Check if this is EnterWorktree - show a compact structured summary
-        // instead of the full instructional tool return.
-        if (rawName === "EnterWorktree" && line.resultOk !== false) {
-          if (parseEnterWorktreeResult(extractedText)) {
-            return <EnterWorktreeResultRenderer resultText={extractedText} />;
-          }
+        // Worktree tools show a compact structured summary instead of the
+        // full instructional tool return.
+        if (hasWorktreeResultRenderer(rawName, extractedText, line.resultOk)) {
+          return (
+            <WorktreeToolResult toolName={rawName} resultText={extractedText} />
+          );
         }
 
         // Check if this is a file edit tool - show diff instead of success message
@@ -599,45 +556,7 @@ export const ToolCallMessage = memo(
             const parsedArgs = JSON.parse(line.argsText);
             const filePath = parsedArgs.file_path || "";
 
-            // Use AdvancedDiffRenderer if we have a precomputed diff
-            if (diff) {
-              // Multi-edit: has edits array
-              if (parsedArgs.edits && Array.isArray(parsedArgs.edits)) {
-                const edits = parsedArgs.edits.map(
-                  (e: {
-                    old_string?: string;
-                    new_string?: string;
-                    replace_all?: boolean;
-                  }) => ({
-                    old_string: e.old_string || "",
-                    new_string: e.new_string || "",
-                    replace_all: e.replace_all,
-                  }),
-                );
-                return (
-                  <AdvancedDiffRenderer
-                    precomputed={diff}
-                    kind="multi_edit"
-                    filePath={filePath}
-                    edits={edits}
-                  />
-                );
-              }
-              // Single edit
-              return (
-                <AdvancedDiffRenderer
-                  precomputed={diff}
-                  kind="edit"
-                  filePath={filePath}
-                  oldString={parsedArgs.old_string || ""}
-                  newString={parsedArgs.new_string || ""}
-                  replaceAll={parsedArgs.replace_all}
-                />
-              );
-            }
-
-            // Fallback to simple renderers when no precomputed diff
-            // Multi-edit: has edits array
+            // MultiEdit (removed tool) calls in older transcripts: edits array
             if (parsedArgs.edits && Array.isArray(parsedArgs.edits)) {
               const edits = parsedArgs.edits.map(
                 (e: { old_string?: string; new_string?: string }) => ({
@@ -654,6 +573,21 @@ export const ToolCallMessage = memo(
               );
             }
 
+            // Use AdvancedDiffRenderer if we have a precomputed diff
+            if (diff) {
+              return (
+                <AdvancedDiffRenderer
+                  precomputed={diff}
+                  kind="edit"
+                  filePath={filePath}
+                  oldString={parsedArgs.old_string || ""}
+                  newString={parsedArgs.new_string || ""}
+                  replaceAll={parsedArgs.replace_all}
+                />
+              );
+            }
+
+            // Fallback to simple renderers when no precomputed diff
             // Single edit: has old_string/new_string
             if (parsedArgs.old_string !== undefined) {
               return (
@@ -964,60 +898,18 @@ export const ToolCallMessage = memo(
 
       return (
         <Box flexDirection="column">
-          {/* Tool call with exact wrapping logic from old codebase */}
-          <Box flexDirection="row">
-            <Box width={2} flexShrink={0}>
-              <BlinkDot color={dotColor} shouldAnimate={dotShouldAnimate} />
-              <Text></Text>
-            </Box>
-            <Box flexGrow={1} width={rightWidth}>
-              {fallback ? (
-                <Text wrap="wrap">
-                  {isMemoryTool(rawName) ? (
-                    <>
-                      <Text bold color={colors.tool.memoryName}>
-                        {displayName}{" "}
-                      </Text>
-                      {args}
-                    </>
-                  ) : (
-                    <>
-                      <Text bold>{displayName} </Text>
-                      {args}
-                    </>
-                  )}
-                </Text>
-              ) : (
-                <Box flexDirection="row">
-                  <Text
-                    bold
-                    color={
-                      isMemoryTool(rawName) ? colors.tool.memoryName : undefined
-                    }
-                  >
-                    {displayName}{" "}
-                  </Text>
-                  {shellFirstLineSpans ? (
-                    <Box
-                      flexGrow={1}
-                      width={Math.max(0, rightWidth - displayName.length - 1)}
-                    >
-                      <Text color={colors.shellSyntax.text}>
-                        {renderSpans(shellFirstLineSpans)}
-                      </Text>
-                    </Box>
-                  ) : args ? (
-                    <Box
-                      flexGrow={1}
-                      width={Math.max(0, rightWidth - displayName.length - 1)}
-                    >
-                      <Text wrap="wrap">{args}</Text>
-                    </Box>
-                  ) : null}
-                </Box>
-              )}
-            </Box>
-          </Box>
+          <ToolCallHeader
+            name={displayName}
+            args={args}
+            shellArgs={
+              shellFirstLineSpans ? renderSpans(shellFirstLineSpans) : undefined
+            }
+            columns={columns}
+            phase={line.phase}
+            resultOk={line.resultOk}
+            isStreaming={isStreaming}
+            isMemory={isMemoryTool(rawName)}
+          />
 
           {/* Shell command continuation lines with │ prefix */}
           {shellContinuationLines.map((spans) => {

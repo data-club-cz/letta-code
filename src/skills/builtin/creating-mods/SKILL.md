@@ -118,7 +118,7 @@ Agents can inspect local mod diagnostics at:
 ## Rules
 
 - Do not create project mods.
-- Custom provider mods are local-backend/local-agent only. They do not add providers for Constellation/cloud agents.
+- Custom provider mods are local-backend/local-agent only. They do not add providers for agents managed through the Letta API.
 - Provider mods may run in a provider-only listener context; keep provider registration independent from commands/tools/UI and guard everything else.
 - Direct mod files should not assume third-party npm packages are available. Use Node/Bun built-ins unless packaging is explicitly requested.
 - Do not do surprising side effects on startup; mods activate on app start and `/reload`.
@@ -155,7 +155,7 @@ Before finishing, verify:
 | `references/providers.md` | Adding a custom model/API provider for local agents |
 | `references/events.md` | Reacting to lifecycle/tool/turn events or transforming turns/tools |
 | `references/permissions.md` | Enforcing dynamic tool allow/ask/deny policy before approval/execution |
-| `references/ui.md` | Panels (including order-0 statusline) or `ui.panels` capability guards are involved |
+| `references/ui.md` | Panels (including order-0 statusline and order-1 dreaming indicator) or `ui.panels` capability guards are involved |
 | `references/plan-mode.md` | Recreating plan mode with commands, tools, events, permissions, and local state |
 | `references/analysis-mode.md` | Phrase-triggered diagnostic mode with turn reminders (simpler than plan-mode) |
 | `references/architecture.md` | Multiple capabilities, local state, cleanup, background model work, or non-trivial composition |

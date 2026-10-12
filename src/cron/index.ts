@@ -5,6 +5,8 @@ export {
   type CancelReason,
   type CronRunOutcome,
   type CronRunReason,
+  type CronSchedulerScope,
+  type CronStateChangeResult,
   type CronTask,
   type CronTaskStatus,
   claimSchedulerLease,
@@ -15,10 +17,15 @@ export {
   getActiveTasks,
   getCronFileMtime,
   getTask,
+  hasLiveSchedulerOwner,
   isProcessAlive,
   listTasks,
+  pauseTask,
   readCronFile,
+  recordTaskQueued,
+  refreshSchedulerLease,
   releaseSchedulerLease,
+  resumeTask,
   type SchedulerOwner,
   updateTask,
   verifySchedulerLease,
@@ -33,6 +40,7 @@ export {
   type ParsedInterval,
   parseAt,
   parseEvery,
+  parseRfc3339Timestamp,
 } from "./parse-interval";
 export {
   appendCronRunLog,
@@ -49,7 +57,12 @@ export {
   safeAppendCronRunLogForTask,
 } from "./run-log";
 export {
+  type CronPromptTiming,
+  formatCronPrompt,
+  formatTimezoneQualifiedIso,
+  getIntendedCronOccurrence,
   handleMissedOneShot,
+  handleTaskPreflight,
   shouldFireTask,
   wrapCronPrompt,
 } from "./scheduler";

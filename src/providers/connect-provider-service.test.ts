@@ -3,6 +3,8 @@ import type { ProviderResponse } from "@/backend/api/providers";
 import type { ByokProvider } from "@/providers/byok-providers";
 import {
   buildConnectProviderEntries,
+  resolveChatGPTOAuthConnection,
+  resolveConnectProviderOAuth,
   resolveProviderConnectionFields,
 } from "@/providers/connect-provider-service";
 
@@ -232,11 +234,112 @@ describe("connect provider service", () => {
         label: "AWS Access Keys",
         description: "Enter access keys manually",
         fields: [
-          { key: "accessKey", label: "Access key" },
-          { key: "apiKey", label: "Secret key", secret: true },
+          { key: "accessKey", label: "Access key", required: true },
+          {
+            key: "apiKey",
+            label: "Secret key",
+            secret: true,
+            required: true,
+          },
         ],
       },
     ]);
+  });
+
+  test("serializes custom OpenAI-compatible fields", () => {
+    const providers: ByokProvider[] = [
+      {
+        id: "openai-compatible",
+        displayName: "OpenAI-compatible API",
+        description: "Connect an OpenAI-compatible endpoint",
+        providerType: "openai",
+        providerName: "lc-openai-compatible",
+        fields: [
+          { key: "apiKey", label: "API Key", secret: true },
+          {
+            key: "baseUrl",
+            label: "Base URL",
+            placeholder: "https://proxy.example.com/v1",
+          },
+        ],
+      },
+    ];
+
+    const entries = buildConnectProviderEntries(providers, new Map(), "api");
+
+    expect(entries[0]?.fields).toEqual([
+      { key: "apiKey", label: "API Key", secret: true, required: true },
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "https://proxy.example.com/v1",
+        required: true,
+      },
+    ]);
+  });
+
+  test("serializes optional fields as not required", () => {
+    const providers: ByokProvider[] = [
+      {
+        id: "ollama",
+        displayName: "Ollama (local)",
+        description: "Connect Ollama",
+        providerType: "ollama",
+        providerName: "ollama",
+        requiresApiKey: false,
+        defaultApiKey: "not-needed",
+        fields: [
+          {
+            key: "baseUrl",
+            label: "Base URL",
+            placeholder: "http://localhost:11434/v1",
+            required: false,
+          },
+          { key: "apiKey", label: "API Key", secret: true, required: false },
+        ],
+      },
+    ];
+
+    const entries = buildConnectProviderEntries(providers, new Map(), "local");
+
+    expect(entries[0]?.fields).toEqual([
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "http://localhost:11434/v1",
+        required: false,
+      },
+      { key: "apiKey", label: "API Key", secret: true, required: false },
+    ]);
+  });
+
+  test("resolves optional-field providers without any input", () => {
+    const provider: ByokProvider = {
+      id: "ollama",
+      displayName: "Ollama (local)",
+      description: "Connect Ollama",
+      providerType: "ollama",
+      providerName: "ollama",
+      requiresApiKey: false,
+      defaultApiKey: "not-needed",
+      fields: [
+        { key: "baseUrl", label: "Base URL", required: false },
+        { key: "apiKey", label: "API Key", secret: true, required: false },
+      ],
+    };
+
+    expect(resolveProviderConnectionFields(provider, { fields: {} })).toEqual({
+      apiKey: "not-needed",
+      options: {},
+    });
+    expect(
+      resolveProviderConnectionFields(provider, {
+        fields: { baseUrl: " http://192.168.1.20:11434/v1 " },
+      }),
+    ).toEqual({
+      apiKey: "not-needed",
+      options: { baseURL: "http://192.168.1.20:11434/v1" },
+    });
   });
 
   test("resolves simple API key fields for saving", () => {
@@ -323,6 +426,52 @@ describe("connect provider service", () => {
     ).toThrow("uses OAuth");
   });
 
+  test("accepts completed ChatGPT OAuth credentials with a provider alias", () => {
+    const provider: ByokProvider = {
+      id: "codex",
+      displayName: "ChatGPT / Codex plan",
+      description: "Connect ChatGPT",
+      providerType: "chatgpt_oauth",
+      providerName: "chatgpt-plus-pro",
+      isOAuth: true,
+    };
+    const oauthConfig = {
+      access_token: "access-token",
+      id_token: "id-token",
+      refresh_token: "refresh-token",
+      account_id: "account-id",
+      expires_at: 1_800_000_000_000,
+    };
+
+    expect(
+      resolveChatGPTOAuthConnection(provider, {
+        providerName: "chatgpt-work",
+        oauthConfig,
+      }),
+    ).toEqual({ providerName: "chatgpt-work", oauthConfig });
+  });
+
+  test("rejects ChatGPT OAuth credentials for another provider", () => {
+    const provider: ByokProvider = {
+      id: "anthropic",
+      displayName: "Claude API",
+      description: "Connect Claude API",
+      providerType: "anthropic",
+      providerName: "lc-anthropic",
+    };
+
+    expect(() =>
+      resolveChatGPTOAuthConnection(provider, {
+        oauthConfig: {
+          access_token: "access-token",
+          id_token: "id-token",
+          account_id: "account-id",
+          expires_at: 1_800_000_000_000,
+        },
+      }),
+    ).toThrow("does not accept ChatGPT OAuth");
+  });
+
   test("requires all selected auth method fields", () => {
     const provider: ByokProvider = {
       id: "bedrock",
@@ -349,5 +498,142 @@ describe("connect provider service", () => {
         fields: { profile: "default" },
       }),
     ).toThrow("Missing AWS Region");
+  });
+});
+
+describe("subscription OAuth token connections", () => {
+  const xaiProvider: ByokProvider = {
+    id: "xai",
+    displayName: "xAI (Grok/X subscription)",
+    description: "Connect a subscription account",
+    providerType: "xai",
+    providerName: "xai",
+    providerNames: ["xai", "lc-xai-local"],
+    isOAuth: true,
+    oauthProviderId: "xai",
+  };
+  const tokens = {
+    type: "oauth" as const,
+    access: "access-token",
+    refresh: "refresh-token",
+    expires: 2_000_000_000_000,
+  };
+
+  test("resolves tokens for a local OAuth provider", () => {
+    expect(
+      resolveConnectProviderOAuth(
+        xaiProvider,
+        { oauthConfig: tokens },
+        "local",
+      ),
+    ).toEqual({
+      kind: "tokens",
+      providerName: "xai",
+      providerType: "xai",
+      credentials: tokens,
+    });
+  });
+
+  test("keeps ChatGPT credentials on the ChatGPT branch", () => {
+    const chatgptProvider: ByokProvider = {
+      id: "openai-codex-oauth",
+      displayName: "OpenAI (ChatGPT Plus/Pro)",
+      description: "Connect a subscription account",
+      providerType: "chatgpt_oauth",
+      providerName: "chatgpt-plus-pro",
+      isOAuth: true,
+      oauthProviderId: "openai-codex",
+    };
+    const oauthConfig = {
+      access_token: "access-token",
+      id_token: "id-token",
+      refresh_token: "refresh-token",
+      account_id: "account-id",
+      expires_at: 1_800_000_000_000,
+    };
+
+    expect(
+      resolveConnectProviderOAuth(chatgptProvider, { oauthConfig }, "local"),
+    ).toEqual({
+      kind: "chatgpt",
+      providerName: "chatgpt-plus-pro",
+      oauthConfig,
+    });
+  });
+
+  test("accepts a provider alias but rejects an unknown local name", () => {
+    expect(
+      resolveConnectProviderOAuth(
+        xaiProvider,
+        { providerName: "lc-xai-local", oauthConfig: tokens },
+        "local",
+      ),
+    ).toMatchObject({ providerName: "lc-xai-local" });
+
+    expect(() =>
+      resolveConnectProviderOAuth(
+        xaiProvider,
+        { providerName: "grok-personal", oauthConfig: tokens },
+        "local",
+      ),
+    ).toThrow('does not support the provider name "grok-personal"');
+  });
+
+  test("refuses to write raw tokens to Cloud provider storage", () => {
+    expect(() =>
+      resolveConnectProviderOAuth(xaiProvider, { oauthConfig: tokens }, "api"),
+    ).toThrow("only be saved to local provider storage");
+  });
+
+  test("refuses tokens for an API-key provider", () => {
+    const apiKeyProvider: ByokProvider = {
+      id: "xai-api",
+      displayName: "xAI API",
+      description: "Connect an xAI API key",
+      providerType: "xai",
+      providerName: "lc-xai-key",
+    };
+
+    expect(() =>
+      resolveConnectProviderOAuth(
+        apiKeyProvider,
+        { oauthConfig: tokens },
+        "local",
+      ),
+    ).toThrow("does not accept subscription OAuth tokens");
+  });
+
+  test("refuses a bare token bundle for ChatGPT", () => {
+    const chatgptProvider: ByokProvider = {
+      id: "openai-codex-oauth",
+      displayName: "OpenAI (ChatGPT Plus/Pro)",
+      description: "Connect a subscription account",
+      providerType: "chatgpt_oauth",
+      providerName: "chatgpt-plus-pro",
+      isOAuth: true,
+      oauthProviderId: "openai-codex",
+    };
+
+    expect(() =>
+      resolveConnectProviderOAuth(
+        chatgptProvider,
+        { oauthConfig: tokens },
+        "local",
+      ),
+    ).toThrow("requires a ChatGPT OAuth config");
+  });
+
+  test("requires credentials before a provider name override", () => {
+    expect(() =>
+      resolveConnectProviderOAuth(
+        xaiProvider,
+        { providerName: "xai" },
+        "local",
+      ),
+    ).toThrow("providerName requires OAuth credentials");
+  });
+
+  test("returns null when no OAuth credentials were sent", () => {
+    expect(resolveConnectProviderOAuth(xaiProvider, {}, "local")).toBeNull();
   });
 });

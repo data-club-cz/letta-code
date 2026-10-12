@@ -1,8 +1,15 @@
 // src/cli/commands/registry.ts
 // Registry of available CLI commands
 
+import {
+  type DreamCommandScope,
+  requestCloudReflectionRun,
+} from "@/agent/reflection-runs";
+import { renderWorkflowTree } from "@/cli/helpers/workflow-display";
+import { listWorkflowExecutions } from "@/tools/workflow/execution-registry";
 import { handleMemoryRepositoryCommand } from "./memory-repository";
 import { handleSecretCommand } from "./secret";
+import { handleSystemRemindersCommand } from "./system-reminders";
 
 type CommandHandlerResult =
   | string
@@ -13,6 +20,7 @@ type CommandHandlerResult =
 
 type CommandHandler = (
   args: string[],
+  scope?: DreamCommandScope,
 ) => Promise<CommandHandlerResult> | CommandHandlerResult;
 
 interface Command {
@@ -22,6 +30,20 @@ interface Command {
   hidden?: boolean; // Hidden commands don't show in autocomplete but still work
   order?: number; // Lower numbers appear first in autocomplete (default: 100)
   noArgs?: boolean; // If true, reject any arguments passed to this command
+}
+
+async function handleReflectionCommand(
+  args: string[],
+  scope?: DreamCommandScope,
+) {
+  if (!scope) throw new Error("Reflection requires an active agent.");
+  const output = await requestCloudReflectionRun(scope, args.join(" "));
+  // Code-managed reflection needs the TUI/listener runtime, not this registry.
+  if (output === null)
+    throw new Error(
+      "Run this command in the TUI or listener to launch Code-managed reflection.",
+    );
+  return output;
 }
 
 export const commands: Record<string, Command> = {
@@ -53,47 +75,39 @@ export const commands: Record<string, Command> = {
     },
   },
   "/doctor": {
-    desc: "Audit and refine your memory structure",
+    desc: "Investigate an agent issue in this conversation",
     order: 12.1,
-    noArgs: true,
+    args: "[symptom]",
     handler: () => {
-      // Handled specially in App.tsx to send doctor prompt
-      return "Running memory doctor...";
+      // Handled by the primary-agent turn in the TUI and listener.
+      return "Starting doctor...";
     },
   },
-  "/remember": {
-    desc: "Remember something from the conversation (/remember [instructions])",
-    order: 13,
-    handler: () => {
-      // Handled specially in App.tsx to trigger memory update
-      return "Processing memory request...";
-    },
-  },
-  "/goal": {
-    desc: "Manage goal: /goal [status|pause|resume|complete|clear|disable|--replace|--token-budget N <objective>]",
-    args: "[status|pause|resume|complete|clear|disable|--replace|--token-budget N <objective>]",
-    order: 14,
-    handler: () => {
-      // Handled specially in App.tsx
-      return "Managing conversation goal...";
-    },
+  "/dream": {
+    desc: "Reflect on memory (alias for /reflect; Cloud reflects this conversation)",
+    order: 49,
+    args: "[--recent N | --conversation ID ... | --auto] [--instruction TEXT]",
+    handler: handleReflectionCommand,
   },
   "/reflect": {
     desc: "Launch reflection (/reflect [--recent N | --conversation ID ... | --auto] [--instruction TEXT])",
     args: "[--recent N | --conversation ID ... | --auto] [--instruction TEXT]",
     order: 50,
-    handler: () => {
-      // Handled specially in App.tsx
-      return "Launching reflection agent...";
-    },
+    handler: handleReflectionCommand,
   },
   "/reflection": {
     desc: "Alias for /reflect",
-    args: "[transcript_file]",
+    args: "[--recent N | --conversation ID ... | --auto] [--instruction TEXT]",
     hidden: true,
+    handler: handleReflectionCommand,
+  },
+  "/reflect-arena": {
+    desc: "Experimental blind A/B reflection model comparison",
+    args: "[--model-a MODEL] [--model-b MODEL] | resume <run-id> | choose <run-id> <1|2|tie> [notes]",
+    order: 50.1,
     handler: () => {
       // Handled specially in App.tsx
-      return "Launching reflection agent...";
+      return "Preparing reflection arena...";
     },
   },
   "/skills": {
@@ -132,7 +146,7 @@ export const commands: Record<string, Command> = {
     },
   },
   "/sleeptime": {
-    desc: "Configure sleep-time reflection trigger settings",
+    desc: "Configure sleep-time reflection trigger and merge settings",
     order: 15.5,
     noArgs: true,
     handler: () => {
@@ -159,7 +173,7 @@ export const commands: Record<string, Command> = {
     },
   },
   "/memfs": {
-    desc: "Manage filesystem-backed memory (/memfs [enable|disable|sync|reset])",
+    desc: "Manage filesystem-backed memory (/memfs [enable|sync|reset])",
     args: "[enable|disable|sync|reset]",
     order: 27.5, // Advanced feature, near /toolset
     handler: () => {
@@ -191,6 +205,15 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to reset agent messages
       return "Clearing in-context messages...";
+    },
+  },
+  "/clear-messages": {
+    desc: "Reset all agent messages (destructive)",
+    hidden: true,
+    noArgs: true,
+    handler: () => {
+      // Handled specially in App.tsx to reset agent messages
+      return "Resetting agent messages...";
     },
   },
   "/chdir": {
@@ -269,15 +292,6 @@ export const commands: Record<string, Command> = {
     handler: () => {
       // Handled specially in App.tsx to access agent ID and client
       return "Updating description...";
-    },
-  },
-  "/export": {
-    desc: "Export AgentFile (.af)",
-    order: 26,
-    noArgs: true,
-    handler: () => {
-      // Handled specially in App.tsx to access agent ID and client
-      return "Exporting agent file...";
     },
   },
   "/toolset": {
@@ -457,6 +471,12 @@ export const commands: Record<string, Command> = {
       return "Managing reasoning Tab shortcut...";
     },
   },
+  "/system-reminders": {
+    desc: "Show or hide system reminders",
+    args: "[on|off|status]",
+    order: 36.8,
+    handler: (args: string[]) => handleSystemRemindersCommand(args),
+  },
   "/terminal": {
     desc: "Setup terminal shortcuts [--revert]",
     order: 37,
@@ -542,6 +562,18 @@ export const commands: Record<string, Command> = {
       return "Showing background processes...";
     },
   },
+  "/workflows": {
+    desc: "Show workflow runs, their agents, and token usage",
+    order: 42.5,
+    noArgs: true,
+    handler: () => {
+      const executions = listWorkflowExecutions();
+      if (executions.length === 0) {
+        return "No workflow runs in this session";
+      }
+      return executions.flatMap(renderWorkflowTree).join("\n");
+    },
+  },
   "/exit": {
     desc: "Exit this session",
     order: 43,
@@ -552,7 +584,7 @@ export const commands: Record<string, Command> = {
     },
   },
   "/login": {
-    desc: "Sign in to Letta Constellation",
+    desc: "Sign in with Letta",
     order: 43,
     noArgs: true,
     handler: () => {
@@ -640,14 +672,6 @@ export const commands: Record<string, Command> = {
       return "Opening agent browser...";
     },
   },
-  "/download": {
-    desc: "Export AgentFile (.af)",
-    hidden: true, // Legacy alias for /export
-    noArgs: true,
-    handler: () => {
-      return "Exporting agent file...";
-    },
-  },
 };
 
 export interface CommandExecutionResult {
@@ -672,6 +696,7 @@ function normalizeCommandHandlerResult(result: CommandHandlerResult): {
  */
 export async function executeCommand(
   input: string,
+  scope?: DreamCommandScope,
 ): Promise<CommandExecutionResult> {
   const [command, ...args] = input.trim().split(/\s+/);
 
@@ -699,7 +724,9 @@ export async function executeCommand(
   }
 
   try {
-    const result = normalizeCommandHandlerResult(await handler.handler(args));
+    const result = normalizeCommandHandlerResult(
+      await handler.handler(args, scope),
+    );
     return { success: true, ...result };
   } catch (error) {
     return {

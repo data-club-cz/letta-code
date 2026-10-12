@@ -16,7 +16,7 @@ interface Question {
   question: string;
   header: string;
   options: QuestionOption[];
-  multiSelect: boolean;
+  multiSelect?: boolean;
   allowOther?: boolean; // default true - set false to hide "Type something" option
 }
 
@@ -72,7 +72,16 @@ export const InlineQuestionApproval = memo(
     const showOther = currentQuestion?.allowOther !== false;
     const baseOptions = currentQuestion
       ? [
-          ...currentQuestion.options,
+          ...(Array.isArray(currentQuestion.options)
+            ? currentQuestion.options.filter(
+                (o): o is QuestionOption =>
+                  o != null &&
+                  typeof o === "object" &&
+                  typeof (o as { label?: unknown }).label === "string" &&
+                  typeof (o as { description?: unknown }).description ===
+                    "string",
+              )
+            : []),
           ...(showOther ? [{ label: "Type something.", description: "" }] : []),
         ]
       : [];
@@ -220,7 +229,10 @@ export const InlineQuestionApproval = memo(
         if (key.return) {
           if (currentQuestion.multiSelect) {
             // Multi-select: Enter toggles the checkbox (only for regular options, not custom)
-            if (selectedOption < customOptionIndex) {
+            if (
+              selectedOption !== customOptionIndex &&
+              selectedOption !== submitOptionIndex
+            ) {
               setSelectedMulti((prev) => {
                 const newSet = new Set(prev);
                 if (newSet.has(selectedOption)) {
@@ -240,7 +252,10 @@ export const InlineQuestionApproval = memo(
 
         // Space also toggles for multi-select (like Claude Code) - only regular options
         if (input === " " && currentQuestion.multiSelect) {
-          if (selectedOption < customOptionIndex) {
+          if (
+            selectedOption !== customOptionIndex &&
+            selectedOption !== submitOptionIndex
+          ) {
             setSelectedMulti((prev) => {
               const newSet = new Set(prev);
               if (newSet.has(selectedOption)) {
@@ -257,7 +272,12 @@ export const InlineQuestionApproval = memo(
         // Number keys for quick selection
         if (input >= "1" && input <= "9") {
           const optionIndex = Number.parseInt(input, 10) - 1;
-          if (optionIndex < optionsWithOther.length - 1) {
+          if (
+            optionIndex >= 0 &&
+            optionIndex < optionsWithOther.length &&
+            optionIndex !== submitOptionIndex &&
+            optionIndex !== customOptionIndex
+          ) {
             if (currentQuestion.multiSelect) {
               setSelectedMulti((prev) => {
                 const newSet = new Set(prev);

@@ -9,14 +9,29 @@ export interface ApprovalRequest {
   toolCallId: string;
   toolName: string;
   toolArgs: string;
+  /**
+   * Server-assigned id of the approval_request_message this tool call arrived
+   * on. Client tool lifecycle emissions reuse this id instead of minting one
+   * (LET-10608).
+   */
+  messageId?: string;
 }
 
 export interface ErrorInfo {
   message: string;
   error_type?: string;
+  error_code?: string;
+  status_code?: number;
+  retryable?: boolean;
   detail?: string;
   run_id?: string;
 }
+
+type StructuredLettaErrorMessage = LettaStreamingResponse.LettaErrorMessage & {
+  error_code?: string;
+  status_code?: number;
+  retryable?: boolean;
+};
 
 export interface ChunkProcessingResult {
   /** Whether this chunk should be output to the user */
@@ -27,6 +42,23 @@ export interface ChunkProcessingResult {
 
   /** If this chunk updated an approval, the current state */
   updatedApproval?: ApprovalRequest;
+}
+
+export interface StreamSequenceCursor {
+  runId: string;
+  seqId: number;
+}
+
+export function advanceStreamSequenceCursor(
+  cursor: StreamSequenceCursor | null,
+  runId: string | null | undefined,
+  seqId: number | null | undefined,
+): StreamSequenceCursor | null {
+  if (!runId || seqId == null) return cursor;
+  return {
+    runId,
+    seqId: cursor?.runId === runId ? Math.max(cursor.seqId, seqId) : seqId,
+  };
 }
 
 // ============================================================================
@@ -40,18 +72,24 @@ export class StreamProcessor {
   public lastRunId: string | null = null;
   public lastSeqId: number | null = null;
   public stopReason: StopReasonType | null = null;
+  public lastErrorInfo: ErrorInfo | undefined;
 
-  constructor(private readonly seenSeqIdThreshold: number | null = null) {}
+  constructor(
+    private readonly seenSequenceCursor: StreamSequenceCursor | null = null,
+  ) {}
 
   processChunk(chunk: LettaStreamingResponse): ChunkProcessingResult {
     let errorInfo: ErrorInfo | undefined;
     let updatedApproval: ApprovalRequest | undefined;
+    const cursor = this.seenSequenceCursor;
 
     if (
       "seq_id" in chunk &&
       chunk.seq_id != null &&
-      this.seenSeqIdThreshold != null &&
-      chunk.seq_id <= this.seenSeqIdThreshold
+      "run_id" in chunk &&
+      cursor &&
+      chunk.run_id === cursor.runId &&
+      chunk.seq_id <= cursor.seqId
     ) {
       return { shouldOutput: false };
     }
@@ -81,11 +119,14 @@ export class StreamProcessor {
     // Detect mid-stream errors
     // Case 1: LettaErrorMessage from the API (has message_type: "error_message")
     if ("message_type" in chunk && chunk.message_type === "error_message") {
-      // This is a LettaErrorMessage
-      const apiError = chunk as LettaStreamingResponse.LettaErrorMessage;
+      // Cloud may send structured fields that predate the generated SDK type.
+      const apiError = chunk as StructuredLettaErrorMessage;
       errorInfo = {
         message: apiError.message,
         error_type: apiError.error_type,
+        error_code: apiError.error_code,
+        status_code: apiError.status_code,
+        retryable: apiError.retryable,
         detail: apiError.detail,
         run_id: this.lastRunId || undefined,
       };
@@ -103,6 +144,8 @@ export class StreamProcessor {
         run_id: this.lastRunId || undefined,
       };
     }
+
+    if (errorInfo) this.lastErrorInfo = errorInfo;
 
     // Suppress mid-stream desync errors (match headless behavior)
     // These are transient and will be handled by end-of-turn desync recovery
@@ -155,6 +198,12 @@ export class StreamProcessor {
           toolArgs: "",
         };
 
+        // The chunk carries the approval_request_message's server-assigned
+        // id; keep it so later emissions about this tool call reuse it.
+        if ("id" in chunk && typeof chunk.id === "string" && chunk.id) {
+          existing.messageId = chunk.id;
+        }
+
         // Update name if provided
         if (toolCall.name) {
           existing.toolName = toolCall.name;
@@ -187,6 +236,7 @@ export class StreamProcessor {
       toolCallId: a.toolCallId,
       toolName: a.toolName,
       toolArgs: a.toolArgs,
+      ...(a.messageId ? { messageId: a.messageId } : {}),
     }));
   }
 }

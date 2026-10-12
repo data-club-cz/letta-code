@@ -11,6 +11,7 @@ import {
   runPreCompactHooks,
   runPreToolUseHooks,
 } from "@/hooks";
+import { clampRawToolReturn } from "@/tools/impl/tool-return-clamp";
 import { debugLog } from "@/utils/debug";
 import { isRecord } from "@/utils/type-guards";
 import { extractCompactionSummary } from "./compaction-utils";
@@ -153,6 +154,8 @@ export type Line =
       phase: "streaming" | "finished";
       isContinuation?: boolean; // true for split continuation lines (no header)
       messageId?: string; // canonical backend message.id when known
+      startedAtMs?: number;
+      durationMs?: number;
     }
   | {
       kind: "assistant";
@@ -339,6 +342,10 @@ function extractExecCommandDisplay(
   argsText: string | undefined,
 ): string | null {
   const parsed = parseToolArgsText(argsText);
+  const description = parsed?.description;
+  if (typeof description === "string" && description.trim()) {
+    return description.trim();
+  }
   const cmd = parsed?.cmd;
   return typeof cmd === "string" && cmd.trim() ? cmd : null;
 }
@@ -427,7 +434,11 @@ function formatRetryEventStatusLines(
   ];
 }
 
-function upsertStatusLine(b: Buffers, id: string, lines: string[]): void {
+export function upsertStatusLine(
+  b: Buffers,
+  id: string,
+  lines: string[],
+): void {
   const existing = b.byId.get(id);
   if (existing?.kind === "status") {
     existing.lines = lines;
@@ -440,7 +451,6 @@ function upsertStatusLine(b: Buffers, id: string, lines: string[]): void {
 // Mark a line as finished if it has a phase (immutable update)
 function markAsFinished(b: Buffers, id: string) {
   const line = b.byId.get(id);
-  // console.log(`[MARK_FINISHED] Called for ${id}, line exists: ${!!line}, kind: ${line?.kind}, phase: ${(line as any)?.phase}`);
   if (line && "phase" in line && line.phase === "streaming") {
     const updatedLine =
       line.kind === "reasoning"
@@ -448,10 +458,14 @@ function markAsFinished(b: Buffers, id: string) {
             ...line,
             text: trimFinishedReasoningText(line.text),
             phase: "finished" as const,
+            durationMs:
+              line.durationMs ??
+              (line.startedAtMs === undefined
+                ? undefined
+                : Math.max(0, Date.now() - line.startedAtMs)),
           }
         : { ...line, phase: "finished" as const };
     b.byId.set(id, updatedLine);
-    // console.log(`[MARK_FINISHED] Successfully marked ${id} as finished`);
 
     // Track last reasoning content for hooks (PostToolUse and Stop will include it)
     if (
@@ -469,8 +483,6 @@ function markAsFinished(b: Buffers, id: string) {
     ) {
       b.lastAssistantMessage = updatedLine.text;
     }
-  } else {
-    // console.log(`[MARK_FINISHED] Did NOT mark ${id} as finished (conditions not met)`);
   }
 }
 
@@ -853,6 +865,7 @@ function trySplitContent(
   newText: string,
 ): boolean {
   if (!b.tokenStreamingEnabled) return false;
+  if (kind === "reasoning") return false;
 
   const splitPoint = findLastSafeSplitPoint(newText);
   if (splitPoint >= newText.length) return false; // No safe split point
@@ -871,8 +884,7 @@ function trySplitContent(
   const committedLine = {
     kind,
     id: commitId,
-    text:
-      kind === "reasoning" ? trimFinishedReasoningText(beforeText) : beforeText,
+    text: beforeText,
     phase: "finished" as const,
     isContinuation: counter > 0, // First split shows bullet, subsequent don't
     messageId:
@@ -904,11 +916,11 @@ function trySplitContent(
   return true;
 }
 
-// OpenAI reasoning summaries can start a new `**Section Title**\n\n` block inside the
-// same otid without a leading separator. Insert the missing blank line so markdown
-// renders the title as a new paragraph instead of gluing it to the previous sentence.
+// Restore missing blank lines between adjacent OpenAI reasoning summary headings.
 function normalizeReasoningSectionBoundaries(text: string): string {
-  return text.replace(/([^\n])(\*\*[^*\n]+\*\*\n\n)/g, "$1\n\n$2");
+  return text
+    .replace(/\*\*\*\*/g, "**\n\n**")
+    .replace(/([^\n])(\*\*[^*\n]+\*\*\n\n)/g, "$1\n\n$2");
 }
 
 // Feed one SDK chunk; mutate buffers in place.
@@ -924,11 +936,6 @@ export function onChunk(
     return;
   }
 
-  // TODO remove once SDK v1 has proper typing for in-stream errors
-  // Check for streaming error objects (not typed in SDK but emitted by backend)
-  // Note: Error handling moved to catch blocks in App.tsx and headless.ts
-  // The SDK now throws APIError when it sees event: error, so chunks never have error property
-
   switch (chunk.message_type) {
     case "reasoning_message": {
       const chunkWithIds = chunk as LettaStreamingResponse & {
@@ -936,9 +943,7 @@ export function onChunk(
         otid?: string;
       };
       const id = resolveReasoningLineId(b, chunkWithIds);
-      // console.log(`[REASONING] Received chunk with otid=${id}, delta="${chunk.reasoning?.substring(0, 50)}..."`);
       if (!id) {
-        // console.log(`[REASONING] No otid, breaking`);
         break;
       }
 
@@ -954,6 +959,7 @@ export function onChunk(
         text: "",
         phase: "streaming",
         messageId,
+        startedAtMs: Date.now(),
       }));
       if (delta) {
         const newText = normalizeReasoningSectionBoundaries(line.text + delta);
@@ -971,7 +977,6 @@ export function onChunk(
       } else if (messageId && line.messageId !== messageId) {
         b.byId.set(id, { ...line, messageId });
       }
-      // console.log(`[REASONING] Updated ${id}, textLen=${newText.length}`);
       break;
     }
 
@@ -1036,11 +1041,8 @@ export function onChunk(
       // Handle otid transition (mark previous line as finished)
       handleOtidTransition(b, lineId);
 
-      // Extract text content from the user message
       const rawText = extractTextPart(chunk.content);
       if (!rawText) break;
-
-      // Check if this is a compaction summary message (old format embedded in user_message)
       const compactionSummary = extractCompactionSummary(rawText);
       if (compactionSummary) {
         // Render as a finished compaction event
@@ -1057,24 +1059,19 @@ export function onChunk(
         markCompactionCompleted(ctx);
         break;
       }
+      // User input is rendered optimistically before the request. Only consume
+      // echoed user messages that reconcile one of those existing rows; other
+      // echoes are harness-injected context, not new user-visible input.
+      if (!mappedLineId) break;
 
-      const line = ensure(b, lineId, () => ({
-        kind: "user",
-        id: lineId,
-        text: rawText,
-        messageId,
-        otid,
-      }));
-      if (line.kind === "user") {
-        b.byId.set(lineId, {
+      const line = b.byId.get(mappedLineId);
+      if (line?.kind === "user") {
+        b.byId.set(mappedLineId, {
           ...line,
           text: line.text || rawText,
           messageId: messageId ?? line.messageId,
           otid: otid ?? line.otid,
         });
-      }
-      if (otid) {
-        b.userLineIdByOtid.set(otid, lineId);
       }
       break;
     }
@@ -1226,13 +1223,11 @@ export function onChunk(
             : undefined) ||
           ("tool_return" in toolReturn ? toolReturn.tool_return : undefined);
 
-        // Ensure resultText is always a string (guard against SDK returning objects)
-        const resultText =
-          typeof rawResult === "string"
-            ? rawResult
-            : rawResult != null
-              ? JSON.stringify(rawResult)
-              : "";
+        // Stringify + clip: cloud returns bypass the tool manager's clamp.
+        const resultText = clampRawToolReturn(
+          rawResult,
+          toolCallId ? b.serverToolCalls.get(toolCallId)?.toolName : undefined,
+        );
         const status = toolReturn.status;
 
         // Look up the line by toolCallId

@@ -1,6 +1,8 @@
 import { isLocalAgentId as isLocalAgentIdShared } from "@/agent/agent-id";
 
-const APP_BASE = "https://app.letta.com";
+const CHAT_BASE = "https://chat.letta.com";
+
+export const LETTA_CHAT_API_KEYS_URL = `${CHAT_BASE}/preferences/api-keys`;
 
 export function isLocalAgentId(agentId: string): boolean {
   return isLocalAgentIdShared(agentId);
@@ -17,7 +19,7 @@ export function buildChatUrl(
     deviceId?: string;
   },
 ): string {
-  const base = `${APP_BASE}/chat/${agentId}`;
+  const base = `${CHAT_BASE}/chat/${agentId}`;
   const params = new URLSearchParams();
 
   if (options?.view) {
@@ -35,8 +37,27 @@ export function buildChatUrl(
 }
 
 /**
- * Build a user-facing agent reference. API-backed agents can link to the app,
- * but local-backend agents are not available at app.letta.com, so show the ID.
+ * Build the chat.letta.com desktop viewer URL for a sandbox desktop-session
+ * relay URL. Chat reads the relay path and expiry from the hash, so they never
+ * reach a server log as a query string. Anyone holding the result can view and
+ * control the desktop until it expires.
+ */
+export function buildDesktopViewerUrl(
+  relayUrl: string,
+  expiresAt: string,
+): string {
+  const relay = new URL(relayUrl);
+  const viewer = new URL("/desktop", CHAT_BASE);
+  viewer.hash = new URLSearchParams({
+    path: `${relay.pathname}${relay.search}`,
+    expiresAt,
+  }).toString();
+  return viewer.toString();
+}
+
+/**
+ * Build a user-facing agent reference. API-backed agents can link to Chat,
+ * but local-backend agents are not available there, so show the ID.
  */
 export function buildAgentReference(
   agentId: string,
@@ -67,8 +88,8 @@ export function buildAgentTerminalLink(
 }
 
 /**
- * Build a non-agent app URL (e.g. settings pages).
+ * Build a URL for a Chat preference or other non-agent Chat page.
  */
-export function buildAppUrl(path: string): string {
-  return `${APP_BASE}${path}`;
+export function buildChatWebUrl(path: string): string {
+  return `${CHAT_BASE}${path}`;
 }

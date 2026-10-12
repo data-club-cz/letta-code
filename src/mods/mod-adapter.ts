@@ -1,4 +1,5 @@
 import type { Backend } from "@/backend";
+import { resolveProcessModCapabilities } from "@/mods/capabilities";
 import { areModsDisabled, disableModsForProcess } from "@/mods/disable";
 import { createDisabledModAdapter } from "@/mods/disabled-mod-adapter";
 import { emptyEventEmissionResult, type ModEvents } from "@/mods/event-emitter";
@@ -11,6 +12,15 @@ import {
   type ResolveLocalModSourcesOptions,
   resolveLocalModSources,
 } from "@/mods/mod-engine";
+import {
+  filterAvailableModPermissionsRegistry,
+  type ModPermissionDefinition,
+} from "@/mods/permission-registry";
+import {
+  filterAvailableModToolsRegistry,
+  type ModToolDefinition,
+} from "@/mods/tool-registry";
+import type { ModContext } from "@/mods/types";
 import { debugLog } from "@/utils/debug";
 
 const RUNTIME_DIAGNOSTICS_WRITE_DELAY_MS = 30_000;
@@ -34,6 +44,12 @@ export interface CreateModAdapterOptions extends CreateModEngineOptions {
 export interface ModAdapter {
   dispose: () => void;
   events: ModEvents;
+  getAvailablePermissions: (
+    context?: ModContext | null,
+  ) => Map<string, ModPermissionDefinition>;
+  getAvailableTools: (
+    context?: ModContext | null,
+  ) => Map<string, ModToolDefinition>;
   getBackend: () => Backend | undefined;
   getSnapshot: () => ModAdapterSnapshot;
   engine: ModEngine;
@@ -64,8 +80,13 @@ export function createModAdapter(options: CreateModAdapterOptions): ModAdapter {
     return createDisabledModAdapter();
   }
 
+  const effectiveEngineOptions = {
+    ...engineOptions,
+    capabilities: resolveProcessModCapabilities(engineOptions.capabilities),
+  };
+
   let disposed = false;
-  const initialHasModSources = hasModSources(engineOptions);
+  const initialHasModSources = hasModSources(effectiveEngineOptions);
   let loadState: ModAdapterLoadState = {
     hadModPanels: false,
     hasModSources: initialHasModSources,
@@ -77,7 +98,7 @@ export function createModAdapter(options: CreateModAdapterOptions): ModAdapter {
   const getBackend = () => resolveBackend?.();
 
   const engine = createModEngine({
-    ...engineOptions,
+    ...effectiveEngineOptions,
     getBackend,
     onDiagnostic: () => scheduleDiagnosticsWrite(),
   });
@@ -126,6 +147,11 @@ export function createModAdapter(options: CreateModAdapterOptions): ModAdapter {
   }
 
   const events: ModEvents = {
+    hasHandlers(name) {
+      if (loadState.isLoading) return true;
+      if (!loadState.hasModSources) return false;
+      return (engine.getSnapshot().events[name]?.length ?? 0) > 0;
+    },
     async emit(name, event, scopedContext) {
       if (loadState.isLoading || !loadState.hasModSources) {
         // Events are best-effort hooks; do not deliver them while the mod
@@ -163,7 +189,7 @@ export function createModAdapter(options: CreateModAdapterOptions): ModAdapter {
       loadState.hadModPanels;
     loadState = {
       hadModPanels: previousHadModPanels,
-      hasModSources: hasModSources(engineOptions),
+      hasModSources: hasModSources(effectiveEngineOptions),
       isLoading: true,
     };
     publish();
@@ -217,6 +243,18 @@ export function createModAdapter(options: CreateModAdapterOptions): ModAdapter {
       listeners.clear();
     },
     events,
+    getAvailablePermissions(context) {
+      return filterAvailableModPermissionsRegistry(
+        new Map(Object.entries(engine.getSnapshot().permissions)),
+        context,
+      );
+    },
+    getAvailableTools(context) {
+      return filterAvailableModToolsRegistry(
+        new Map(Object.entries(engine.getSnapshot().tools)),
+        context,
+      );
+    },
     getBackend,
     getSnapshot,
     engine,

@@ -9,7 +9,6 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
   "/personality",
   "/subagents",
   "/memory",
-  "/goal",
   "/sleeptime",
   "/mcp",
   "/help",
@@ -29,16 +28,14 @@ const INTERACTIVE_SLASH_COMMANDS = new Set([
 const NON_STATE_COMMANDS = new Set([
   "/ade",
   "/bg",
+  "/workflows", // read-only view of background workflow runs
   "/btw",
   "/usage",
   "/help",
   "/hooks",
   "/search",
   "/memory",
-  "/goal",
   "/feedback",
-  "/export",
-  "/download",
   "/mods", // starts background local mod-learning runs; does not need the foreground lock
   "/reasoning-tab",
   "/secret",
@@ -47,7 +44,15 @@ const NON_STATE_COMMANDS = new Set([
   "/rename", // agent/convo rename
   "/btw",
   "/reload", // runtime surface reload (has its own busy guard)
+  "/dream", // Cloud admission or Code-managed background reflection
+  "/reflect",
+  "/reflection",
 ]);
+
+export function aliasBareExitCommand(input: string): string {
+  if (input === "exit" || input === "quit") return "/exit";
+  return input;
+}
 
 // Check if a command is interactive (opens overlay, should not be queued)
 export function isInteractiveCommand(msg: string): boolean {

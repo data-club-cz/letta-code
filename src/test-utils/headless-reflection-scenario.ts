@@ -47,6 +47,7 @@ interface PayloadFile {
 interface LiveReflectionSummary {
   code: number | null;
   signal: NodeJS.Signals | null;
+  scenarioSatisfiedBeforeTermination: boolean;
   tmpRoot: string;
   agentId: string | null;
   conversationId: string | null;
@@ -64,6 +65,29 @@ interface LiveReflectionSummary {
 const TURN_ONE_MARKER = "LIVE_REFLECTION_TURN_ONE_MARKER";
 const TURN_TWO_MARKER = "LIVE_REFLECTION_TURN_TWO_MARKER";
 const DEFAULT_REFLECTION_MODEL = "gpt-5.4-mini-low";
+const MAX_TURN_ATTEMPTS = 4;
+
+export async function terminateAfterScenarioSatisfied(options: {
+  waitForScenarioSatisfied: () => Promise<boolean>;
+  terminate: (signal: "SIGTERM") => void;
+}): Promise<boolean> {
+  if (!(await options.waitForScenarioSatisfied())) return false;
+  options.terminate("SIGTERM");
+  return true;
+}
+
+export function isAcceptedScenarioExit(summary: {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  scenarioSatisfiedBeforeTermination: boolean;
+}): boolean {
+  if (summary.signal === null) return summary.code === 0;
+  return (
+    summary.scenarioSatisfiedBeforeTermination &&
+    summary.code === null &&
+    summary.signal === "SIGTERM"
+  );
+}
 
 function parseArgs(argv: string[]): Args {
   const args: Args = {
@@ -186,6 +210,11 @@ async function runLiveBidirectionalCli(paths: {
     let conversationId: string | null = null;
     let resultCount = 0;
     let closing = false;
+    let scenarioSatisfiedBeforeTermination = false;
+    let phase: "first" | "second" = "first";
+    let phaseAttempt = 0;
+    let sawAssistantMessage = false;
+    let retryTimer: NodeJS.Timeout | null = null;
 
     const transcriptDir = () =>
       agentId && conversationId
@@ -198,11 +227,43 @@ async function runLiveBidirectionalCli(paths: {
       );
     };
 
-    const closeWhenReflectionPayloadExists = () => {
+    const endInput = () => {
       if (closing) return;
       closing = true;
-      void waitForLaunchArtifacts(transcriptDir, 90_000).finally(() => {
-        proc.stdin.end();
+      proc.stdin.end();
+    };
+
+    const sendCurrentTurn = () => {
+      if (closing) return;
+      phaseAttempt += 1;
+      sawAssistantMessage = false;
+      const marker = phase === "first" ? TURN_ONE_MARKER : TURN_TWO_MARKER;
+      sendUser(`Return OK as your final answer. Do not use tools. ${marker}`);
+    };
+
+    const retryCurrentTurn = () => {
+      if (phaseAttempt >= MAX_TURN_ATTEMPTS) {
+        endInput();
+        return;
+      }
+      retryTimer = setTimeout(() => {
+        retryTimer = null;
+        sendCurrentTurn();
+      }, 1_000);
+    };
+
+    const terminateWhenScenarioSatisfied = () => {
+      if (closing) return;
+      closing = true;
+      void terminateAfterScenarioSatisfied({
+        waitForScenarioSatisfied: () =>
+          waitForLaunchArtifacts(transcriptDir, 2, 90_000),
+        terminate: (signal) => {
+          scenarioSatisfiedBeforeTermination = true;
+          proc.kill(signal);
+        },
+      }).then((satisfied) => {
+        if (!satisfied) proc.stdin.end();
       });
     };
 
@@ -233,21 +294,36 @@ async function runLiveBidirectionalCli(paths: {
             : conversationId;
 
         if (parsed.type === "system" && parsed.subtype === "init") {
-          sendUser(`Reply with OK only. Do not use tools. ${TURN_ONE_MARKER}`);
+          sendCurrentTurn();
+        }
+
+        if (
+          parsed.type === "message" &&
+          parsed.message_type === "assistant_message"
+        ) {
+          sawAssistantMessage = true;
         }
 
         if (parsed.type === "result") {
           resultCount += 1;
-          if (resultCount === 1) {
-            setTimeout(
-              () =>
-                sendUser(
-                  `Reply with OK only. Do not use tools. ${TURN_TWO_MARKER}`,
-                ),
-              1_000,
+          if (!sawAssistantMessage) {
+            // The live auto route can return final text only as reasoning. That
+            // turn is not an assistant step, so keep the current snapshot phase.
+            retryCurrentTurn();
+          } else if (phase === "first") {
+            void waitForLaunchArtifacts(transcriptDir, 1, 10_000).then(
+              (launched) => {
+                if (!launched) {
+                  endInput();
+                  return;
+                }
+                phase = "second";
+                phaseAttempt = 0;
+                sendCurrentTurn();
+              },
             );
-          } else if (resultCount === 2) {
-            closeWhenReflectionPayloadExists();
+          } else {
+            terminateWhenScenarioSatisfied();
           }
         }
       }
@@ -278,9 +354,11 @@ async function runLiveBidirectionalCli(paths: {
 
     proc.on("close", (code, signal) => {
       clearTimeout(timeout);
+      if (retryTimer) clearTimeout(retryTimer);
       void buildSummary({
         code,
         signal,
+        scenarioSatisfiedBeforeTermination,
         tmpRoot: paths.tmpRoot,
         transcriptDir: transcriptDir(),
         agentId,
@@ -297,27 +375,30 @@ async function runLiveBidirectionalCli(paths: {
 
 async function waitForLaunchArtifacts(
   getTranscriptDir: () => string | null,
+  minimumCompletedSteps: number,
   timeoutMs: number,
-): Promise<void> {
+): Promise<boolean> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const dir = getTranscriptDir();
     const state = dir ? await readReflectionState(dir) : null;
     const payloadFiles = dir ? await readPayloadFiles(dir) : [];
     if (
-      (state?.total_completed_steps ?? 0) >= 2 &&
+      (state?.total_completed_steps ?? 0) >= minimumCompletedSteps &&
       state?.last_reflection_started_at &&
       payloadFiles.length >= 1
     ) {
-      return;
+      return true;
     }
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
+  return false;
 }
 
 async function buildSummary(args: {
   code: number | null;
   signal: NodeJS.Signals | null;
+  scenarioSatisfiedBeforeTermination: boolean;
   tmpRoot: string;
   transcriptDir: string | null;
   agentId: string | null;
@@ -342,6 +423,7 @@ async function buildSummary(args: {
   return {
     code: args.code,
     signal: args.signal,
+    scenarioSatisfiedBeforeTermination: args.scenarioSatisfiedBeforeTermination,
     tmpRoot: args.tmpRoot,
     agentId: args.agentId,
     conversationId: args.conversationId,
@@ -434,6 +516,8 @@ function formatSummary(summary: LiveReflectionSummary): string {
     {
       code: summary.code,
       signal: summary.signal,
+      scenarioSatisfiedBeforeTermination:
+        summary.scenarioSatisfiedBeforeTermination,
       tmpRoot: summary.tmpRoot,
       agentId: summary.agentId,
       conversationId: summary.conversationId,
@@ -460,13 +544,15 @@ function assertTrue(condition: unknown, message: string): asserts condition {
 
 function assertScenario(summary: LiveReflectionSummary): void {
   const details = formatSummary(summary);
-  assertTrue(summary.code === 0, `Expected exit code 0.\n${details}`);
-  assertTrue(summary.signal === null, `Expected no signal.\n${details}`);
+  assertTrue(
+    isAcceptedScenarioExit(summary),
+    `Expected a clean exit or satisfied-scenario SIGTERM.\n${details}`,
+  );
   assertTrue(summary.agentId, `Missing agent id.\n${details}`);
   assertTrue(summary.conversationId, `Missing conversation id.\n${details}`);
   assertTrue(
     summary.resultCount >= 2,
-    `Expected at least two completed steps.\n${details}`,
+    `Expected at least two turn results.\n${details}`,
   );
   assertTrue(
     summary.reflectionLaunchCount >= 1,
@@ -503,8 +589,12 @@ function assertScenario(summary: LiveReflectionSummary): void {
 
   const firstPayload = parsePayload(summary.firstPayloadText);
   assertTrue(
-    firstPayload.roles.includes("system"),
-    `Payload missing system message.\n${details}`,
+    firstPayload.roles[0] === "meta",
+    `Payload missing leading metadata record.\n${details}`,
+  );
+  assertTrue(
+    !firstPayload.roles.includes("system"),
+    `Payload unexpectedly includes a system message.\n${details}`,
   );
   assertTrue(
     firstPayload.roles.includes("user"),
@@ -538,7 +628,9 @@ async function main(): Promise<void> {
   );
 }
 
-main().catch((error) => {
-  console.error(String(error?.stack || error));
-  process.exit(1);
-});
+if (import.meta.main) {
+  main().catch((error) => {
+    console.error(String(error?.stack || error));
+    process.exit(1);
+  });
+}

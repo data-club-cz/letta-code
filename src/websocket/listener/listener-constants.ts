@@ -6,11 +6,14 @@
  * and protocol-outbound.ts.
  */
 export const SUPPORTED_REMOTE_COMMANDS: readonly string[] = [
+  "browser_device_mcp_oauth",
   "clear",
+  "clear-messages",
   "doctor",
+  "dream",
+  "reflect",
+  "reflection",
   "init",
-  "remember",
-  "goal",
   "compact",
   "reload",
   "context-limit",
@@ -21,4 +24,5 @@ export const SUPPORTED_REMOTE_COMMANDS: readonly string[] = [
   // dedicated secret_list / secret_apply WS commands — not via
   // execute_command — so it has no case in handleExecuteCommand.
   "secret",
+  "monitor_stop",
 ];

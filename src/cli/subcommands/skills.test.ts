@@ -23,6 +23,7 @@ import {
   parseDirectSkillFileUrlSpecifier,
   parseGitHubSpecifier,
   runInstallSubcommand,
+  syncCommittedRemoteSkillMemoryChange,
 } from "./skills";
 
 function createChildProcess(): ChildProcess {
@@ -616,6 +617,30 @@ describe("skills subcommand", () => {
     }
   });
 
+  test("lists installed skills with multiline descriptions", async () => {
+    const tempRoot = mkdtempSync(join(tmpdir(), "letta-skills-test-"));
+    try {
+      const memoryDir = join(tempRoot, "memory");
+      const skillDir = join(memoryDir, "skills", "firecrawl");
+      await mkdir(skillDir, { recursive: true });
+      writeFileSync(
+        join(skillDir, "SKILL.md"),
+        "---\nname: firecrawl\ndescription: >-\n  Scrape websites with Firecrawl.\n  Use for structured web data.\n---\n\n# Firecrawl\n",
+      );
+
+      expect(await listSkillDirectories({ memoryDir })).toEqual([
+        {
+          name: "firecrawl",
+          description:
+            "Scrape websites with Firecrawl. Use for structured web data.",
+          path: skillDir,
+        },
+      ]);
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  });
+
   test("deletes an installed skill directory", async () => {
     const tempRoot = mkdtempSync(join(tmpdir(), "letta-skills-test-"));
     try {
@@ -631,5 +656,77 @@ describe("skills subcommand", () => {
     } finally {
       await rm(tempRoot, { recursive: true, force: true });
     }
+  });
+
+  test("syncs committed remote MemFS skill changes", async () => {
+    const calls: Array<{ agentId: string; memoryDir?: string }> = [];
+
+    const result = await syncCommittedRemoteSkillMemoryChange({
+      agentId: "agent-123",
+      memoryDir: "/tmp/memory",
+      committed: true,
+      syncFn: async (agentId, options) => {
+        calls.push({ agentId, memoryDir: options.memoryDir });
+        return {
+          status: "pushed" as const,
+          summary: "Pushed 1 pending memory commit(s).",
+          memoryDir: options.memoryDir ?? "",
+          localOnly: false,
+        };
+      },
+    });
+
+    expect(calls).toEqual([{ agentId: "agent-123", memoryDir: "/tmp/memory" }]);
+    expect(result).toEqual({
+      status: "pushed",
+      summary: "Pushed 1 pending memory commit(s).",
+    });
+  });
+
+  test("skips skill MemFS sync without a committed remote change", async () => {
+    let calls = 0;
+    const syncFn = async () => {
+      calls += 1;
+      return {
+        status: "pushed" as const,
+        summary: "should not run",
+        memoryDir: "/tmp/memory",
+        localOnly: false,
+      };
+    };
+
+    await expect(
+      syncCommittedRemoteSkillMemoryChange({
+        agentId: "agent-123",
+        memoryDir: "/tmp/memory",
+        committed: false,
+        syncFn,
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      syncCommittedRemoteSkillMemoryChange({
+        agentId: "agent-local-123",
+        memoryDir: "/tmp/memory",
+        committed: true,
+        syncFn,
+      }),
+    ).resolves.toBeUndefined();
+    expect(calls).toBe(0);
+  });
+
+  test("reports skill MemFS sync failures without failing the committed change", async () => {
+    const result = await syncCommittedRemoteSkillMemoryChange({
+      agentId: "agent-123",
+      memoryDir: "/tmp/memory",
+      committed: true,
+      syncFn: async () => {
+        throw new Error("push unavailable");
+      },
+    });
+
+    expect(result).toEqual({
+      status: "push_failed",
+      summary: "push unavailable",
+    });
   });
 });

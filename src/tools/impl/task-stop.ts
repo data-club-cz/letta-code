@@ -1,4 +1,7 @@
-import { kill_bash } from "./kill-bash.js";
+import { getSubagents } from "@/agent/subagent-state.js";
+import { getBackend } from "@/backend";
+import { getErrorMessage } from "@/utils/error";
+import { killBackgroundProcess } from "./kill-bash.js";
 import {
   backgroundTasks,
   scheduleBackgroundTaskCleanup,
@@ -11,6 +14,31 @@ interface TaskStopArgs {
 
 interface TaskStopResult {
   killed: boolean;
+  output?: string;
+}
+
+/** Interrupt a remote child's conversation, as the UI's stop button does. */
+async function cancelRemoteRun(subagentId: string): Promise<TaskStopResult> {
+  const child = getSubagents().find((agent) => agent.id === subagentId);
+  const target =
+    child?.conversationId === "default" ? child.agentId : child?.conversationId;
+  try {
+    if (!target) throw new Error("its conversation is not known yet");
+    const results = await getBackend().cancelConversation(target);
+    const outcomes = Object.values(results);
+    if (
+      outcomes.length === 0 ||
+      outcomes.some((status) => status !== "cancelled")
+    ) {
+      throw new Error("Cloud did not cancel every run");
+    }
+    return { killed: true, output: "Cancelled the remote run" };
+  } catch (error) {
+    return {
+      killed: false,
+      output: `Couldn't cancel the remote run: ${getErrorMessage(error)}`,
+    };
+  }
 }
 
 export async function task_stop(args: TaskStopArgs): Promise<TaskStopResult> {
@@ -21,18 +49,22 @@ export async function task_stop(args: TaskStopArgs): Promise<TaskStopResult> {
   const task = backgroundTasks.get(task_id);
   if (task) {
     if (task.status === "running" && task.abortController) {
+      const remote = task.remote
+        ? await cancelRemoteRun(task.subagentId)
+        : undefined;
+      if (remote && !remote.killed) return remote;
       task.abortController.abort();
-      task.status = "failed";
       task.error = "Aborted by user";
+      await task.completion;
+      task.status = "failed";
       scheduleBackgroundTaskCleanup(task_id);
-      return { killed: true };
+      return remote ?? { killed: true };
     }
     // Task exists but isn't running or doesn't have abort controller
     return { killed: false };
   }
 
-  // Fall back to killing a Bash background process.
-  // The KillBash helper still uses `shell_id` internally; task_id is the
-  // unified external contract (bash shells share the same id space).
-  return kill_bash({ shell_id: task_id });
+  // Fall back to killing a Bash background process (bash shells share the
+  // task id space).
+  return { killed: killBackgroundProcess(task_id) };
 }

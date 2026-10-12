@@ -8,7 +8,9 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { join } from "node:path";
+import { normalizeTranscript } from "@letta-ai/trajectory";
 import { MEMORY_SYSTEM_DIR } from "@/agent/memory-filesystem";
+import type { LocalMemoryFormat } from "@/agent/memory-format";
 import { REFLECTION_PARENT_MEMORY_SNAPSHOT_CHAR_LIMIT } from "@/agent/subagents/context-budget";
 import { getBackend } from "@/backend";
 import {
@@ -184,44 +186,10 @@ export interface ReflectionAutoPayload {
   candidates: ReflectionAutoCandidates;
 }
 
-export interface ReflectionPromptInput {
-  instruction?: string;
-  memoryDir: string;
-  parentMemory?: string;
-}
-
-export function buildReflectionSubagentPrompt(
-  input: ReflectionPromptInput,
-): string {
-  const lines: string[] = [];
-
-  lines.push(
-    'Review the conversation transcript payload and update memory files. The payload path is available as the `$TRANSCRIPT_PATH` env var — read it via Bash (e.g. `wc -c "$TRANSCRIPT_PATH"`). Note: `$TRANSCRIPT_PATH` only expands in shell commands; Edit `file_path` is literal and does NOT expand env vars.',
-    "",
-    'The payload may be either a JSON message array for one conversation or a `multi_transcript_reflection_payload` manifest. If it is a manifest, read each `payload_path` listed in `transcripts` and synthesize across all conversations. Entries with `mode: "replay"` were already reflected before and are included intentionally for re-review/deduplication; do not ignore them just because they are replay slices.',
-    "When reviewing multiple transcripts, prefer durable patterns and latest evidence across sessions. Resolve contradictions by updating stale memory at the source, deduplicate repeated facts, and avoid storing one-off task state.",
-    "",
-    `The primary agent's memory filesystem is located at: ${input.memoryDir}`,
-    "In-context memory (in the parent agent's system prompt) is stored in the `system/` folder and are rendered in <memory> tags below. Modification to files in `system/` will edit the parent agent's system prompt.",
-    "Additional memory files (such as skills and external memory) may also be read and modified.",
-    "",
-  );
-
-  if (input.instruction?.trim()) {
-    lines.push(
-      "Additional user-provided reflection instruction:",
-      input.instruction.trim(),
-      "",
-      "Use this instruction to focus what you look for, but still only persist durable memory-worthy learnings and do not store transient task state.",
-      "",
-    );
-  }
-
-  if (input.parentMemory) {
-    lines.push(input.parentMemory);
-  }
-  return lines.join("\n");
-}
+export {
+  buildReflectionSubagentPrompt,
+  type ReflectionPromptInput,
+} from "./reflection-prompt";
 
 export function buildReflectionSelectorPrompt(options?: {
   instruction?: string;
@@ -246,12 +214,12 @@ export function buildReflectionSelectorPrompt(options?: {
   lines.push(
     "If the candidates payload includes `user_instruction`, use it as the requested focus for selection.",
     "",
-    "Select up to `max_selected` conversations. Prefer candidates likely to contain durable memory updates: explicit user corrections, repeated preferences, coding/review/commit style preferences, repo or workflow gotchas, durable facts about people/projects, contradictions with current memory, or repeated agent failures.",
+    "Select up to `max_selected` conversations. Prefer candidates likely to contain useful memory updates: explicit user corrections, repeated preferences, coding/review/commit style preferences, repo or workflow gotchas, facts about people/projects that will matter later, contradictions with current memory, or repeated agent failures.",
     "Avoid one-off debugging, transient task status, duplicated/redundant candidates, and conversations already fully reflected unless they are useful for deduplication or contradiction resolution.",
     "Treat summaries/descriptions as weak internal metadata, not confirmed facts. The final reflection pass will verify against the actual transcript before writing memory.",
     "",
     "Return strict JSON as your final response with this shape:",
-    '{"selected_conversations":[{"conversation_id":"conv-...","reason":"durable reason for selecting this transcript","priority":"high"}]}',
+    '{"selected_conversations":[{"conversation_id":"conv-...","reason":"reason for selecting this transcript","priority":"high"}]}',
     'Use priority values `high`, `medium`, or `low`. If nothing looks memory-worthy, write `{"selected_conversations":[]}`.',
   );
 
@@ -267,6 +235,7 @@ interface ParentMemoryFile {
 interface ParentMemorySnapshotOptions {
   /** Maximum characters for the full rendered parent memory preview. */
   maxChars?: number;
+  memoryFormat?: LocalMemoryFormat;
 }
 
 function isSystemMemoryFile(relativePath: string): boolean {
@@ -516,6 +485,12 @@ export async function buildParentMemorySnapshot(
   memoryDir: string,
   options: ParentMemorySnapshotOptions = {},
 ): Promise<string> {
+  if (options.memoryFormat === "memfs-v2") {
+    const { buildMemfsV2ParentMemorySnapshot } = await import(
+      "./reflection-memory-v2"
+    );
+    return buildMemfsV2ParentMemorySnapshot(memoryDir, options.maxChars);
+  }
   const files = await collectParentMemoryFiles(memoryDir);
   const tree = buildParentMemoryTree(files);
   const systemFiles = files.filter((file) =>
@@ -540,7 +515,7 @@ export async function buildParentMemorySnapshot(
 
     for (const file of systemFiles) {
       const normalizedPath = file.relativePath.replace(/\\/g, "/");
-      const absolutePath = `${memoryDir.replace(/\\/g, "/")}/${normalizedPath}`;
+      const absolutePath = `$MEMORY_DIR/${normalizedPath}`;
       const prefix = ["<memory>", `<path>${absolutePath}</path>`];
       const suffix = ["</memory>"];
       const fullEntry = [...prefix, file.content, ...suffix];
@@ -589,7 +564,7 @@ export async function buildParentMemorySnapshot(
     }
 
     if (omittedSystemFiles > 0) {
-      const notice = `[Memory preview omitted ${omittedSystemFiles.toLocaleString()} additional system file(s) because the reflection startup context budget was exhausted. Read files directly from ${memoryDir} if needed.]`;
+      const notice = `[Memory preview omitted ${omittedSystemFiles.toLocaleString()} additional system file(s) because the reflection startup context budget was exhausted. Read files directly from $MEMORY_DIR if needed.]`;
       if (canAppendWithinBudget(lines, [notice], maxChars)) {
         lines.push(notice);
       }
@@ -645,99 +620,22 @@ function countAssistantRows(entries: TranscriptEntry[]): number {
   return entries.filter((entry) => entry.kind === "assistant").length;
 }
 
-/** Maximum characters to keep for tool-call arguments in the reflection payload. */
-const TOOL_ARGS_TRUNCATE_LIMIT = 300;
-
 /**
- * Truncate text to a character limit, appending a marker when content is cut.
+ * Normalize a selected client-transcript fragment into the shared trajectory
+ * record format consumed by reflection agents.
  */
-function truncateArgs(
-  text: string | undefined,
-  limit: number,
-): string | undefined {
-  if (text === undefined) return undefined;
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}…[truncated]`;
-}
-
-/**
- * Strip inline base64 image data and data-URI image references from text.
- * This is a safety net — the accumulator's `extractTextPart` already drops
- * multimodal image_url parts, but pasted/inline base64 could still appear.
- */
-function stripImagesFromText(text: string): string {
-  // Strip data:image URIs (including surrounding markdown image syntax)
-  return text.replace(
-    /!\[[^\]]*\]\(data:image\/[^)]+\)|data:image\/[^\s"')]+/g,
-    "[image]",
-  );
-}
-
-/**
- * JSON message entry for the reflection payload.
- * Follows the ChatML-style format from the reference transcript spec.
- */
-type ReflectionMessage =
-  | { role: "system" | "user" | "reasoning" | "error"; content: string }
-  | {
-      role: "assistant";
-      content: string;
-    }
-  | {
-      role: "assistant";
-      content: null;
-      tool_calls: Array<{ name: string; args: string }>;
-    };
-
-/**
- * Serialize transcript entries (and optional filtered system prompt) into a
- * JSON message array for the reflection subagent.
- *
- * Output is a flat array of `{ role, content, tool_calls? }` objects.
- */
-function formatTaggedTranscript(
-  entries: TranscriptEntry[],
-  filteredSystemPrompt?: string,
-): string {
-  const messages: ReflectionMessage[] = [];
-
-  if (filteredSystemPrompt) {
-    messages.push({ role: "system", content: filteredSystemPrompt });
-  }
-
-  for (const entry of entries) {
-    switch (entry.kind) {
-      case "user":
-        messages.push({
-          role: "user",
-          content: stripImagesFromText(entry.text),
-        });
-        break;
-      case "assistant":
-        messages.push({
-          role: "assistant",
-          content: stripImagesFromText(entry.text),
-        });
-        break;
-      case "reasoning":
-        messages.push({ role: "reasoning", content: entry.text });
-        break;
-      case "error":
-        messages.push({ role: "error", content: entry.text });
-        break;
-      case "tool_call": {
-        const args =
-          truncateArgs(entry.argsText, TOOL_ARGS_TRUNCATE_LIMIT) ?? "{}";
-        messages.push({
-          role: "assistant",
-          content: null,
-          tool_calls: [{ name: entry.name ?? "unknown", args }],
-        });
-        break;
-      }
-    }
-  }
-  return JSON.stringify(messages, null, 2);
+function normalizeReflectionTranscript(entries: TranscriptEntry[]): string {
+  const transcript = entries.map((entry) => JSON.stringify(entry)).join("\n");
+  const { records } = normalizeTranscript({
+    source: "letta-code",
+    transcript,
+    sourceContext: { partial: true },
+    bounds: {
+      toolArguments: { maxCharacters: null },
+    },
+    filters: { toolResults: "include" },
+  });
+  return JSON.stringify(records, null, 2);
 }
 
 function lineToTranscriptEntry(
@@ -1000,7 +898,7 @@ async function writeState(
 
 function buildPayloadPath(
   rootDir: string,
-  kind: "auto" | "candidates" | "multi" | "remember" | "slice",
+  kind: "auto" | "candidates" | "multi" | "slice",
 ): string {
   const nonce = Math.random().toString(36).slice(2, 8);
   return join(rootDir, `payload-${kind}-${nonce}.json`);
@@ -1053,39 +951,105 @@ export async function appendTranscriptDeltaJsonl(
 }
 
 /**
- * Strip dynamic / noisy sections from a system prompt so the reflection agent
- * sees only the core behavioural instructions.
- *
- * Removes:
- * - XML blocks: `<memory>`, `<self>`, `<human>`, `<available_skills>`,
- *   `<system-reminder>`, `<memory_metadata>`
- * - The `# Memory` markdown section (operational memory-filesystem docs)
+ * A transcript entry supplied by an external source adapter (e.g. converted
+ * OpenHands events). Mirrors the on-disk TranscriptEntry shape, but
+ * captured_at may be omitted (stamped at append time).
  */
-export function filterSystemPromptForReflection(raw: string): string {
-  // Remove XML-style blocks that carry dynamic/ephemeral content.
-  // Using [\s\S] instead of . so we cross newlines.
-  const tagsToStrip = [
-    "memory",
-    "self",
-    "human",
-    "available_skills",
-    "system-reminder",
-    "memory_metadata",
-  ];
-  let filtered = raw;
-  for (const tag of tagsToStrip) {
-    filtered = filtered.replace(
-      new RegExp(`<${tag}>[\\s\\S]*?</${tag}>`, "g"),
-      "",
-    );
+export type ExternalTranscriptEntry =
+  | {
+      kind: "user" | "assistant" | "reasoning" | "error";
+      text: string;
+      captured_at?: string;
+      source_message_id?: string;
+    }
+  | {
+      kind: "tool_call";
+      name?: string;
+      argsText?: string;
+      resultText?: string;
+      resultOk?: boolean;
+      captured_at?: string;
+      source_message_id?: string;
+    };
+
+function externalToTranscriptEntry(
+  entry: ExternalTranscriptEntry,
+  fallbackCapturedAt: string,
+): TranscriptEntry | null {
+  const capturedAt = normalizeString(entry.captured_at) ?? fallbackCapturedAt;
+  if (entry.kind === "tool_call") {
+    return {
+      kind: "tool_call",
+      name: entry.name,
+      argsText: entry.argsText,
+      resultText: entry.resultText,
+      resultOk: entry.resultOk,
+      captured_at: capturedAt,
+      source_message_id: entry.source_message_id,
+    };
   }
-  // Strip the "# Memory" markdown section (and everything after it).
-  // This section contains operational memory-filesystem docs that the
-  // reflection agent doesn't need.
-  filtered = filtered.replace(/\n# Memory\n[\s\S]*$/, "");
-  // Collapse runs of 3+ blank lines into 2
-  filtered = filtered.replace(/\n{3,}/g, "\n\n");
-  return filtered.trim();
+  if (typeof entry.text !== "string" || entry.text.length === 0) {
+    return null;
+  }
+  return {
+    kind: entry.kind,
+    text: entry.text,
+    captured_at: capturedAt,
+    source_message_id: entry.source_message_id,
+  };
+}
+
+/**
+ * Append externally-sourced transcript entries (already in transcript shape)
+ * for later processing by a reflection pass. Entries whose source_message_id
+ * already exists in the transcript are skipped, so repeated ingestion of an
+ * overlapping event window is idempotent.
+ */
+export async function appendExternalTranscriptEntries(
+  agentId: string,
+  conversationId: string,
+  entries: ExternalTranscriptEntry[],
+): Promise<{ appended: number; skipped: number }> {
+  return withStateLock(agentId, conversationId, async () => {
+    const paths = getReflectionTranscriptPaths(agentId, conversationId);
+    await ensurePaths(paths);
+    const state = await readState(paths);
+
+    const existingIds = new Set(
+      parseTranscriptRows(await readTranscriptLines(paths))
+        .map((row) => row.entry.source_message_id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0),
+    );
+
+    const fallbackCapturedAt = new Date().toISOString();
+    const fresh: TranscriptEntry[] = [];
+    let skipped = 0;
+    for (const external of entries) {
+      const entry = externalToTranscriptEntry(external, fallbackCapturedAt);
+      if (!entry) {
+        skipped += 1;
+        continue;
+      }
+      const id = entry.source_message_id;
+      if (id && existingIds.has(id)) {
+        skipped += 1;
+        continue;
+      }
+      if (id) {
+        existingIds.add(id);
+      }
+      fresh.push(entry);
+    }
+    if (fresh.length === 0) {
+      return { appended: 0, skipped };
+    }
+
+    const payload = fresh.map((entry) => JSON.stringify(entry)).join("\n");
+    await appendFile(paths.transcriptPath, `${payload}\n`, "utf-8");
+    state.total_completed_steps += countAssistantRows(fresh);
+    await writeState(paths, state);
+    return { appended: fresh.length, skipped };
+  });
 }
 
 type TranscriptSelection = {
@@ -1220,7 +1184,7 @@ const REFLECTION_AUTO_QUERIES = [
   {
     id: "user-corrections",
     query:
-      "user corrections and preferences repeated mistakes durable feedback",
+      "user corrections and preferences repeated mistakes recurring feedback",
   },
   {
     id: "coding-style",
@@ -1229,11 +1193,11 @@ const REFLECTION_AUTO_QUERIES = [
   {
     id: "collaboration",
     query:
-      "collaboration communication style team preferences durable workflow",
+      "collaboration communication style team preferences recurring workflow",
   },
   {
     id: "repo-gotchas",
-    query: "repo conventions project gotchas durable implementation details",
+    query: "repo conventions project gotchas important implementation details",
   },
   {
     id: "long-term-facts",
@@ -1519,7 +1483,7 @@ export async function buildReflectionAutoPayload(options: {
     max_selected: maxSelected,
     user_instruction: instruction?.trim() || undefined,
     instructions:
-      "Choose conversations likely to contain durable memory updates. Prefer explicit corrections, repeated preferences, project conventions, and contradictions; avoid one-off debugging and transient task state.",
+      "Choose conversations likely to contain useful memory updates. Prefer explicit corrections, repeated preferences, project conventions, and contradictions; avoid one-off debugging and transient task state.",
     candidates: sortedCandidates,
   };
   const candidatesPath = buildPayloadPath(payloadRoot, "candidates");
@@ -1680,7 +1644,6 @@ export async function getReflectionTranscriptState(
 export async function buildAutoReflectionPayload(
   agentId: string,
   conversationId: string,
-  systemPrompt?: string,
 ): Promise<AutoReflectionPayload | null> {
   return withStateLock(agentId, conversationId, async () => {
     const paths = getReflectionTranscriptPaths(agentId, conversationId);
@@ -1698,13 +1661,7 @@ export async function buildAutoReflectionPayload(
     }
 
     const entries = entriesForSelection(rows, selection);
-    const filteredSystemPrompt = systemPrompt
-      ? filterSystemPromptForReflection(systemPrompt) || undefined
-      : undefined;
-    const transcript = formatTaggedTranscript(entries, filteredSystemPrompt);
-    if (!transcript || transcript === "[]") {
-      return null;
-    }
+    const transcript = normalizeReflectionTranscript(entries);
 
     const payloadPath = buildPayloadPath(paths.rootDir, "auto");
     await writeFile(payloadPath, transcript, "utf-8");
@@ -1734,7 +1691,6 @@ export interface BuildMultiReflectionPayloadOptions {
   agentId: string;
   instruction?: string;
   selectionPolicy: MultiReflectionSelectionPolicy;
-  systemPrompt?: string;
   maxReplayTurnsPerConversation?: number;
   maxTotalChars?: number;
 }
@@ -1804,7 +1760,6 @@ export async function buildMultiReflectionPayload(
     agentId,
     instruction,
     selectionPolicy,
-    systemPrompt,
     maxReplayTurnsPerConversation = 50,
     maxTotalChars = 150_000,
   } = options;
@@ -1817,9 +1772,6 @@ export async function buildMultiReflectionPayload(
   }
 
   const payloadRoot = await ensureAgentPayloadRoot(agentId);
-  const filteredSystemPrompt = systemPrompt
-    ? filterSystemPromptForReflection(systemPrompt) || undefined
-    : undefined;
   const transcripts: MultiReflectionTranscriptSlice[] = [];
   let totalChars = 0;
   let firstMessageId: string | undefined;
@@ -1848,10 +1800,7 @@ export async function buildMultiReflectionPayload(
       }
 
       const entries = entriesForSelection(rows, selection);
-      const transcript = formatTaggedTranscript(entries, filteredSystemPrompt);
-      if (!transcript || transcript === "[]") {
-        return null;
-      }
+      const transcript = normalizeReflectionTranscript(entries);
       const approxChars = transcript.length;
       if (transcripts.length > 0 && totalChars + approxChars > maxTotalChars) {
         return null;

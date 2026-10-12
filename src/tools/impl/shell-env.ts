@@ -9,15 +9,28 @@ import { createRequire } from "node:module";
 import { homedir, tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { getConversationId, getCurrentAgentId } from "@/agent/context";
+import { ACTING_USER_ID_ENV } from "@/agent/acting-user";
+import {
+  getConversationId,
+  getCurrentAgentId,
+  getCurrentAgentName,
+} from "@/agent/context";
 import {
   getScopedMemoryFilesystemRoot,
   resolveScopedMemoryDir,
 } from "@/agent/memory-filesystem";
-import { getServerUrl } from "@/backend/api/client";
-import { isLocalBackendNoMemfsEnvEnabled } from "@/backend/local/paths";
-import { getCurrentWorkingDirectory } from "@/runtime-context";
+import { getDesktopAccessToken } from "@/auth/desktop-credentials";
+import { peekOrgAccessToken } from "@/auth/org-credentials-session";
+import { getServerUrl } from "@/backend/api/server-url";
+import { isLocalBackendMemfsDisabledForProcess } from "@/backend/local/paths";
+import {
+  getCurrentWorkingDirectory,
+  getRuntimeActingUserId,
+  getRuntimeContext,
+} from "@/runtime-context";
+import { getRuntimeExecutionEnv } from "@/runtime-execution-settings";
 import { settingsManager } from "@/settings-manager";
+import { LISTENER_CONNECTION_ENV } from "@/utils/subagent-launch-marker";
 import { getRipgrepBinDir } from "./ripgrep-manager.js";
 
 /**
@@ -160,7 +173,12 @@ export function getLettaShimDir(env: NodeJS.ProcessEnv = process.env): string {
   return path.join(tmpdir(), SHELL_SHIM_DIR_NAME);
 }
 
-export function ensureLettaShimDir(invocation: LettaInvocation): string | null {
+export function ensureLettaShimDir(
+  invocation: LettaInvocation,
+  electronExecPath: string | undefined = process.versions.electron
+    ? process.execPath
+    : undefined,
+): string | null {
   if (!invocation.command) return null;
 
   const shimDir = getLettaShimDir();
@@ -183,9 +201,17 @@ export function ensureLettaShimDir(invocation: LettaInvocation): string | null {
   const commandWithArgs = [invocation.command, ...invocation.args]
     .map(shellEscape)
     .join(" ");
-  writeFileSync(shimPath, `#!/bin/sh\nexec ${commandWithArgs} "$@"\n`, {
-    mode: 0o755,
-  });
+  // Electron needs this when launched from a fresh shell that did not inherit
+  // Desktop's environment. Do not add it for ordinary Node/Bun launchers.
+  const electronEnv =
+    electronExecPath && invocation.command === electronExecPath
+      ? "export ELECTRON_RUN_AS_NODE=1\n"
+      : "";
+  writeFileSync(
+    shimPath,
+    `#!/bin/sh\n${electronEnv}exec ${commandWithArgs} "$@"\n`,
+    { mode: 0o755 },
+  );
   return shimDir;
 }
 
@@ -298,7 +324,13 @@ function applyHostedMemfsGitHeaderEnv(env: NodeJS.ProcessEnv): void {
  * Includes bundled tools (like ripgrep) in PATH and Letta context for skill scripts.
  */
 export function getShellEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
+  const executionEnv = getRuntimeExecutionEnv(
+    process.env,
+    getRuntimeContext()?.executionSettings,
+  );
+  const env = { ...executionEnv };
+  const sessionAccessToken = peekOrgAccessToken() ?? getDesktopAccessToken();
+  if (sessionAccessToken) env.LETTA_API_KEY = sessionAccessToken;
   const pathKey =
     Object.keys(env).find((k) => k.toUpperCase() === "PATH") || "PATH";
   const pathPrefixes: string[] = [];
@@ -328,6 +360,23 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 
   env.USER_CWD = getCurrentWorkingDirectory();
 
+  // Commands started by a listener turn must inherit that listener's registered
+  // device identity, not a stale installation id from the child CLI settings.
+  const environmentDeviceId = getRuntimeContext()?.environmentDeviceId?.trim();
+  if (environmentDeviceId) {
+    env.LETTA_RUNTIME_ENVIRONMENT_DEVICE_ID = environmentDeviceId;
+  }
+  const listenerConnectionId = getRuntimeContext()?.connectionId;
+  if (listenerConnectionId?.startsWith("conn-")) {
+    env[LISTENER_CONNECTION_ENV] = listenerConnectionId;
+  }
+  const actingUserId = getRuntimeActingUserId();
+  if (actingUserId) {
+    env[ACTING_USER_ID_ENV] = actingUserId;
+  } else if (getRuntimeContext()?.suppressActingUserFallback) {
+    delete env[ACTING_USER_ID_ENV];
+  }
+
   // Add Letta context for skill scripts.
   // Prefer explicit agent context, but fall back to inherited env values.
   let agentId: string | undefined;
@@ -351,8 +400,13 @@ export function getShellEnv(): NodeJS.ProcessEnv {
     env.LETTA_AGENT_ID = agentId;
     env.AGENT_ID = agentId;
 
+    const agentName = getCurrentAgentName()?.trim() || env.AGENT_NAME?.trim();
+    if (agentName) {
+      env.AGENT_NAME = agentName;
+    }
+
     try {
-      const localBackendNoMemfs = isLocalBackendNoMemfsEnvEnabled();
+      const localBackendNoMemfs = isLocalBackendMemfsDisabledForProcess();
       const localBackendEnabled =
         process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL === "1" ||
         process.env.LETTA_LOCAL_BACKEND_EXPERIMENTAL?.toLowerCase() === "true";
@@ -367,18 +421,52 @@ export function getShellEnv(): NodeJS.ProcessEnv {
         env.LETTA_MEMORY_DIR = memoryDir;
         env.MEMORY_DIR = memoryDir;
       } else {
-        const inheritedMemoryDir = process.env.MEMORY_DIR?.trim();
-        const inheritedLettaMemoryDir = process.env.LETTA_MEMORY_DIR?.trim();
-        const parentAgentId = process.env.LETTA_PARENT_AGENT_ID?.trim();
+        const inheritedMemoryDir = executionEnv.MEMORY_DIR?.trim();
+        const inheritedLettaMemoryDir = executionEnv.LETTA_MEMORY_DIR?.trim();
+        const parentAgentId = executionEnv.LETTA_PARENT_AGENT_ID?.trim();
         const inheritedParentMemoryDir = parentAgentId
           ? getScopedMemoryFilesystemRoot(parentAgentId)
           : null;
+        const inheritedParentAgentDir = inheritedParentMemoryDir
+          ? path.dirname(inheritedParentMemoryDir)
+          : null;
+        const inheritedMemoryPath = inheritedMemoryDir
+          ? path.resolve(inheritedMemoryDir)
+          : null;
+        const inheritedMemoryIsParentScoped =
+          inheritedMemoryPath && inheritedParentMemoryDir
+            ? inheritedMemoryPath === path.resolve(inheritedParentMemoryDir) ||
+              Boolean(
+                inheritedParentAgentDir &&
+                  inheritedMemoryPath.startsWith(
+                    `${path.resolve(inheritedParentAgentDir)}${path.sep}memory-worktrees${path.sep}`,
+                  ),
+              )
+            : false;
+        // An EXPLICIT memory scope (LETTA_MEMORY_DIR_EXPLICIT=1, set by a
+        // launcher that deliberately points this session's memory at an
+        // isolated copy — e.g. an SDK dream batch's memfs clone) is honored
+        // when it lies outside the agents' memory store: such a path cannot
+        // be another agent's memory, which is what this guard protects.
+        // Without the marker, a non-parent-scoped inherited value is treated
+        // as stale leakage and stripped, as before.
+        const inheritedMemoryExplicit =
+          process.env.LETTA_MEMORY_DIR_EXPLICIT === "1";
+        const memoryStoreDir = path.dirname(
+          path.dirname(getScopedMemoryFilesystemRoot(agentId)),
+        );
+        const inheritedMemoryOutsideStore = Boolean(
+          inheritedMemoryPath &&
+            !inheritedMemoryPath.startsWith(
+              `${path.resolve(memoryStoreDir)}${path.sep}`,
+            ) &&
+            inheritedMemoryPath !== path.resolve(memoryStoreDir),
+        );
 
         if (
           inheritedMemoryDir &&
-          inheritedParentMemoryDir &&
-          path.resolve(inheritedMemoryDir) ===
-            path.resolve(inheritedParentMemoryDir)
+          (inheritedMemoryIsParentScoped ||
+            (inheritedMemoryExplicit && inheritedMemoryOutsideStore))
         ) {
           env.MEMORY_DIR = inheritedMemoryDir;
           env.LETTA_MEMORY_DIR = inheritedLettaMemoryDir || inheritedMemoryDir;
@@ -451,6 +539,19 @@ export function getShellEnv(): NodeJS.ProcessEnv {
   // `git push`/`pull` inside $MEMORY_DIR uses the proxy without persisting the
   // ephemeral localhost URL into the memory repo's git config.
   applyMemfsGitProxyEnv(env);
+  if (sessionAccessToken) {
+    const memfsPrefix = `${trimBaseUrl(getShellMemfsBaseUrl(env))}/v1/git/`;
+    const encoded = Buffer.from(`letta:${sessionAccessToken}`).toString(
+      "base64",
+    );
+    appendGitConfigEnv(env, `credential.${memfsPrefix}.helper`, "");
+    appendGitConfigEnv(
+      env,
+      `http.${memfsPrefix}.extraHeader`,
+      `Authorization: Basic ${encoded}`,
+    );
+    env.GIT_TERMINAL_PROMPT = "0";
+  }
   applyHostedMemfsGitHeaderEnv(env);
 
   return env;

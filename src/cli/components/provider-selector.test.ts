@@ -4,16 +4,22 @@ import {
   canConnectAnotherProvider,
   connectAnotherProviderOption,
   connectedProviderSummary,
+  connectProviderTabOrder,
   fieldValuesFromProviderPlaceholders,
   filterProviderConfigs,
-  hasConstellationProviderStoreCredentials,
+  formatConnectProviderTab,
+  hasCloudProviderStoreCredentials,
   isChatGPTUsageProvider,
   isProviderTargetLoading,
   nextProviderConnectionName,
   providerApiKeyFromInput,
+  providerManageActionLabel,
+  providerManageActions,
   providerSelectionFlow,
+  reconnectProviderOption,
+  shouldForceLocalProviderTab,
   shouldShowProviderStoreTabs,
-} from "@/cli/components/ProviderSelector";
+} from "@/cli/components/provider-selector-helpers";
 import {
   type ByokProvider,
   defaultProviderApiKey,
@@ -67,6 +73,18 @@ describe("ProviderSelector local provider API keys", () => {
     expect(isChatGPTUsageProvider(openai)).toBe(false);
   });
 
+  test("keeps OpenAI-compatible endpoints distinct from named local engines", () => {
+    const provider = providerById("openai-compatible");
+
+    expect(provider).toMatchObject({
+      providerType: "openai-compatible",
+      providerName: "openai-compatible",
+      requiresApiKey: false,
+      fields: [{ key: "apiKey", required: false }, { key: "baseUrl" }],
+    });
+    expect(defaultProviderApiKey(provider)).toBe("not-needed");
+  });
+
   test("keeps LM Studio UI identity while using server provider type", () => {
     const lmstudio = providerById("lmstudio");
 
@@ -108,6 +126,9 @@ describe("ProviderSelector local provider API keys", () => {
         expect(providerApiKeyFromInput(providerById("ollama"), "   ")).toBe(
           "not-needed",
         );
+        expect(
+          providerApiKeyFromInput(providerById("openai-compatible"), ""),
+        ).toBe("not-needed");
         expect(providerApiKeyFromInput(providerById("openai"), "")).toBe(
           undefined,
         );
@@ -130,9 +151,9 @@ describe("ProviderSelector local provider API keys", () => {
   });
 });
 
-describe("ProviderSelector Constellation auth gating", () => {
-  test("requires Constellation credentials before showing provider-store tabs", () => {
-    const loggedOut = hasConstellationProviderStoreCredentials(
+describe("ProviderSelector Letta Cloud auth gating", () => {
+  test("requires Letta Cloud credentials before showing provider-store tabs", () => {
+    const loggedOut = hasCloudProviderStoreCredentials(
       { env: {}, refreshToken: undefined },
       {},
     );
@@ -142,21 +163,21 @@ describe("ProviderSelector Constellation auth gating", () => {
     expect(shouldShowProviderStoreTabs(null)).toBe(false);
   });
 
-  test("accepts env, stored API key, or refresh token as Constellation auth", () => {
+  test("accepts env, stored API key, or refresh token as Letta Cloud auth", () => {
     expect(
-      hasConstellationProviderStoreCredentials(
+      hasCloudProviderStoreCredentials(
         { env: {}, refreshToken: undefined },
         { LETTA_API_KEY: "env-key" },
       ),
     ).toBe(true);
     expect(
-      hasConstellationProviderStoreCredentials(
+      hasCloudProviderStoreCredentials(
         { env: { LETTA_API_KEY: "stored-key" }, refreshToken: undefined },
         {},
       ),
     ).toBe(true);
     expect(
-      hasConstellationProviderStoreCredentials(
+      hasCloudProviderStoreCredentials(
         { env: {}, refreshToken: "refresh-token" },
         {},
       ),
@@ -173,8 +194,22 @@ describe("ProviderSelector provider filtering", () => {
       filterProviderConfigs(providers, "copilot").map((p) => p.id),
     ).toEqual(["github-copilot"]);
     expect(
+      filterProviderConfigs(providers, "openrou").map((p) => p.id),
+    ).toEqual(["openrouter", "openrouter-oauth"]);
+    // Keep the subscription filter aligned with pi-ai's OAuth providers.
+    expect(
       filterProviderConfigs(providers, "subscription").map((p) => p.id),
-    ).toEqual(["anthropic-oauth", "openai-codex-oauth", "github-copilot"]);
+    ).toEqual([
+      "anthropic-oauth",
+      "github-copilot",
+      "kimi-coding",
+      "meta",
+      "openai-codex-oauth",
+      "openai-oauth",
+      "openrouter-oauth",
+      "radius",
+      "xai",
+    ]);
   });
 
   test("matches provider aliases and restores all providers for blank query", () => {
@@ -212,6 +247,20 @@ describe("ProviderSelector multi-field defaults", () => {
           placeholder: "sk-...",
           secret: true,
         },
+      ]),
+    ).toEqual({});
+  });
+
+  test("does not prefill optional field placeholders", () => {
+    expect(
+      fieldValuesFromProviderPlaceholders([
+        {
+          key: "baseUrl",
+          label: "Base URL",
+          placeholder: "http://localhost:11434/v1",
+          required: false,
+        },
+        { key: "apiKey", label: "API Key", secret: true, required: false },
       ]),
     ).toEqual({});
   });
@@ -298,6 +347,42 @@ describe("ProviderSelector connected provider actions", () => {
     expect(connectAnotherProviderOption(codexProvider)).toBe(
       "Connect another ChatGPT / Codex plan",
     );
+  });
+
+  test("offers reconnect for Cloud Grok instead of a dead-end manage view", () => {
+    const grok = getProviderConfigs("api").find(
+      (provider) => provider.id === "grok",
+    );
+    if (!grok) throw new Error("Expected grok provider config");
+    const lcXai: ProviderResponse = {
+      id: "provider-lc-xai",
+      name: "lc-xai",
+      provider_type: "xai",
+    };
+
+    expect(canConnectAnotherProvider(grok, "api")).toBe(false);
+    expect(reconnectProviderOption(grok)).toBe(
+      "Reconnect xAI (Grok/X subscription)",
+    );
+    expect(
+      providerManageActions(grok, "api", [lcXai]).map((action) =>
+        providerManageActionLabel(action, grok),
+      ),
+    ).toEqual([
+      "Disconnect lc-xai",
+      "Reconnect xAI (Grok/X subscription)",
+      "Back",
+    ]);
+  });
+
+  test("defaults Cloud sessions to the Cloud connect tab", () => {
+    expect(shouldForceLocalProviderTab(null, "api")).toBe(false);
+    expect(shouldForceLocalProviderTab(true, "api")).toBe(false);
+    expect(shouldForceLocalProviderTab(false, "api")).toBe(true);
+    expect(connectProviderTabOrder("api")).toEqual(["api", "local"]);
+    expect(connectProviderTabOrder("local")).toEqual(["local", "api"]);
+    expect(formatConnectProviderTab("api", "api")).toBe("[ Cloud ]");
+    expect(formatConnectProviderTab("local", "api")).toBe("  Local  ");
   });
 
   test("suggests the next available ChatGPT OAuth provider name", () => {

@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { TOOLSET_OPTIONS } from "@/tools/toolset-catalog";
 
 export type CliFlagMode = "interactive" | "headless" | "both";
 export type CliBackendMode = "api" | "local";
@@ -118,8 +119,7 @@ export const CLI_FLAG_CATALOG = {
     mode: "both",
     help: {
       argLabel: "<name>",
-      description:
-        'Toolset mode: "auto", "codex", "default", or "gemini" (manual values override model-based auto-selection)',
+      description: `Toolset mode: ${TOOLSET_OPTIONS.map(({ id }) => `"${id}"`).join(", ")} (manual values override model-based auto-selection)`,
     },
   },
   prompt: {
@@ -136,7 +136,7 @@ export const CLI_FLAG_CATALOG = {
     mode: "both",
     help: {
       argLabel: "<mode>",
-      description: 'Backend mode: "api" or "local"',
+      description: 'Backend mode: "cloud" or "local"',
     },
   },
   tools: { parser: { type: "string" }, mode: "both" },
@@ -163,6 +163,26 @@ export const CLI_FLAG_CATALOG = {
       argLabel: "<fmt>",
       description: "Output format for headless mode (text, json, stream-json)",
       continuationLines: ["Default: text"],
+    },
+  },
+  "client-message-id": {
+    parser: { type: "string" },
+    mode: "headless",
+    help: {
+      argLabel: "<id>",
+      description:
+        "Client identity for the initial Cloud input (not a command request_id)",
+    },
+  },
+  "no-wait": {
+    parser: { type: "boolean" },
+    mode: "headless",
+    help: {
+      description:
+        "Submit a Cloud message and return its acceptance receipt without waiting for an answer",
+      continuationLines: [
+        "Use --conversation or --agent to select the destination.",
+      ],
     },
   },
   "input-format": {
@@ -192,6 +212,17 @@ export const CLI_FLAG_CATALOG = {
       description: "Inject agent-to-agent system reminder (headless mode)",
     },
   },
+  computer: {
+    parser: { type: "string" },
+    mode: "headless",
+    help: {
+      argLabel: "<selector>",
+      description:
+        "Route headless message through 'cloud' or a computer by name, device ID, or connection ID",
+    },
+  },
+  environment: { parser: { type: "string" }, mode: "headless" },
+  env: { parser: { type: "string" }, mode: "headless" },
   skills: {
     parser: { type: "string" },
     mode: "both",
@@ -211,17 +242,6 @@ export const CLI_FLAG_CATALOG = {
     },
   },
   "pre-load-skills": { parser: { type: "string" }, mode: "headless" },
-  // Legacy alias retained for backward compatibility; use --import in docs/errors.
-  "from-af": { parser: { type: "string" }, mode: "both" },
-  import: {
-    parser: { type: "string" },
-    mode: "both",
-    help: {
-      argLabel: "<path>",
-      description: "Create agent from an AgentFile (.af) template",
-      continuationLines: ["Use @author/name to import from the agent registry"],
-    },
-  },
   // Internal headless metadata tag assignment (not part of primary user help).
   tags: { parser: { type: "string" }, mode: "headless" },
   memfs: {
@@ -229,10 +249,30 @@ export const CLI_FLAG_CATALOG = {
     mode: "both",
     help: { description: "Enable memory filesystem for this agent" },
   },
+  ephemeral: {
+    parser: { type: "boolean" },
+    mode: "headless",
+    help: {
+      description: "Run in a temporary conversation with no agent or memory",
+    },
+  },
+  stateless: {
+    parser: { type: "boolean" },
+    mode: "headless",
+    help: {
+      description: "Run an existing agent without MemFS enablement or sync",
+    },
+  },
+  // DEPRECATED no-op, intentionally hidden from help. Accepted for backward
+  // compatibility: older parent processes (pre-mandatory-memfs) spawn
+  // subagents with --no-memfs, and after an auto-update the child binary on
+  // disk is newer than the still-running parent. Rejecting the flag broke
+  // reflection subagents during that version skew (LET-9436). Subagent
+  // statelessness now derives from LETTA_CODE_AGENT_ROLE=subagent, so the
+  // flag is simply ignored.
   "no-memfs": {
     parser: { type: "boolean" },
     mode: "both",
-    help: { description: "Disable memory filesystem for this agent" },
   },
   "memfs-startup": {
     parser: { type: "string" },
@@ -382,6 +422,12 @@ export function parseCliArgs(args: string[], strict: boolean) {
     strict,
     allowPositionals: true,
   });
+  const clientMessageId = parsed.values["client-message-id"];
+  if (
+    clientMessageId !== undefined &&
+    (typeof clientMessageId !== "string" || !clientMessageId.trim())
+  )
+    throw new Error("--client-message-id must be a non-empty string");
   return {
     ...parsed,
     values: parsed.values as CliParsedValues,
@@ -394,9 +440,10 @@ export function parseBackendModeFlag(
   value: string | undefined,
 ): CliBackendMode | undefined {
   if (value === undefined) return undefined;
-  if (value === "api" || value === "local") return value;
+  if (value === "cloud" || value === "api") return "api";
+  if (value === "local") return "local";
   throw new Error(
-    `Invalid --backend value "${value}". Expected "api" or "local".`,
+    `Invalid --backend value "${value}". Expected "cloud" or "local".`,
   );
 }
 
@@ -414,7 +461,7 @@ export function extractBackendFlag(args: string[]): {
       const value = args[index + 1];
       if (value === undefined) {
         throw new Error(
-          'Missing value for --backend. Expected "api" or "local".',
+          'Missing value for --backend. Expected "cloud" or "local".',
         );
       }
       backend = parseBackendModeFlag(value);

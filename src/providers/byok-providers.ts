@@ -3,8 +3,7 @@
  * Unified module for managing custom LLM provider connections
  */
 
-import { getProviders } from "@earendil-works/pi-ai";
-import { getOAuthProviders } from "@earendil-works/pi-ai/oauth";
+import { getBuiltinProviders } from "@earendil-works/pi-ai/providers/all";
 import {
   checkProviderApiKey as checkProviderApiKeyRequest,
   createOrUpdateProvider as createOrUpdateProviderRequest,
@@ -17,6 +16,7 @@ import {
   updateProvider as updateProviderRequest,
 } from "@/backend/api/providers";
 import { getBackend } from "@/backend/backend";
+import { listBuiltinOAuthProviders } from "@/backend/dev/pi-oauth";
 import { listRegisteredPiProviders } from "@/backend/dev/pi-provider-mod-registry";
 import {
   getPiProviderSpec,
@@ -36,6 +36,7 @@ import {
   updateLocalProvider,
 } from "@/backend/local/local-provider-auth-store";
 import type { LocalProviderTimeout } from "@/backend/local/local-provider-timeout";
+import { isOpenAICompatibleProxyEndpoint } from "@/utils/openai-endpoint";
 
 export type { ProviderResponse } from "@/backend/api/providers";
 
@@ -48,6 +49,7 @@ export interface ProviderConnectionOptions {
 
 export interface ProviderOperationOptions {
   target?: ProviderStorageTarget;
+  connection?: ProviderConnectionOptions;
 }
 
 // Field definition for multi-field providers (like Bedrock)
@@ -56,6 +58,7 @@ export interface ProviderField {
   label: string;
   placeholder?: string;
   secret?: boolean; // If true, mask input like a password
+  required?: boolean; // Defaults to true when omitted
 }
 
 // Auth method definition for providers with multiple auth options
@@ -109,8 +112,8 @@ const BEDROCK_AUTH_METHODS: AuthMethod[] = [
   },
 ];
 
-// Provider configuration for the Constellation / Letta API provider store.
-export const CONSTELLATION_BYOK_PROVIDERS: readonly ByokProvider[] = [
+// Provider configuration for the Letta Cloud / API provider store.
+export const CLOUD_BYOK_PROVIDERS: readonly ByokProvider[] = [
   {
     id: "codex",
     displayName: "ChatGPT / Codex plan",
@@ -118,6 +121,15 @@ export const CONSTELLATION_BYOK_PROVIDERS: readonly ByokProvider[] = [
     providerType: "chatgpt_oauth",
     providerName: "chatgpt-plus-pro",
     isOAuth: true,
+  },
+  {
+    id: "grok",
+    displayName: "xAI (Grok/X subscription)",
+    description: "Connect a subscription account",
+    providerType: "xai",
+    providerName: "lc-xai",
+    isOAuth: true,
+    oauthProviderId: "xai",
   },
   {
     id: "anthropic",
@@ -132,6 +144,21 @@ export const CONSTELLATION_BYOK_PROVIDERS: readonly ByokProvider[] = [
     description: "Connect an OpenAI API key",
     providerType: "openai",
     providerName: "lc-openai",
+  },
+  {
+    id: "openai-compatible",
+    displayName: "OpenAI-compatible API",
+    description: "Connect an OpenAI-compatible Chat Completions endpoint",
+    providerType: "openai",
+    providerName: "lc-openai-compatible",
+    fields: [
+      { key: "apiKey", label: "API Key", secret: true },
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "https://proxy.example.com/v1",
+      },
+    ],
   },
   {
     id: "zai",
@@ -183,6 +210,15 @@ export const CONSTELLATION_BYOK_PROVIDERS: readonly ByokProvider[] = [
     providerName: "lc-openrouter",
   },
   {
+    id: "openrouter-oauth",
+    displayName: "OpenRouter OAuth",
+    description: "Connect an OpenRouter account",
+    providerType: "openrouter",
+    providerName: "openrouter-oauth",
+    isOAuth: true,
+    oauthProviderId: "openrouter",
+  },
+  {
     id: "bedrock",
     displayName: "AWS Bedrock",
     description: "Connect to Claude on Amazon Bedrock",
@@ -193,7 +229,7 @@ export const CONSTELLATION_BYOK_PROVIDERS: readonly ByokProvider[] = [
 ];
 
 // Backwards-compatible export for code/tests that mean the API provider list.
-export const BYOK_PROVIDERS = CONSTELLATION_BYOK_PROVIDERS;
+export const BYOK_PROVIDERS = CLOUD_BYOK_PROVIDERS;
 
 const LOCAL_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   anthropic: "Anthropic",
@@ -242,12 +278,21 @@ const LOCAL_EXTRA_PROVIDER_CONFIGS: readonly ByokProvider[] = [
   {
     id: "ollama",
     displayName: "Ollama (local)",
-    description: "Connect local Ollama at http://localhost:11434/v1",
+    description: "Connect Ollama at http://localhost:11434/v1 or a remote URL",
     providerType: "ollama",
     providerName: "ollama",
     providerNames: ["ollama", "lc-ollama"],
     requiresApiKey: false,
     defaultApiKey: LOCAL_PROVIDER_NO_API_KEY,
+    fields: [
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "http://localhost:11434/v1",
+        required: false,
+      },
+      { key: "apiKey", label: "API Key", secret: true, required: false },
+    ],
   },
   {
     id: "ollama-cloud",
@@ -258,24 +303,58 @@ const LOCAL_EXTRA_PROVIDER_CONFIGS: readonly ByokProvider[] = [
     providerNames: ["ollama-cloud", "lc-ollama-cloud"],
   },
   {
+    id: "openai-compatible",
+    displayName: "OpenAI-compatible API",
+    description: "Connect an OpenAI-compatible Chat Completions endpoint",
+    providerType: "openai-compatible",
+    providerName: "openai-compatible",
+    providerNames: ["openai-compatible", "lc-openai-compatible"],
+    requiresApiKey: false,
+    defaultApiKey: LOCAL_PROVIDER_NO_API_KEY,
+    fields: [
+      { key: "apiKey", label: "API Key", secret: true, required: false },
+      { key: "baseUrl", label: "Base URL" },
+    ],
+  },
+  {
     id: "lmstudio",
     displayName: "LM Studio (local)",
-    description: "Connect local LM Studio at http://127.0.0.1:1234/v1",
+    description:
+      "Connect LM Studio at http://127.0.0.1:1234/v1 or a remote URL",
     providerType: LMSTUDIO_OPENAI_PROVIDER_TYPE,
     providerName: "lmstudio",
     providerNames: ["lmstudio", "lc-lmstudio"],
     requiresApiKey: false,
     defaultApiKey: LOCAL_PROVIDER_NO_API_KEY,
+    fields: [
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "http://127.0.0.1:1234/v1",
+        required: false,
+      },
+      { key: "apiKey", label: "API Key", secret: true, required: false },
+    ],
   },
   {
     id: "llama-cpp",
     displayName: "llama.cpp (local)",
-    description: "Connect local llama.cpp at http://localhost:8080/v1",
+    description:
+      "Connect llama.cpp at http://localhost:8080/v1 or a remote URL",
     providerType: "llama_cpp",
     providerName: "llama-cpp",
     providerNames: ["llama-cpp", "lc-llama-cpp"],
     requiresApiKey: false,
     defaultApiKey: LOCAL_PROVIDER_NO_API_KEY,
+    fields: [
+      {
+        key: "baseUrl",
+        label: "Base URL",
+        placeholder: "http://localhost:8080/v1",
+        required: false,
+      },
+      { key: "apiKey", label: "API Key", secret: true, required: false },
+    ],
   },
 ];
 
@@ -310,13 +389,17 @@ function byokProviderFromPiSpec(provider: string): ByokProvider | undefined {
   };
 }
 
-// Pi TUI exposes Anthropic in both subscription and API-key login flows.
-// Other OAuth providers are subscription-only in the Pi TUI.
-const PI_TUI_API_KEY_OAUTH_PROVIDER_IDS = new Set(["anthropic"]);
+// Providers that support both OAuth and API-key authentication need distinct
+// local /connect entries for each method.
+const LOCAL_DUAL_AUTH_PROVIDER_IDS = new Set([
+  "anthropic",
+  "openai",
+  "openrouter",
+]);
 
 function localOAuthConfigId(providerId: string): string {
   if (providerId === "openai-codex") return "openai-codex-oauth";
-  if (PI_TUI_API_KEY_OAUTH_PROVIDER_IDS.has(providerId)) {
+  if (LOCAL_DUAL_AUTH_PROVIDER_IDS.has(providerId)) {
     return `${providerId}-oauth`;
   }
   return providerId;
@@ -326,7 +409,7 @@ function localOAuthProviderConfigs(): ByokProvider[] {
   const registeredProviderIds = new Set(
     listRegisteredPiProviders().map((provider) => provider.providerName),
   );
-  return getOAuthProviders()
+  return listBuiltinOAuthProviders()
     .filter((provider) => !registeredProviderIds.has(provider.id))
     .map((provider) => {
       const spec = PI_PROVIDER_SPECS.find(
@@ -354,12 +437,12 @@ function localOAuthProviderConfigs(): ByokProvider[] {
 
 function localApiKeyProviderIds(): string[] {
   const oauthProviderIds = new Set(
-    getOAuthProviders().map((provider) => provider.id),
+    listBuiltinOAuthProviders().map((provider) => provider.id),
   );
-  return getProviders().filter(
+  return getBuiltinProviders().filter(
     (provider) =>
       !oauthProviderIds.has(provider) ||
-      PI_TUI_API_KEY_OAUTH_PROVIDER_IDS.has(provider),
+      LOCAL_DUAL_AUTH_PROVIDER_IDS.has(provider),
   );
 }
 
@@ -414,7 +497,7 @@ function byokProviderFromRegisteredProvider(
 export function getProviderConfigs(
   target: ProviderStorageTarget = defaultProviderStorageTarget(),
 ): readonly ByokProvider[] {
-  if (target === "api") return CONSTELLATION_BYOK_PROVIDERS;
+  if (target === "api") return CLOUD_BYOK_PROVIDERS;
 
   const byId = new Map<string, ByokProvider>();
   for (const provider of localOAuthProviderConfigs()) {
@@ -497,10 +580,30 @@ export { PROVIDER_TYPE_TO_BASE_PROVIDER };
 /**
  * Build a mapping of BYOK provider names → base provider strings.
  *
- * Default aliases are derived from both Constellation and local provider
+ * Default aliases are derived from both Letta Cloud and local provider
  * metadata so all built-in providers are covered. Connected providers are
  * layered on top to support custom provider names.
  */
+export function buildOpenAICompatibleProxyProviderNames(
+  connectedProviders: Array<
+    Pick<
+      ProviderResponse,
+      "name" | "provider_type" | "provider_category" | "base_url"
+    >
+  >,
+): Set<string> {
+  return new Set(
+    connectedProviders
+      .filter(
+        (provider) =>
+          provider.provider_category === "byok" &&
+          provider.provider_type === "openai" &&
+          isOpenAICompatibleProxyEndpoint(provider.base_url),
+      )
+      .map((provider) => provider.name),
+  );
+}
+
 export function buildByokProviderAliases(
   connectedProviders: Array<
     Pick<ProviderResponse, "name" | "provider_type">
@@ -626,6 +729,7 @@ export async function checkProviderApiKey(
     accessKey,
     region,
     profile,
+    options.connection?.baseURL,
   );
 }
 
@@ -661,6 +765,7 @@ export async function createProvider(
     accessKey,
     region,
     profile,
+    options.baseURL,
   );
 }
 
@@ -689,7 +794,14 @@ export async function updateProvider(
       options,
     );
   }
-  return updateProviderRequest(providerId, apiKey, accessKey, region, profile);
+  return updateProviderRequest(
+    providerId,
+    apiKey,
+    accessKey,
+    region,
+    profile,
+    options.baseURL,
+  );
 }
 
 /**
@@ -739,6 +851,7 @@ export async function createOrUpdateProvider(
     accessKey,
     region,
     profile,
+    options.baseURL,
   );
 }
 
@@ -764,4 +877,12 @@ export function getProviderConfig(
   target: ProviderStorageTarget = defaultProviderStorageTarget(),
 ): ByokProvider | undefined {
   return getProviderConfigs(target).find((p) => p.id === id);
+}
+
+export function isXaiOAuthProvider(provider: ByokProvider): boolean {
+  return (
+    provider.isOAuth === true &&
+    provider.providerType === "xai" &&
+    provider.oauthProviderId === "xai"
+  );
 }

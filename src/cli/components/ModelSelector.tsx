@@ -1,29 +1,54 @@
 // Import useInput from vendored Ink for bracketed paste support
 import { Box, useInput } from "ink";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
 import {
   clearAvailableModelsCache,
   getAvailableModelHandles,
   getAvailableModelsCacheInfo,
   getCachedModelHandles,
   getCachedModelProviderTypes,
+  getCachedOpenAICompatibleProxyHandles,
 } from "@/agent/available-models";
 import {
   CHATGPT_FAST_SERVICE_TIER,
   getChatGptFastRegistryHandleForModelHandle,
-  getLocalModelLabel,
-  getModelInfo,
   models,
   normalizeModelHandleForRegistry,
 } from "@/agent/model";
+import { refreshModelCatalog } from "@/agent/remote-model-catalog";
+import {
+  getPiProviderRegistryRevision,
+  subscribePiProviderRegistry,
+} from "@/backend/dev/pi-provider-mod-registry";
 
 import {
   buildByokProviderAliases,
+  buildOpenAICompatibleProxyProviderNames,
   isByokHandleForSelector,
   listProviders,
 } from "@/providers/byok-providers";
 import { settingsManager } from "@/settings-manager";
 import { colors } from "./colors";
+import {
+  baseHandleForByokAlias,
+  filterModelsByAvailabilityForSelector,
+  includeUnknownBackendHandleInRecommended,
+  labelForBackendModel,
+  type ModelSelectorSelection,
+  registryHandleForBackendModel,
+  registryHandleForByokAlias,
+  toByokSelectorModel,
+  toSelectorModelForHandle,
+  type UiModel,
+  withProviderMetadataForSelector,
+} from "./model-selector-helpers";
 import { OverlayShell } from "./OverlayShell";
 import { TabBar } from "./TabBar";
 import { Text } from "./Text";
@@ -39,11 +64,23 @@ type ModelCategory =
   | "server-recommended"
   | "server-all";
 
-const CHATGPT_OAUTH_BASE_PROVIDER = "openai-codex";
-const CHATGPT_LABEL_SUFFIX_PATTERN = /\s+\(ChatGPT\)$/;
-
 // Re-export for consumers that import from ModelSelector
 export { buildByokProviderAliases, isByokHandleForSelector };
+export type {
+  ModelSelectorSelection,
+  UiModel,
+} from "./model-selector-helpers";
+export {
+  filterModelsByAvailabilityForSelector,
+  includeUnknownBackendHandleInRecommended,
+  labelForBackendModel,
+  labelForChatGPTByokAlias,
+  registryHandleForBackendModel,
+  registryHandleForByokAlias,
+  toByokSelectorModel,
+  toSelectorModelForHandle,
+  withProviderMetadataForSelector,
+} from "./model-selector-helpers";
 
 export function usesBackendModelCatalog(
   isSelfHosted?: boolean,
@@ -70,7 +107,7 @@ export function getEmptyStateActionDescriptors(
           {
             id: "login" as const,
             label: "/login",
-            description: "Sign in to Letta Constellation",
+            description: "Sign in with Letta",
           },
         ]
       : []),
@@ -101,134 +138,6 @@ export function getModelCategories(
     return ["recents", ...base];
   }
   return base;
-}
-
-export type UiModel = {
-  id: string;
-  handle: string;
-  label: string;
-  description: string;
-  registryHandle?: string;
-  isDefault?: boolean;
-  isFeatured?: boolean;
-  free?: boolean;
-  updateArgs?: Record<string, unknown>;
-};
-
-export type ModelSelectorSelection = Pick<
-  UiModel,
-  "id" | "handle" | "label" | "description" | "registryHandle" | "updateArgs"
->;
-
-export function labelForChatGPTByokAlias(
-  label: string,
-  handle: string,
-  byokProviderAliases: Record<string, string>,
-): string {
-  const slashIndex = handle.indexOf("/");
-  if (slashIndex === -1) return label;
-
-  const providerAlias = handle.slice(0, slashIndex);
-  if (byokProviderAliases[providerAlias] !== CHATGPT_OAUTH_BASE_PROVIDER) {
-    return label;
-  }
-
-  return label.replace(CHATGPT_LABEL_SUFFIX_PATTERN, ` (${providerAlias})`);
-}
-
-export function baseHandleForByokAlias(
-  handle: string,
-  byokProviderAliases: Record<string, string>,
-): string {
-  const slashIndex = handle.indexOf("/");
-  if (slashIndex === -1) return handle;
-
-  const provider = handle.slice(0, slashIndex);
-  const model = handle.slice(slashIndex + 1);
-  const baseProvider = byokProviderAliases[provider];
-
-  if (baseProvider) {
-    return `${baseProvider}/${model}`;
-  }
-  return handle;
-}
-
-export function registryHandleForByokAlias(
-  handle: string,
-  byokProviderAliases: Record<string, string>,
-): string {
-  const baseHandle = baseHandleForByokAlias(handle, byokProviderAliases);
-  return normalizeModelHandleForRegistry(baseHandle) ?? baseHandle;
-}
-
-export function toByokSelectorModel(
-  staticModel: UiModel,
-  handle: string,
-  byokProviderAliases: Record<string, string>,
-  updateArgs?: Record<string, unknown>,
-): UiModel {
-  const resolvedUpdateArgs =
-    updateArgs ??
-    (staticModel.updateArgs as Record<string, unknown> | undefined);
-
-  return {
-    ...staticModel,
-    id: handle,
-    handle,
-    registryHandle: registryHandleForByokAlias(handle, byokProviderAliases),
-    label: labelForChatGPTByokAlias(
-      staticModel.label,
-      handle,
-      byokProviderAliases,
-    ),
-    updateArgs: resolvedUpdateArgs,
-  };
-}
-
-export function toSelectorModelForHandle(handle: string): UiModel {
-  const registryHandle = normalizeModelHandleForRegistry(handle) ?? handle;
-  const modelInfo = getModelInfo(registryHandle);
-  if (modelInfo) {
-    return {
-      id: handle,
-      handle,
-      registryHandle,
-      label: modelInfo.label,
-      description: modelInfo.description ?? "",
-      updateArgs: modelInfo.updateArgs as Record<string, unknown> | undefined,
-    };
-  }
-  return {
-    id: handle,
-    handle,
-    label: getLocalModelLabel(handle),
-    description: "",
-  };
-}
-
-const API_GATED_MODEL_HANDLES = new Set([
-  "letta/auto",
-  "letta/auto-fast",
-  "letta/glm",
-]);
-
-export function filterModelsByAvailabilityForSelector<
-  T extends { handle: string },
->(
-  typedModels: T[],
-  availableHandles: Set<string> | null,
-  allApiHandles: string[],
-): T[] {
-  if (availableHandles === null) {
-    return typedModels.filter((m) => {
-      if (!API_GATED_MODEL_HANDLES.has(m.handle)) {
-        return true;
-      }
-      return allApiHandles.includes(m.handle);
-    });
-  }
-
-  return typedModels.filter((m) => availableHandles.has(m.handle));
 }
 
 interface ModelSelectorProps {
@@ -305,6 +214,18 @@ export function ModelSelector({
   const [byokProviderAliases, setByokProviderAliases] = useState<
     Record<string, string>
   >(() => buildByokProviderAliases([]));
+  const [openAICompatibleProxyHandles, setOpenAICompatibleProxyHandles] =
+    useState<Set<string>>(
+      () => getCachedOpenAICompatibleProxyHandles() ?? new Set(),
+    );
+  const [openAICompatibleProxyProviders, setOpenAICompatibleProxyProviders] =
+    useState<Set<string>>(new Set());
+  const providerRegistryRevision = useSyncExternalStore(
+    subscribePiProviderRegistry,
+    getPiProviderRegistryRevision,
+    getPiProviderRegistryRevision,
+  );
+  const previousProviderRegistryRevision = useRef(providerRegistryRevision);
 
   const mountedRef = useRef(true);
   useEffect(() => {
@@ -349,13 +270,24 @@ export function ModelSelector({
       }
 
       const cacheInfoBefore = getAvailableModelsCacheInfo();
-      const result = await getAvailableModelHandles({ forceRefresh });
+      // Refresh the curated catalog alongside availability so the preset
+      // list reflects cloud-canon data before this component re-renders
+      // (best-effort: on failure `models` keeps its current contents).
+      const [result] = await Promise.all([
+        getAvailableModelHandles({ forceRefresh }),
+        refreshModelCatalog(forceRefresh ? { force: true } : undefined).catch(
+          () => false,
+        ),
+      ]);
 
       if (!mountedRef.current) return;
 
       setAvailableHandles(result.handles);
       setAllApiHandles(Array.from(result.handles));
       setProviderTypesByHandle(new Map(result.providerTypes));
+      setOpenAICompatibleProxyHandles(
+        new Set(result.openAICompatibleProxyHandles),
+      );
       setIsCached(!forceRefresh && cacheInfoBefore.isFresh);
       setIsLoading(false);
       setRefreshing(false);
@@ -368,16 +300,22 @@ export function ModelSelector({
       setAvailableHandles(null);
       setAllApiHandles([]);
       setProviderTypesByHandle(new Map());
+      setOpenAICompatibleProxyHandles(new Set());
     }
   });
 
   useEffect(() => {
+    if (previousProviderRegistryRevision.current !== providerRegistryRevision) {
+      previousProviderRegistryRevision.current = providerRegistryRevision;
+      clearAvailableModelsCache();
+    }
     loadModels.current(forceRefreshOnMount ?? false);
-  }, [forceRefreshOnMount]);
+  }, [forceRefreshOnMount, providerRegistryRevision]);
 
   useEffect(() => {
     if (localModelCatalog) {
       setByokProviderAliases(buildByokProviderAliases([]));
+      setOpenAICompatibleProxyProviders(new Set());
       return;
     }
     (async () => {
@@ -385,9 +323,13 @@ export function ModelSelector({
         const providers = await listProviders();
         if (!mountedRef.current) return;
         setByokProviderAliases(buildByokProviderAliases(providers));
+        setOpenAICompatibleProxyProviders(
+          buildOpenAICompatibleProxyProviderNames(providers),
+        );
       } catch {
         if (!mountedRef.current) return;
         setByokProviderAliases(buildByokProviderAliases([]));
+        setOpenAICompatibleProxyProviders(new Set());
       }
     })();
   }, [localModelCatalog]);
@@ -453,18 +395,31 @@ export function ModelSelector({
       updateArgs: Record<string, unknown> | undefined,
     ): Record<string, unknown> | undefined => {
       const providerType = providerTypesByHandle.get(handle);
-      if (!providerType) return updateArgs;
-      return {
-        ...(updateArgs ?? {}),
-        provider_type: providerType,
-      };
+      const providerName = handle.split("/")[0];
+      return withProviderMetadataForSelector(
+        updateArgs,
+        providerType,
+        isByokHandleForSelector(handle, byokProviderAliases),
+        openAICompatibleProxyHandles.has(handle) ||
+          (providerName !== undefined &&
+            openAICompatibleProxyProviders.has(providerName)),
+      );
     },
-    [providerTypesByHandle],
+    [
+      byokProviderAliases,
+      openAICompatibleProxyHandles,
+      openAICompatibleProxyProviders,
+      providerTypesByHandle,
+    ],
   );
 
   const modelsForBackendHandle = useCallback(
     (handle: string, includeUnknown: boolean): UiModel[] => {
-      const registryHandle = normalizeModelHandleForRegistry(handle) ?? handle;
+      const providerType = providerTypesByHandle.get(handle);
+      const registryHandle = registryHandleForBackendModel(
+        handle,
+        providerType,
+      );
       const baseStaticModel = pickPreferredStaticModel(registryHandle);
       const fastRegistryHandle =
         getChatGptFastRegistryHandleForModelHandle(handle);
@@ -484,7 +439,10 @@ export function ModelSelector({
         : null;
       const baseModel = baseStaticModel
         ? withActualHandle(
-            baseStaticModel,
+            {
+              ...baseStaticModel,
+              label: labelForBackendModel(baseStaticModel.label, providerType),
+            },
             handle,
             registryHandle,
             baseUpdateArgsWithProviderType,
@@ -518,11 +476,16 @@ export function ModelSelector({
 
       return result;
     },
-    [pickPreferredStaticModel, withActualHandle, withProviderTypeMetadata],
+    [
+      pickPreferredStaticModel,
+      providerTypesByHandle,
+      withActualHandle,
+      withProviderTypeMetadata,
+    ],
   );
 
-  // Supported models: models.json entries that are available
-  // Featured models first, then non-featured, preserving JSON order within each group
+  // Supported models: runtime catalog entries that are available
+  // Featured models first, then non-featured, preserving catalog order within each group
   // If filterProvider is set, only show models from that provider
   const supportedModels = useMemo(() => {
     if (availableHandles === undefined) return [];
@@ -581,7 +544,7 @@ export function ModelSelector({
     [byokProviderAliases],
   );
 
-  // Letta API (all): all non-BYOK handles from API, including recommended models.
+  // Letta API (all): preserve backend metadata when aliases are not yet classified as BYOK.
   const allLettaModels = useMemo(() => {
     if (availableHandles === undefined) return [];
 
@@ -589,18 +552,14 @@ export function ModelSelector({
       .filter((handle) => !isByokHandle(handle))
       .map((handle) => {
         const staticModel = pickPreferredStaticModel(handle);
-        if (staticModel) {
-          return {
-            ...staticModel,
-            id: handle,
-            handle,
-          };
-        }
         return {
+          ...(staticModel ?? { label: handle, description: "" }),
           id: handle,
           handle,
-          label: handle,
-          description: "",
+          updateArgs: withProviderTypeMetadata(
+            handle,
+            staticModel?.updateArgs as Record<string, unknown> | undefined,
+          ),
         } satisfies UiModel;
       });
 
@@ -621,9 +580,10 @@ export function ModelSelector({
     isByokHandle,
     pickPreferredStaticModel,
     searchQuery,
+    withProviderTypeMetadata,
   ]);
 
-  // Convert BYOK handle to base provider handle for models.json lookup
+  // Convert a BYOK handle to its base provider handle for catalog lookup
   // e.g., "lc-anthropic/claude-3-5-haiku" -> "anthropic/claude-3-5-haiku"
   // e.g., "lc-gemini/gemini-2.0-flash" -> "google_ai/gemini-2.0-flash"
   const toBaseHandle = useCallback(
@@ -632,20 +592,20 @@ export function ModelSelector({
     [byokProviderAliases],
   );
 
-  // BYOK (recommended): BYOK API handles that have matching entries in models.json
+  // BYOK (recommended): BYOK API handles with matching runtime catalog entries
   const byokModels = useMemo(() => {
     if (availableHandles === undefined) return [];
 
     // Get all BYOK handles from API
     const byokHandles = allApiHandles.filter(isByokHandle);
 
-    // Find models.json entries that match (using alias for lc-* providers)
+    // Find matching catalog entries (using aliases for lc-* providers)
     const matched: UiModel[] = [];
     for (const handle of byokHandles) {
       const baseHandle = toBaseHandle(handle);
       const staticModel = pickPreferredStaticModel(baseHandle);
       if (staticModel) {
-        // Use models.json data but with the BYOK handle as the ID
+        // Use catalog metadata but keep the BYOK handle as the ID
         matched.push(
           toByokSelectorModel(
             staticModel,
@@ -701,13 +661,21 @@ export function ModelSelector({
     return filtered;
   }, [availableHandles, allApiHandles, searchQuery, isByokHandle]);
 
-  // Server-recommended models: models.json entries available on the server (for self-hosted)
+  // Server-recommended models: runtime catalog entries available on the server.
+  // Discoverable local endpoint providers (Ollama, LM Studio, llama.cpp) may
+  // not have preset entries, so include their live-discovered
+  // handles here instead of hiding them until the user switches to "All".
   // Filter out letta/letta-free legacy model
   const serverRecommendedModels = useMemo(() => {
     if (!backendModelCatalog || availableHandles === undefined) return [];
     let available = allApiHandles
       .filter((handle) => handle !== "letta/letta-free")
-      .flatMap((handle) => modelsForBackendHandle(handle, false));
+      .flatMap((handle) =>
+        modelsForBackendHandle(
+          handle,
+          includeUnknownBackendHandleInRecommended(handle),
+        ),
+      );
     if (searchQuery) {
       const query = searchQuery.toLowerCase();
       available = available.filter(
@@ -769,7 +737,7 @@ export function ModelSelector({
     searchQuery,
   ]);
 
-  // Recent models: models the user has recently selected (max 5)
+  // Recent models: models the user has recently selected (max 10)
   // Only includes models that are currently available
   const recentModels = useMemo(() => {
     if (availableHandles === undefined) return [];
@@ -780,6 +748,12 @@ export function ModelSelector({
     for (const handle of recentHandles) {
       // When availableHandles is non-null, skip unavailable models
       if (availableHandles !== null && !availableHandles.has(handle)) continue;
+
+      if (backendModelCatalog) {
+        const backendModel = modelsForBackendHandle(handle, true)[0];
+        if (backendModel) resolved.push(backendModel);
+        continue;
+      }
 
       // Try to resolve to a static model with label/description
       const staticModel = pickPreferredStaticModel(toBaseHandle(handle));
@@ -809,7 +783,9 @@ export function ModelSelector({
     return resolved;
   }, [
     availableHandles,
+    backendModelCatalog,
     byokProviderAliases,
+    modelsForBackendHandle,
     pickPreferredStaticModel,
     toBaseHandle,
     withProviderTypeMetadata,

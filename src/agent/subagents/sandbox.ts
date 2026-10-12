@@ -1,6 +1,9 @@
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import {
   buildMemorySubagentSandboxPolicy,
   getCrossBackendAgentsTreeRoots,
+  getLettaHomeRoot,
 } from "@/permissions/sandbox-policy";
 import {
   detectSandboxBackend,
@@ -16,13 +19,15 @@ import type { SubagentLaunchProfile } from ".";
 /**
  * Applies an OS-level filesystem sandbox to a subagent child process at spawn.
  *
- * Subagents with the memory-subagent profile (reflection, memory, init, history-analyzer) operate
+ * Subagents with the memory-subagent profile (reflection, memory, init) operate
  * on their parent's memory as their working filesystem. Wrapping the whole child
  * process kernel-enforces the write scope — covering its in-process Write/Edit
  * tools, its Bash commands, and anything those spawn.
  *
- * Enabled by default; set `LETTA_FS_SANDBOX=0` to opt out. No-ops when the host
- * has no sandbox backend.
+ * Enabled by default (unlike the cross-agent shell sandbox, which is opt-in:
+ * memory subagents run non-interactively, so there is no approve/deny flow to
+ * fall back on); set `LETTA_FS_SANDBOX=0` to opt out. No-ops when the host has
+ * no sandbox backend.
  *
  * Both backends scope writes to the harness state dir (`~/.letta`): a memory
  * subagent may persist memory + harness metadata (settings, logs, conversations,
@@ -48,12 +53,24 @@ export interface WrapSubagentLauncherInput {
   memoryRoots: string[];
   /** MEMORY_DIR target; folded into the writable set if not already present. */
   inheritedPrimaryRoot: string | null;
+  /** Optional exact memory scope for harness-created worktrees. */
+  memoryScope?: {
+    primaryRoot: string | null;
+    writableRoots: string[];
+    readonlyRoots?: string[];
+  };
   /**
    * Local backend storage dir (`~/.letta/lc-local-backend`), used to locate the
    * `memfs` cross-agent tree. Only consulted when `backendMode === "local"`;
    * null/omitted falls back to the default storage dir.
    */
   localBackendStorageDir?: string | null;
+  /**
+   * The child's resolved scratchpad dir (`LETTA_SCRATCHPAD`). Shell output
+   * files land here, so it must stay writable even when an inherited value
+   * points outside `~/.letta`.
+   */
+  scratchpadDir?: string | null;
   env?: NodeJS.ProcessEnv;
   /** Injectable for tests; defaults to a real host probe. */
   availability?: SandboxAvailability;
@@ -80,12 +97,13 @@ export function wrapSubagentLauncher(
   if (!isFsSandboxEnabled(env)) return null;
   if (input.launchProfile !== "memory-subagent") return null;
 
-  const writableMemoryRoots = [...input.memoryRoots];
-  if (
-    input.inheritedPrimaryRoot &&
-    !writableMemoryRoots.includes(input.inheritedPrimaryRoot)
-  ) {
-    writableMemoryRoots.push(input.inheritedPrimaryRoot);
+  const writableMemoryRoots = input.memoryScope
+    ? [...input.memoryScope.writableRoots]
+    : [...input.memoryRoots];
+  const primaryRoot =
+    input.memoryScope?.primaryRoot ?? input.inheritedPrimaryRoot;
+  if (primaryRoot && !writableMemoryRoots.includes(primaryRoot)) {
+    writableMemoryRoots.push(primaryRoot);
   }
   // Nothing to scope to → don't sandbox (avoid trapping the child with no
   // writable memory dir at all).
@@ -100,16 +118,25 @@ export function wrapSubagentLauncher(
   // Writes are scoped to the harness state dir (~/.letta) by the policy: the
   // child can persist memory + harness metadata (settings, logs, conversations,
   // transcripts) but not the repo/home/temp. Pass any harness root configured
-  // OUTSIDE ~/.letta — a custom transcript root, or a relocated local storage
-  // dir — so those stay writable too (defaults already live under ~/.letta).
+  // OUTSIDE ~/.letta — a custom transcript root, a relocated local storage
+  // dir, or an inherited scratchpad — so those stay writable too (defaults
+  // already live under ~/.letta).
   const isLocal = input.backendMode === "local";
   const storageDir = input.localBackendStorageDir ?? undefined;
+  const scratchpadDir = input.scratchpadDir || undefined;
+  if (scratchpadDir) {
+    // bwrap binds with --bind-try, which silently skips missing paths; create
+    // the scratchpad up front so the carve-out actually takes effect.
+    mkdirSync(scratchpadDir, { recursive: true });
+  }
   const harnessWritableRoots = [
     getTranscriptRoot(),
     ...(isLocal && storageDir ? [storageDir] : []),
+    ...(scratchpadDir ? [scratchpadDir] : []),
   ];
   const policy = buildMemorySubagentSandboxPolicy({
     memoryRoots: writableMemoryRoots,
+    readonlyRoots: input.memoryScope?.readonlyRoots,
     agentsTreeRoots: getCrossBackendAgentsTreeRoots({
       env,
       localBackendStorageDir: storageDir,
@@ -125,10 +152,19 @@ export function wrapSubagentLauncher(
   if (!wrapped || wrapped.length === 0) return null;
 
   const [command, ...args] = wrapped;
+  // Shell output and runtime scripts use os.tmpdir(). Keep their scratch files
+  // inside the existing harness write scope instead of opening the host temp dir.
+  const scratchRoot = join(getLettaHomeRoot(), "tmp");
+  mkdirSync(scratchRoot, { recursive: true });
   return {
     command: command as string,
     args,
-    sandboxEnv: { [SANDBOX_ENV_VAR]: availability.backend },
+    sandboxEnv: {
+      [SANDBOX_ENV_VAR]: availability.backend,
+      TMPDIR: scratchRoot,
+      TMP: scratchRoot,
+      TEMP: scratchRoot,
+    },
     backend: availability.backend,
   };
 }

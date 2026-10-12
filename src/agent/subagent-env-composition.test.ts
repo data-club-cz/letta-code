@@ -1,16 +1,145 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
-
+import { ACTING_USER_ID_ENV } from "@/agent/acting-user";
+import { isMemoryWorkerSession } from "@/agent/subagents/memory-worker-session";
+import {
+  allocateSubagentName,
+  resolveCreatedAgentName,
+} from "@/agent/subagents/names";
 import {
   composeSubagentChildEnv,
   resolveSubagentInheritedPrimaryRoot,
-} from "@/agent/subagents/manager";
-import { LETTA_INHERITED_CHANNEL_CONTEXT_ENV } from "@/runtime-context";
+} from "@/agent/subagents/subagent-launcher";
+import {
+  LETTA_MOD_CAPABILITY_PROFILE_ENV,
+  PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
+} from "@/mods/capabilities";
+import { LETTA_DISABLE_MODS_ENV } from "@/mods/disable";
+import { SUBAGENT_NAME_ENV } from "@/utils/subagent-launch-marker";
+import { TRANSCRIPT_ROOT_ENV } from "@/utils/transcript-paths";
 
 const PARENT_ID = "agent-226cd814-09bf-4436-940e-aea9d91d14cb";
 const PARENT_MEMORY_DIR = `/Users/someone/.letta/agents/${PARENT_ID}/memory`;
 
 describe("composeSubagentChildEnv", () => {
+  test("an explicitly unattributed child deletes an ambient actor", () => {
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: { [ACTING_USER_ID_ENV]: "ambient-user" },
+      parentAgentId: PARENT_ID,
+      subagentType: "general-purpose",
+      launchProfile: "default",
+      inheritedPrimaryRoot: null,
+      actingUserId: null,
+    });
+    expect(env[ACTING_USER_ID_ENV]).toBeUndefined();
+  });
+
+  test("an omitted actor override preserves the immediate parent actor", () => {
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: { [ACTING_USER_ID_ENV]: "ambient-user" },
+      parentAgentId: "agent-parent",
+      subagentType: "general-purpose",
+      launchProfile: "default",
+      inheritedPrimaryRoot: null,
+    });
+    expect(env[ACTING_USER_ID_ENV]).toBe("ambient-user");
+  });
+  test("memory workers suppress worker-side sync without marking other children as memory workers", () => {
+    const worker = composeSubagentChildEnv({
+      parentProcessEnv: {},
+      parentAgentId: PARENT_ID,
+      subagentType: "memory",
+      launchProfile: "memory-subagent",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+    });
+    expect(isMemoryWorkerSession(worker)).toBe(true);
+    expect(worker[LETTA_MOD_CAPABILITY_PROFILE_ENV]).toBe(
+      PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
+    );
+    const other = composeSubagentChildEnv({
+      parentProcessEnv: worker,
+      parentAgentId: PARENT_ID,
+      subagentType: "general-purpose",
+      launchProfile: "default",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+    });
+    expect(isMemoryWorkerSession(other)).toBe(false);
+  });
+  test("carries the reserved generated name through child creation", () => {
+    const reservedName = allocateSubagentName("Bob");
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: {},
+      parentAgentId: PARENT_ID,
+      launchProfile: "default",
+      inheritedPrimaryRoot: null,
+      subagentName: reservedName,
+    });
+    const createdName = resolveCreatedAgentName(
+      undefined,
+      true,
+      env[SUBAGENT_NAME_ENV],
+    );
+    expect(createdName).toBe(reservedName);
+    expect(createdName).not.toContain("shadow");
+  });
+
+  test("forwards a reserved name to a fresh child without leaking a parent's name", () => {
+    const parentProcessEnv = { [SUBAGENT_NAME_ENV]: "Deckard (subagent)" };
+    const options = {
+      parentProcessEnv,
+      parentAgentId: PARENT_ID,
+      launchProfile: "default" as const,
+      inheritedPrimaryRoot: null,
+    };
+    expect(
+      composeSubagentChildEnv({ ...options, subagentName: "Joi (subagent)" })[
+        SUBAGENT_NAME_ENV
+      ],
+    ).toBe("Joi (subagent)");
+    // Forks and existing-agent launches have no reservation.
+    expect(composeSubagentChildEnv(options)[SUBAGENT_NAME_ENV]).toBeUndefined();
+    expect(parentProcessEnv[SUBAGENT_NAME_ENV]).toBe("Deckard (subagent)");
+  });
+
+  test("reflection subagents load only mod providers in the child process", () => {
+    const parentProcessEnv: NodeJS.ProcessEnv = {
+      HOME: "/home/user",
+      [LETTA_DISABLE_MODS_ENV]: "0",
+    };
+    const originalProcessValue = process.env[LETTA_MOD_CAPABILITY_PROFILE_ENV];
+
+    const env = composeSubagentChildEnv({
+      parentProcessEnv,
+      parentAgentId: PARENT_ID,
+      subagentType: "reflection",
+      launchProfile: "memory-subagent",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+    });
+
+    expect(env[LETTA_MOD_CAPABILITY_PROFILE_ENV]).toBe(
+      PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
+    );
+    expect(env[LETTA_DISABLE_MODS_ENV]).toBe("0");
+    expect(parentProcessEnv[LETTA_MOD_CAPABILITY_PROFILE_ENV]).toBeUndefined();
+    expect(process.env[LETTA_MOD_CAPABILITY_PROFILE_ENV]).toBe(
+      originalProcessValue,
+    );
+  });
+
+  test("non-reflection subagents do not restrict mods by default", () => {
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: { HOME: "/home/user" },
+      parentAgentId: PARENT_ID,
+      subagentType: "general-purpose",
+      launchProfile: "default",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+    });
+
+    expect(env[LETTA_DISABLE_MODS_ENV]).toBeUndefined();
+    expect(env[LETTA_MOD_CAPABILITY_PROFILE_ENV]).toBeUndefined();
+    expect(env.LETTA_SUBAGENT_LAUNCH).toBe("1");
+  });
+
   test("normal subagent records parent identity without overriding memory dir", () => {
     const env = composeSubagentChildEnv({
       parentProcessEnv: { HOME: "/home/user" },
@@ -38,6 +167,36 @@ describe("composeSubagentChildEnv", () => {
     expect(env.MEMORY_DIR).toBe(PARENT_MEMORY_DIR);
     expect(env.LETTA_MEMORY_DIR).toBe(PARENT_MEMORY_DIR);
     expect(env.LETTA_CODE_AGENT_ROLE).toBe("subagent");
+  });
+
+  test("memory subagent receives a transcript-scoped scratchpad by default", () => {
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: {
+        HOME: "/home/user",
+        [TRANSCRIPT_ROOT_ENV]: "/sandbox/transcripts",
+      },
+      parentAgentId: PARENT_ID,
+      launchProfile: "memory-subagent",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+      subagentId: "subagent-123",
+    });
+
+    expect(env.LETTA_SCRATCHPAD).toBe(
+      join("/sandbox/transcripts", "background", "subagent-123"),
+    );
+  });
+
+  test("memory subagent preserves an explicitly configured scratchpad", () => {
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: {
+        LETTA_SCRATCHPAD: "/approved/scratchpad",
+      },
+      parentAgentId: PARENT_ID,
+      launchProfile: "memory-subagent",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+    });
+
+    expect(env.LETTA_SCRATCHPAD).toBe("/approved/scratchpad");
   });
 
   test("memory subagent with no primaryRoot keeps parent marker but clears dir", () => {
@@ -108,6 +267,26 @@ describe("composeSubagentChildEnv", () => {
 
     expect(env.MEMORY_DIR).toBe(PARENT_MEMORY_DIR);
     expect(env.LETTA_MEMORY_DIR).toBe(PARENT_MEMORY_DIR);
+  });
+
+  test("memory subagent memoryScope overrides inherited primary root", () => {
+    const worktreeDir = `/Users/someone/.letta/agents/${PARENT_ID}/memory-worktrees/reflection-123`;
+    const env = composeSubagentChildEnv({
+      parentProcessEnv: {
+        HOME: "/home/user",
+        MEMORY_DIR: "/stale/memory/dir",
+      },
+      parentAgentId: PARENT_ID,
+      launchProfile: "memory-subagent",
+      inheritedPrimaryRoot: PARENT_MEMORY_DIR,
+      memoryScope: {
+        primaryRoot: worktreeDir,
+        writableRoots: [worktreeDir],
+      },
+    });
+
+    expect(env.MEMORY_DIR).toBe(worktreeDir);
+    expect(env.LETTA_MEMORY_DIR).toBe(worktreeDir);
   });
 
   test("transcriptPath is forwarded as TRANSCRIPT_PATH env var when set", () => {
@@ -226,49 +405,6 @@ describe("composeSubagentChildEnv", () => {
     expect(env.HOME).toBe("/home/user");
     expect(env.PATH).toBe("/usr/bin:/bin");
     expect(env.CUSTOM_VAR).toBe("preserved");
-  });
-  test("inherited channel context is serialized for child process scope", () => {
-    const env = composeSubagentChildEnv({
-      parentProcessEnv: { HOME: "/home/user" },
-      parentAgentId: PARENT_ID,
-      launchProfile: "default",
-      inheritedPrimaryRoot: null,
-      inheritedChannelContext: {
-        channelToolScope: {
-          channels: [{ channelId: "telegram", accountId: "account-1" }],
-        },
-        channelTurnSources: [
-          {
-            channel: "telegram",
-            accountId: "account-1",
-            chatId: "7952253975",
-            chatType: "channel",
-            threadId: "42",
-            agentId: PARENT_ID,
-            conversationId: "default",
-          },
-        ],
-      },
-    });
-
-    expect(env[LETTA_INHERITED_CHANNEL_CONTEXT_ENV]).toBe(
-      JSON.stringify({
-        channelToolScope: {
-          channels: [{ channelId: "telegram", accountId: "account-1" }],
-        },
-        channelTurnSources: [
-          {
-            channel: "telegram",
-            accountId: "account-1",
-            chatId: "7952253975",
-            chatType: "channel",
-            threadId: "42",
-            agentId: PARENT_ID,
-            conversationId: "default",
-          },
-        ],
-      }),
-    );
   });
 });
 

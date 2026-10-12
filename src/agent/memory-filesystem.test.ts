@@ -3,17 +3,31 @@
  */
 
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  ensureLocalMemfsCheckout,
   getMemoryFilesystemRoot,
   getMemorySystemDir,
   isLettaMemfsServer,
   labelFromRelativePath,
   renderMemoryFilesystemTree,
+  stampMemfsTagOnCreateBody,
+  stampRootMemoryOnCreateBody,
 } from "@/agent/memory-filesystem";
+import {
+  POST_COMMIT_HOOK_SCRIPT,
+  PRE_COMMIT_HOOK_SCRIPT,
+} from "@/agent/memory-git-hooks";
 import { DIRECTORY_LIMIT_ENV } from "@/utils/directory-limits";
 
 const ORIGINAL_LETTA_BASE_URL = process.env.LETTA_BASE_URL;
@@ -151,6 +165,75 @@ function createMockClient(options: {
 
 // parseBlockFromFileContent tests removed - YAML frontmatter no longer
 // used with git-backed memory (files contain raw block content).
+
+describe("stampMemfsTagOnCreateBody", () => {
+  const TAG = "git-memory-enabled";
+
+  test("adds the memfs tag to a body without tags", () => {
+    const body: { name: string; tags?: string[] } = { name: "prod" };
+    expect(stampMemfsTagOnCreateBody(body, TAG).tags).toEqual([TAG]);
+  });
+
+  test("preserves existing tags while adding the memfs tag", () => {
+    const body = { name: "prod", tags: ["origin:letta-code"] };
+    expect(stampMemfsTagOnCreateBody(body, TAG).tags).toEqual([
+      "origin:letta-code",
+      TAG,
+    ]);
+  });
+
+  test("returns the body unchanged when the tag is already present", () => {
+    const body = { name: "prod", tags: [TAG] };
+    expect(stampMemfsTagOnCreateBody(body, TAG)).toBe(body);
+  });
+
+  test("handles null tags", () => {
+    const body: { name: string; tags: string[] | null } = {
+      name: "prod",
+      tags: null,
+    };
+    expect(stampMemfsTagOnCreateBody(body, TAG).tags).toEqual([TAG]);
+  });
+});
+
+describe("stampRootMemoryOnCreateBody", () => {
+  test("adds a root index before existing memory blocks", () => {
+    const body = {
+      memory_blocks: [{ label: "persona", value: "Persistent persona" }],
+    };
+
+    expect(
+      stampRootMemoryOnCreateBody(body).memory_blocks?.map(
+        (block) => block.label,
+      ),
+    ).toEqual(["MEMORY", "persona"]);
+  });
+
+  test("creates a root index when memory blocks are absent", () => {
+    const body: {
+      memory_blocks?: Array<{
+        label: string;
+        value: string;
+        description?: string;
+      }>;
+    } = {};
+    expect(stampRootMemoryOnCreateBody(body).memory_blocks).toEqual([
+      {
+        label: "MEMORY",
+        value: "# Memory\n",
+        description: "Root memory index.",
+      },
+    ]);
+  });
+
+  test("preserves a caller-provided root index", () => {
+    const body = {
+      memory_blocks: [{ label: "MEMORY", value: "# Custom\n" }],
+    };
+
+    expect(stampRootMemoryOnCreateBody(body)).toBe(body);
+  });
+});
 
 describe("labelFromRelativePath", () => {
   test("converts simple filename to label", () => {
@@ -475,6 +558,35 @@ describe("memory filesystem paths", () => {
     expect(systemDir).toBe(
       join("/home/user", ".letta", "agents", "agent-123", "memory", "system"),
     );
+  });
+
+  test("refreshes harness hooks when an existing checkout is activated", async () => {
+    const agentId = `existing-memfs-${Date.now()}`;
+    const memoryDir = getMemoryFilesystemRoot(agentId);
+    const hooksDir = join(memoryDir, ".git", "hooks");
+    mkdirSync(memoryDir, { recursive: true });
+    execFileSync("git", ["init", "-q", "-b", "main"], { cwd: memoryDir });
+    writeFileSync(join(hooksDir, "pre-commit"), "stale\n");
+    writeFileSync(join(hooksDir, "post-commit"), "stale\n");
+
+    try {
+      await ensureLocalMemfsCheckout(agentId);
+
+      expect(readFileSync(join(hooksDir, "pre-commit"), "utf8")).toBe(
+        PRE_COMMIT_HOOK_SCRIPT,
+      );
+      expect(readFileSync(join(hooksDir, "post-commit"), "utf8")).toBe(
+        POST_COMMIT_HOOK_SCRIPT,
+      );
+      expect(
+        readFileSync(
+          join(memoryDir, ".git", "letta-memory-layout-policy"),
+          "utf8",
+        ),
+      ).toBe("root-marker\n");
+    } finally {
+      rmSync(join(memoryDir, ".."), { recursive: true, force: true });
+    }
   });
 });
 
