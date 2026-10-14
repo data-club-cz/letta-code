@@ -11,9 +11,11 @@ import type { LocalMessage } from "@/backend/local/local-message";
 import { LocalStore } from "@/backend/local/local-store";
 import {
   LOCAL_TRANSCRIPT_MESSAGE_FORMAT,
+  LOCAL_TRANSCRIPT_TAIL_MAX_BYTES,
   LocalTranscriptRepairRequiredError,
   type LocalTranscriptRowsResult,
   overlayResidentLocalMessageSuffix,
+  readJsonlFile,
   readLocalTranscriptTailWindow,
   restrictLocalTranscriptToResidentMessages,
   spliceOutOfContextMessages,
@@ -46,6 +48,36 @@ function userMessage(id: string, text: string): LocalMessage {
     timestamp: 0,
   } as LocalMessage;
 }
+
+describe("readJsonlFile", () => {
+  test("parses rows across chunks without splitting multibyte characters", async () => {
+    const storageDir = await createStorageDirectory();
+    const path = join(storageDir, "messages.jsonl");
+    const chunkSize = 64 * 1024;
+    const jsonPrefix = '{"text":"';
+    const text = `${"x".repeat(chunkSize - 2 - Buffer.byteLength(jsonPrefix))}😀`;
+    await writeFile(
+      path,
+      `${JSON.stringify({ text })}\n${JSON.stringify({ text: "next" })}\n`,
+    );
+
+    expect(readJsonlFile<{ text: string }>(path)).toEqual([
+      { text },
+      { text: "next" },
+    ]);
+  });
+
+  test("skips blank lines and parses a final row without a trailing newline", async () => {
+    const storageDir = await createStorageDirectory();
+    const path = join(storageDir, "messages.jsonl");
+    await writeFile(path, '{"value":1}\n\n  \n{"value":2}');
+
+    expect(readJsonlFile<{ value: number }>(path)).toEqual([
+      { value: 1 },
+      { value: 2 },
+    ]);
+  });
+});
 
 describe("readLocalTranscriptTailWindow", () => {
   test("stops once the suffix covers every in-context id", async () => {
@@ -102,6 +134,77 @@ describe("readLocalTranscriptTailWindow", () => {
       activeMessageIds,
     );
     expect(result.transcript.messageById.size).toBeLessThan(messageCount);
+  });
+
+  test("bounds a stale active list by resident messages and bytes", async () => {
+    const storageDir = await createStorageDirectory();
+    const messagesPath = join(storageDir, "messages.jsonl");
+    const messageCount = 5_000;
+    const activeMessageIds = Array.from(
+      { length: messageCount },
+      (_, index) => `msg-${index}`,
+    );
+    const lines = activeMessageIds.map((messageId, index) =>
+      JSON.stringify({
+        type: "message",
+        id: `ent-${index}`,
+        parentId: index > 0 ? `ent-${index - 1}` : null,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: userMessage(messageId, "x".repeat(4_000)),
+      }),
+    );
+    await writeFile(messagesPath, `${lines.join("\n")}\n`);
+
+    const result = readLocalTranscriptTailWindow(
+      messagesPath,
+      LOCAL_TRANSCRIPT_MESSAGE_FORMAT,
+      activeMessageIds,
+      100,
+      storageDir,
+      storageDir,
+    );
+
+    expect(result.bytesRead).toBeLessThanOrEqual(
+      LOCAL_TRANSCRIPT_TAIL_MAX_BYTES,
+    );
+    expect(result.messages.length).toBeGreaterThan(0);
+    expect(result.messages.length).toBeLessThan(messageCount);
+    expect(result.liveInContextIds).toEqual(
+      result.messages.map((message) => message.id),
+    );
+    expect(activeMessageIds.slice(-result.messages.length)).toEqual(
+      result.liveInContextIds,
+    );
+    expect(result.reachedStart).toBe(false);
+  });
+
+  test("treats an empty active list as a bounded recent window", async () => {
+    const storageDir = await createStorageDirectory();
+    const messagesPath = join(storageDir, "messages.jsonl");
+    const lines = Array.from({ length: 1_000 }, (_, index) =>
+      JSON.stringify({
+        type: "message",
+        id: `ent-${index}`,
+        parentId: index > 0 ? `ent-${index - 1}` : null,
+        timestamp: "2026-01-01T00:00:00.000Z",
+        message: userMessage(`msg-${index}`, "x"),
+      }),
+    );
+    await writeFile(messagesPath, `${lines.join("\n")}\n`);
+
+    const result = readLocalTranscriptTailWindow(
+      messagesPath,
+      LOCAL_TRANSCRIPT_MESSAGE_FORMAT,
+      [],
+      100,
+      storageDir,
+      storageDir,
+    );
+
+    expect(result.messages).toHaveLength(100);
+    expect(result.liveInContextIds).toEqual(
+      Array.from({ length: 100 }, (_, index) => `msg-${index + 900}`),
+    );
   });
 });
 
@@ -289,16 +392,16 @@ describe("in-context tail window and unread head validation", () => {
     expect(reopened.listLocalMessages("default", agentId)).toHaveLength(4);
   });
 
-  test("keeps the head check pending after a failed full read", async () => {
+  test("keeps the head check pending after failed validation", async () => {
     const storageDir = await seedTranscript({ clearInContext: true });
     const messagesPath = conversationPath(storageDir, "messages.jsonl");
     const corrupted = await corruptFirstLine(messagesPath);
 
     const store = freshStore(storageDir);
     expect(() => sendUserMessage(store, "first")).toThrow();
-    // A full-history read (e.g. /compact or an asc listing) fails too; it must
-    // not clear the pending head check for the next send.
-    expect(() => store.listLocalMessages("default", agentId)).toThrow();
+    // The bounded resident window prevents the listing from falling back to a
+    // full read, without clearing the pending check for the next append.
+    expect(store.listLocalMessages("default", agentId)).toHaveLength(4);
     expect(() => sendUserMessage(store, "retry")).toThrow();
     expect(await readFile(messagesPath, "utf8")).toBe(corrupted);
   });

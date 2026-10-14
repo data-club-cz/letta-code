@@ -93,7 +93,7 @@ Usage:
   letta mcp schema <tool-name> [--agent <id>]
   letta mcp search <query> [--mode <hybrid|vector|fts>] [--limit <n>] [--agent <id>]
   letta mcp call <tool-name> [--args '<json>' | --args-file <path|->] [--agent <id>]
-  letta mcp connect <service> [--server-url <url>] [--agent <id>]
+  letta mcp connect <service> [--server-url <url>] [--client-name <name>] [--agent <id>]
 
 Commands:
   list      List MCP servers available to the agent
@@ -114,7 +114,11 @@ Options:
   --args <json>      JSON object passed to a tool
   --args-file <path> Read tool arguments from a file; use - for stdin
   --server-url <url> MCP server for connect, e.g. a Datadog site's URL
-                     (default: the service's first supported URL)
+                     (default: the service's first supported URL; non-US1
+                     Datadog orgs can pass https://mcp.<site>/v1/mcp)
+  --client-name <name>
+                     Application name shown on the provider's consent screen
+                     during connect, 1 to 64 characters (default: Letta Code)
   -h, --help         Show this help
 
 Output is JSON. Server placement and agent/server/tool IDs are internal.
