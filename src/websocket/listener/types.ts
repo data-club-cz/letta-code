@@ -445,6 +445,8 @@ export type ConversationRuntime = {
   conversationId: string;
   /** Runtime-scoped SDK override. Undefined uses the process defaults. */
   skillSources: SkillSource[] | undefined;
+  /** Bundled skill IDs exposed when skillSources omits "bundled". */
+  bundledSkills?: string[];
   /** Explicit runtime filesystem boundary for shared app-server sessions. */
   workspaceSandbox: RuntimeWorkspaceSandbox | undefined;
   executionSettings?: RuntimeExecutionSettings;
@@ -568,9 +570,10 @@ export type ListenerRuntime = {
   heartbeatInterval: NodeJS.Timeout | null;
   reconnectTimeout: NodeJS.Timeout | null;
   /**
-   * Epoch ms of the last `pong` observed from the cloud relay. Used by the
-   * heartbeat watchdog to detect a half-open socket (no `close` event) and
-   * force a reconnect. `null` until the first pong on a connection.
+   * Epoch ms of the last `pong` observed on the legacy single connection.
+   * Reported for diagnostics only: once several connections are live this is
+   * not attributable to a socket, so the heartbeat watchdog reads the pong time
+   * of the socket it pings instead. `null` until the first pong.
    */
   lastPongAt: number | null;
   intentionallyClosed: boolean;
@@ -644,7 +647,10 @@ export type ListenerRuntime = {
     import("@/websocket/listener/permission-mode").ConversationPermissionModeState
   >;
   /** Per-conversation skill overrides survive idle ConversationRuntime eviction. */
-  skillSourcesByConversation: Map<string, SkillSource[]>;
+  skillSourcesByConversation: Map<
+    string,
+    { sources: SkillSource[]; bundledSkills?: string[] }
+  >;
   /** Per-conversation reminder state survives ConversationRuntime eviction. */
   reminderStateByConversation: Map<string, SharedReminderState>;
   /** Per-conversation context tracker survives ConversationRuntime eviction. */
