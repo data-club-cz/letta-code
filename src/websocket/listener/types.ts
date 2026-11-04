@@ -58,7 +58,7 @@ export interface StartListenerOptions {
     connection: ListenerConnectionState,
   ) => void | Promise<void>;
   onDisconnected: () => void;
-  onNeedsReregister?: (replacement: ListenerClientReplacement) => void;
+  onNeedsReregister?: (replacement?: ListenerClientReplacement) => void;
   /** Explicit state lineage supplied only by onNeedsReregister. */
   replacement?: ListenerClientReplacement;
   onError: (error: Error) => void;
@@ -729,6 +729,7 @@ export interface InterruptPopulateInput {
   agentId: string | null;
   conversationId: string;
   requestOtid?: string;
+  denialReason?: string;
 }
 
 export interface InterruptToolReturn {
@@ -740,3 +741,25 @@ export interface InterruptToolReturn {
 }
 
 export type { DequeuedBatch, QueueBlockedReason, QueueItem };
+
+export type ConnectedListenerOptions = Pick<
+  StartListenerOptions,
+  | "connectionId"
+  | "onConnected"
+  | "onLog"
+  | "onConnectionReady"
+  | "onStatusChange"
+  | "onWsEvent"
+>;
+
+export interface ConnectedListenerRuntimeOptions {
+  /** Disable for startup tests using transports without WebSocket events. */
+  startStartupDeadline?: boolean;
+  startHeartbeat?: boolean;
+  startCronScheduler?: boolean;
+  startProcessServices?: boolean;
+  streamTransport?: ListenerTransport | null;
+  emitInitialState?: boolean;
+  updateReconnectState?: boolean;
+  activateIngress?: () => Promise<boolean>;
+}
