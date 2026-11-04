@@ -6,7 +6,9 @@ name: Sync upstream release tags
 #
 # Strategy: walk every upstream tag matching v*.*.* that we haven't merged,
 # in chronological order; merge each via a fast-forward-or-merge into our
-# branch. Conflicts open a PR for human review instead of overwriting.
+# branch. Conflicts open a PR for human review instead of overwriting —
+# except conflicts confined to .github/workflows/, which the fork discards
+# in favour of its own CI anyway; those merge automatically.
 
 on:
   schedule:
@@ -107,12 +109,21 @@ jobs:
           # App to ... without workflows permission"). After each merge, drop any
           # upstream workflow-file changes and keep data-club-patch's versions so
           # pushed commits never modify .github/workflows/.
+          #
+          # `ours` is the commit BEFORE the current merge. It must be pinned:
+          # after a clean merge, data-club-patch/HEAD already point at the new
+          # merge commit, so restoring from them would keep upstream's edits.
+          # During a conflicted merge, `git checkout <ours> -- <path>` also
+          # resolves the unmerged entries under that path (both-modified and
+          # deleted-by-us alike).
+          ours=""
           keep_our_workflows() {
             git rm -rfq --ignore-unmatch .github/workflows >/dev/null 2>&1 || true
-            git checkout data-club-patch -- .github/workflows
+            git checkout "$ours" -- .github/workflows
           }
           for tag in "${TAGS[@]}"; do
             upstream_label="${tag#upstream-}"
+            ours=$(git rev-parse HEAD)
             echo "::group::Merging $upstream_label"
             if git merge --no-ff -m "chore: sync upstream $upstream_label" "$tag"; then
               # Revert any upstream workflow changes, folding it into the merge commit.
@@ -120,6 +131,16 @@ jobs:
               git diff --cached --quiet HEAD -- .github/workflows \
                 || git commit --amend --no-edit --no-verify
               echo "Merged $upstream_label cleanly."
+              merged="${merged:+$merged, }$upstream_label"
+            elif keep_our_workflows \
+                 && [ -z "$(git diff --name-only --diff-filter=U)" ]; then
+              # Every conflict was under .github/workflows/, which we discard
+              # anyway (e.g. upstream bumping node-version in a workflow we
+              # edited or deleted). Nothing left for a human: commit the merge.
+              # Explicit -m: MERGE_MSG carries "# Conflicts:" lines that a
+              # non-editing commit would keep.
+              git commit --no-verify -m "chore: sync upstream $upstream_label"
+              echo "Merged $upstream_label (upstream workflow-only conflicts discarded)."
               merged="${merged:+$merged, }$upstream_label"
             else
               branch="sync/upstream-$upstream_label"
