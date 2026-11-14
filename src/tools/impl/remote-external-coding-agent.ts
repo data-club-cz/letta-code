@@ -17,6 +17,7 @@ import {
 } from "@/app-server-client";
 import { getClient } from "@/backend/api/client";
 import {
+  ComputerResolutionError,
   type EnvironmentConnection,
   getEnvironmentConnection,
   isEnvironmentOnline,
@@ -224,6 +225,40 @@ function errorMessage(error: unknown): string {
 class RemoteWorkerLostError extends Error {}
 
 class OutdatedRemoteWorkerError extends Error {}
+
+/** Fixed telemetry categories; never include error text in the returned code. */
+export function classifyRemoteExternalWorkerControlError(
+  error: unknown,
+): string {
+  if (error instanceof ComputerResolutionError) {
+    return error.code === "computer_offline" ||
+      error.code === "computer_not_found"
+      ? error.code
+      : "other";
+  }
+  if (error instanceof OutdatedRemoteWorkerError) return "outdated_computer";
+  const message = errorMessage(error);
+  if (
+    /^Computer ".*" is offline(?:\.|$)/.test(message) ||
+    message.startsWith("Timed out waiting for cloud sandbox ")
+  )
+    return "computer_offline";
+  if (/^Computer ".*" not found(?:\.|$)/.test(message))
+    return "computer_not_found";
+  if (/^Subagent .* was not found on this computer$/.test(message))
+    return "subagent_not_found";
+  if (message === "Subagent does not belong to this conversation")
+    return "subagent_not_owned";
+  if (
+    /^.* is running an older Letta Code that can't steer Claude Code subagents remotely\./.test(
+      message,
+    )
+  )
+    return "outdated_computer";
+  if (message.startsWith("App-server WebSocket failed to open:"))
+    return "connect_failed";
+  return "other";
+}
 
 /** Longest wait between reconnect attempts while the computer is unreachable. */
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -452,7 +487,7 @@ export async function launchRemoteExternalCodingAgent(
     reportExternalWorkerLaunchFailure({
       stage,
       harness: type,
-      computer,
+      computer: stage === "resolve_computer" ? undefined : computer,
       error,
       errorCode,
       agentId: parentScope.agentId,
@@ -492,7 +527,11 @@ export async function launchRemoteExternalCodingAgent(
     );
     if (outdated) return fail("outdated_computer", outdated);
   } catch (error) {
-    return fail("resolve_computer", errorMessage(error));
+    return fail(
+      "resolve_computer",
+      errorMessage(error),
+      error instanceof ComputerResolutionError ? error.code : undefined,
+    );
   }
   params.signal?.throwIfAborted();
 
@@ -789,6 +828,7 @@ export async function sendRemoteExternalCodingAgentMessage(
       harness: target?.type ?? "unknown",
       computer: target?.computer,
       error,
+      errorCode: classifyRemoteExternalWorkerControlError(error),
       agentId: params.parentScope.agentId,
       conversationId: params.parentScope.conversationId,
       toolCallId: params.toolCallId,
