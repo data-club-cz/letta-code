@@ -16,6 +16,7 @@ import type {
   ConversationMessageStreamBody,
   ConversationRecompileBody,
 } from "@/backend/backend";
+import { notifyConversationCompacted } from "@/backend/compaction-events";
 import {
   HEADLESS_BACKEND_CAPABILITIES,
   HeadlessBackend,
@@ -44,7 +45,6 @@ import {
   isLocalSlidingWindowCompactionPlanningError,
   isLocalSlidingWindowMode,
   type LocalCompactionResult,
-  type LocalCompactionStats,
   type LocalCompleteFunction,
   type LocalSelfCompactionContext,
   packageLocalSummaryMessage,
@@ -66,7 +66,7 @@ import {
   createLocalExecutor,
   type LocalBackendExecutionMode,
 } from "./local-executor-factory";
-import type { LocalMessage } from "./local-message";
+import type { LocalCompactionStats, LocalMessage } from "./local-message";
 import {
   listLocalModels,
   localModelSettingsForHandle,
@@ -422,6 +422,7 @@ export class LocalBackend extends HeadlessBackend {
       "manual",
       body,
     );
+    notifyConversationCompacted({ backend: this, conversationId, agentId });
     return {
       num_messages_before: result.numMessagesBefore,
       num_messages_after: result.numMessagesAfter,
@@ -741,7 +742,7 @@ export class LocalBackend extends HeadlessBackend {
     const summarize = slidingWindow
       ? summarizeLocalMessagesSlidingWindow
       : summarizeLocalMessagesAll;
-    const summary = await summarize({
+    const { summary, source } = await summarize({
       conversationId,
       agent,
       messages: plan.messagesToSummarize,
@@ -752,6 +753,8 @@ export class LocalBackend extends HeadlessBackend {
       modelsRuntime: this.piModelsRuntime,
       self,
     });
+    // Built per pass, so a sliding-window → full fallback reports the pass
+    // whose summary is stored.
     const stats: LocalCompactionStats = {
       trigger,
       context_tokens_before: estimateLocalMessageTokens(messages),
@@ -759,6 +762,7 @@ export class LocalBackend extends HeadlessBackend {
       context_window: contextWindow,
       messages_count_before: messages.length,
       messages_count_after: 1 + plan.messagesToKeep.length,
+      ...(source ? { summary_source: source } : {}),
     };
     if (!slidingWindow) {
       assertLocalPressureBudget(
