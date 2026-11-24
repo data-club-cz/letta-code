@@ -370,7 +370,6 @@ export async function runMessagesSubcommand(
 
         cursorBefore = items[items.length - 1]?.id;
 
-        // Stop if no new items (all duplicates) or partial page
         if (newItems === 0 || items.length < pageLimit) {
           truncated = newItems === 0;
           break;
@@ -647,8 +646,6 @@ export async function runMessagesSubcommand(
       console.log(JSON.stringify({ id: forked.id, agent_id: agentId || null }));
       return 0;
     }
-
-    // Agent-to-agent messaging uses `letta -p --from-agent <sender-id> ...`
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     return 1;

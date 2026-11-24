@@ -10,6 +10,8 @@ export interface NativeSessionOwner {
   conversationId: string;
   actingUserId?: string | null;
   cloudSkillRepositories?: string[];
+  /** The Agent task description the session was launched for. */
+  description?: string;
 }
 
 function ownerPath(source: NativeSessionSource, sessionId: string): string {
@@ -49,14 +51,12 @@ export function persistNativeSessionOwner(
   const path = ownerPath(source, sessionId);
   mkdirSync(join(path, ".."), { recursive: true, mode: 0o700 });
   try {
-    // First launch owns the session permanently, including across restarts.
     writeFileSync(path, JSON.stringify(scope), { flag: "wx", mode: 0o600 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
   }
 }
 
-// Test-only: persisted owners otherwise outlive the in-memory reset.
 export function clearNativeSessionOwnersForTests(): void {
   rmSync(join(resolveGlobalConfigDir(), "native-session-owners"), {
     recursive: true,
