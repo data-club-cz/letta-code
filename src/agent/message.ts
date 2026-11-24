@@ -254,16 +254,12 @@ export type SendMessageStreamOptions = {
   permissionModeState?: PermissionModeState;
   skillSources?: SkillSource[];
   overrideModel?: string;
-<<<<<<< HEAD
   /**
    * Per-request system-prompt override. Replaces the compiled system message
    * for this turn only (no agent/conversation persisted state mutation).
    * data-club fork patch — see ai-hub-server's recency-bias injection.
    */
   overrideSystem?: string;
-  /** Request-scoped Messages API response format. */
-=======
->>>>>>> upstream-v0.34.70
   responseFormat?: Record<string, unknown>;
   preparedToolContext?: PreparedToolExecutionContext;
   allowResponseStateReuse?: boolean;

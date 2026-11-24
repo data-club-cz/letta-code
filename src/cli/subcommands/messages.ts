@@ -563,7 +563,6 @@ export async function runMessagesSubcommand(
       );
       return 0;
     }
-<<<<<<< HEAD
 
     if (action === "info") {
       // Retrieve one conversation's metadata as JSON. Added for AI Hub's
@@ -647,10 +646,6 @@ export async function runMessagesSubcommand(
       console.log(JSON.stringify({ id: forked.id, agent_id: agentId || null }));
       return 0;
     }
-
-    // Agent-to-agent messaging uses `letta -p --from-agent <sender-id> ...`
-=======
->>>>>>> upstream-v0.34.70
   } catch (error) {
     console.error(error instanceof Error ? error.message : String(error));
     return 1;
